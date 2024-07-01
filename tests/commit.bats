@@ -173,18 +173,6 @@ load helpers
         expect_output "$buildah_version"
 }
 
-@test "commit-parent-id" {
-  _prefetch alpine
-  run_buildah from --quiet --pull $WITH_POLICY_JSON alpine
-  cid=$output
-  run_buildah inspect --format '{{.FromImageID}}' $cid
-  iid=$output
-
-  run_buildah commit $WITH_POLICY_JSON --format docker $cid alpine-image
-  run_buildah inspect --format '{{.Docker.Parent}}' alpine-image
-  expect_output "sha256:$iid" "alpine-image -> .Docker.Parent"
-}
-
 @test "commit-container-id" {
   _prefetch alpine
   run_buildah from --quiet --pull $WITH_POLICY_JSON alpine
@@ -387,4 +375,28 @@ load helpers
     [ $status -eq 0 ]
     assert ${rootowner}:-rw-r--r--
   done
+}
+
+@test "commit with insufficient disk space" {
+  skip_if_rootless_environment
+  _prefetch busybox
+  local tmp=$TEST_SCRATCH_DIR/buildah-test
+  mkdir -p $tmp
+  mount -t tmpfs -o size=4M tmpfs $tmp
+  # Create a temporary file which should not be easy to compress,
+  # which we'll add to our container for committing, but which is
+  # larger than the filesystem where the layer blob that would
+  # contain it, compressed or not, would be written during commit.
+  run dd if=/dev/urandom of=$TEST_SCRATCH_DIR/8M bs=1M count=8
+  # Create a working container.
+  run_buildah from --pull=never $WITH_POLICY_JSON busybox
+  ctrID="$output"
+  # Copy the file into the working container.
+  run_buildah copy $ctrID $TEST_SCRATCH_DIR/8M /8M
+  # Try to commit the image.  The temporary copy of the layer diff should
+  # require more space than is available where we're telling it to store
+  # temporary things.
+  TMPDIR=$tmp run_buildah '?' commit $ctrID
+  umount $tmp
+  expect_output --substring "no space left on device"
 }

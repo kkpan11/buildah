@@ -53,6 +53,7 @@ import (
 	"github.com/opencontainers/runtime-tools/generate"
 	"github.com/opencontainers/selinux/go-selinux/label"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/exp/slices"
 	"golang.org/x/sys/unix"
 	"golang.org/x/term"
 )
@@ -83,10 +84,15 @@ func (b *Builder) createResolvConf(rdir string, chownOpts *idtools.IDPair) (stri
 
 // addResolvConf copies files from host and sets them up to bind mount into container
 func (b *Builder) addResolvConfEntries(file string, networkNameServer []string,
-	namespaces []specs.LinuxNamespace, keepHostServers, ipv6 bool) error {
+	spec *specs.Spec, keepHostServers, ipv6 bool) error {
 	defaultConfig, err := config.Default()
 	if err != nil {
 		return fmt.Errorf("failed to get config: %w", err)
+	}
+
+	var namespaces []specs.LinuxNamespace
+	if spec.Linux != nil {
+		namespaces = spec.Linux.Namespaces
 	}
 
 	dnsServers, dnsSearch, dnsOptions := b.CommonBuildOpts.DNSServers, b.CommonBuildOpts.DNSSearch, b.CommonBuildOpts.DNSOptions
@@ -540,7 +546,7 @@ func runUsingRuntime(options RunOptions, configureNetwork bool, moreCreateArgs [
 		}
 	}
 
-	runtimeArgs := options.Args[:]
+	runtimeArgs := slices.Clone(options.Args)
 	if options.CgroupManager == config.SystemdCgroupsManager {
 		runtimeArgs = append(runtimeArgs, "--systemd-cgroup")
 	}
@@ -1253,7 +1259,7 @@ func (b *Builder) runUsingRuntimeSubproc(isolation define.Isolation, options Run
 			}
 
 			if resolvFile != "" {
-				err = b.addResolvConfEntries(resolvFile, netResult.dnsServers, spec.Linux.Namespaces, netResult.keepHostResolvers, netResult.ipv6)
+				err = b.addResolvConfEntries(resolvFile, netResult.dnsServers, spec, netResult.keepHostResolvers, netResult.ipv6)
 				if err != nil {
 					return err
 				}
@@ -1659,7 +1665,7 @@ func (b *Builder) getTmpfsMount(tokens []string, idMaps IDMaps) (*specs.Mount, e
 	return &volumes[0], nil
 }
 
-func (b *Builder) getSecretMount(tokens []string, secrets map[string]define.Secret, idMaps IDMaps, workdir string) (*specs.Mount, string, error) {
+func (b *Builder) getSecretMount(tokens []string, secrets map[string]define.Secret, idMaps IDMaps, workdir string) (_ *specs.Mount, _ string, retErr error) {
 	errInvalidSyntax := errors.New("secret should have syntax id=id[,target=path,required=bool,mode=uint,uid=uint,gid=uint")
 	if len(tokens) == 0 {
 		return nil, "", errInvalidSyntax
@@ -1739,6 +1745,11 @@ func (b *Builder) getSecretMount(tokens []string, secrets map[string]define.Secr
 		if err != nil {
 			return nil, "", err
 		}
+		defer func() {
+			if retErr != nil {
+				os.Remove(tmpFile.Name())
+			}
+		}()
 		envFile = tmpFile.Name()
 		ctrFileOnHost = tmpFile.Name()
 	case "file":

@@ -882,6 +882,18 @@ func (e *ClientExecutor) Copy(excludes []string, copies ...imagebuilder.Copy) er
 		if copy.Checksum != "" {
 			return fmt.Errorf("ADD --checksum not supported")
 		}
+		if copy.Link {
+			return fmt.Errorf("ADD or COPY --link not supported")
+		}
+		if copy.Parents {
+			return fmt.Errorf("COPY --parents not supported")
+		}
+		if copy.KeepGitDir {
+			return fmt.Errorf("ADD --keep-git-dir not supported")
+		}
+		if len(copy.Excludes) > 0 {
+			return fmt.Errorf("ADD or COPY --exclude not supported")
+		}
 		if len(copy.Files) > 0 {
 			return fmt.Errorf("Heredoc syntax is not supported")
 		}
@@ -1058,7 +1070,7 @@ func (e *ClientExecutor) CopyContainer(container *docker.Container, excludes []s
 			}
 			chmod = func(h *tar.Header, r io.Reader) (data []byte, update bool, skip bool, err error) {
 				mode := h.Mode &^ 0o777
-				mode |= parsed & 0o777
+				mode |= parsed & 0o7777
 				h.Mode = mode
 				return nil, false, false, nil
 			}

@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -68,6 +69,9 @@ type BuildOptions = define.BuildOptions
 func BuildDockerfiles(ctx context.Context, store storage.Store, options define.BuildOptions, paths ...string) (id string, ref reference.Canonical, err error) {
 	if options.CommonBuildOpts == nil {
 		options.CommonBuildOpts = &define.CommonBuildOptions{}
+	}
+	if options.Args == nil {
+		options.Args = make(map[string]string)
 	}
 	if err := parse.Volumes(options.CommonBuildOpts.Volumes); err != nil {
 		return "", nil, fmt.Errorf("validating volumes: %w", err)
@@ -221,6 +225,9 @@ func BuildDockerfiles(ctx context.Context, store storage.Store, options define.B
 	systemContext := options.SystemContext
 	for _, platform := range options.Platforms {
 		platformContext := *systemContext
+		if platform.OS == "" && platform.Arch != "" {
+			platform.OS = runtime.GOOS
+		}
 		platformSpec := internalUtil.NormalizePlatform(v1.Platform{
 			OS:           platform.OS,
 			Architecture: platform.Arch,

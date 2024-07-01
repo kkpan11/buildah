@@ -243,26 +243,48 @@ _EOF
   assert "${checkvars[*]}" != "" \
          "INTERNAL ERROR! No 'ARG xxx' lines in $containerfile!"
 
+  ARCH=$(go env GOARCH)
   # With explicit and full --platform, buildah should not warn.
   run_buildah build $WITH_POLICY_JSON --platform linux/amd64/v2 \
               -t source -f $containerfile
-  assert "$output" !~ "missing .* build argument" \
-         "With explicit --platform, buildah should not warn"
+  assert "$output" =~ "image platform \(linux/amd64\) does not match the expected platform" \
+         "With explicit --platform, buildah should warn about pulling difference in platform"
+  assert "$output" =~ "TARGETOS=linux" " --platform TARGETOS set correctly"
+  assert "$output" =~ "TARGETARCH=amd64" " --platform TARGETARCH set correctly"
+  assert "$output" =~ "TARGETVARIANT=" " --platform TARGETVARIANT set correctly"
+  assert "$output" =~ "TARGETPLATFORM=linux/amd64/v2" " --platform TARGETPLATFORM set correctly"
 
   # Likewise with individual args
   run_buildah build $WITH_POLICY_JSON --os linux --arch amd64 --variant v2 \
               -t source -f $containerfile
-  assert "$output" !~ "missing .* build argument" \
-         "With explicit --os + --arch + --variant, buildah should not warn"
+  assert "$output" =~ "image platform \(linux/amd64\) does not match the expected platform" \
+         "With explicit --variant, buildah should warn about pulling difference in platform"
+  assert "$output" =~ "TARGETOS=linux" "--os --arch --variant TARGETOS set correctly"
+  assert "$output" =~ "TARGETARCH=amd64" "--os --arch --variant TARGETARCH set correctly"
+  assert "$output" =~ "TARGETVARIANT=" "--os --arch --variant TARGETVARIANT set correctly"
+  assert "$output" =~ "TARGETPLATFORM=linux/amd64" "--os --arch --variant TARGETPLATFORM set correctly"
 
-  # FIXME FIXME FIXME: #4319: with --os only, buildah should not warn about OS
-  if false; then
-      run_buildah build $WITH_POLICY_JSON --os linux \
-                  -t source -f $containerfile
-      assert "$output" !~ "missing.*TARGETOS" \
-             "With explicit --os (but no arch/variant), buildah should not warn about TARGETOS"
-      # FIXME: add --arch test too, and maybe make this cleaner
-  fi
+  run_buildah build $WITH_POLICY_JSON --os linux -t source -f $containerfile
+  assert "$output" !~ "WARNING" \
+         "With explicit --os (but no arch/variant), buildah should not warn about TARGETOS"
+  assert "$output" =~ "TARGETOS=linux" "--os TARGETOS set correctly"
+  assert "$output" =~ "TARGETARCH=${ARCH}" "--os TARGETARCH set correctly"
+  assert "$output" =~ "TARGETVARIANT=" "--os TARGETVARIANT set correctly"
+  assert "$output" =~ "TARGETPLATFORM=linux/${ARCH}" "--os TARGETPLATFORM set correctly"
+
+  run_buildah build $WITH_POLICY_JSON --arch amd64 -t source -f $containerfile
+  assert "$output" !~ "WARNING" \
+         "With explicit --os (but no arch/variant), buildah should not warn about TARGETOS"
+  assert "$output" =~ "TARGETOS=linux" "--arch TARGETOS set correctly"
+  assert "$output" =~ "TARGETARCH=amd64" "--arch TARGETARCH set correctly"
+  assert "$output" =~ "TARGETVARIANT=" "--arch TARGETVARIANT set correctly"
+  assert "$output" =~ "TARGETPLATFORM=linux/amd64" "--arch TARGETPLATFORM set correctly"
+
+  for option in "--arch=arm64" "--os=windows" "--variant=v2"; do
+    run_buildah 125 build $WITH_POLICY_JSON --platform linux/amd64 ${option} \
+                -t source -f $containerfile
+    assert "$output" =~ "invalid --platform may not be used with --os, --arch, or --variant" "can't use --platform and one of --os, --arch or --variant together"
+  done
 }
 
 @test "build-conflicting-isolation-chroot-and-network" {
@@ -333,7 +355,7 @@ _EOF
 }
 
 @test "bud build with heredoc content" {
-  _prefetch fedora
+  _prefetch quay.io/fedora/python-311
   run_buildah build -t heredoc $WITH_POLICY_JSON -f $BUDFILES/heredoc/Containerfile .
   expect_output --substring "print first line from heredoc"
   expect_output --substring "print second line from heredoc"
@@ -1582,6 +1604,15 @@ _EOF
   expect_line_count 18
 }
 
+@test "bud with no --layers comment" {
+  _prefetch alpine
+  run_buildah build --pull-never $WITH_POLICY_JSON --layers=false --no-cache -t test $BUDFILES/use-layers
+  run_buildah images -a
+  expect_line_count 3
+  run_buildah inspect --format "{{index .Docker.History 2}}" test
+  expect_output --substring "FROM docker.io/library/alpine:latest"
+}
+
 @test "bud with --layers and single and two line Dockerfiles" {
   _prefetch alpine
   run_buildah inspect --format "{{.FromImageDigest}}" alpine
@@ -2127,7 +2158,7 @@ RUN echo 'hello'> hello
 _EOF
   run_buildah 125 build --output type=tar, $WITH_POLICY_JSON -t test-bud -f $mytmpdir/Containerfile .
   expect_output --substring 'invalid'
-  run_buildah 125 build --output type=wrong,dest=hello --signature-policy ${TESTSDIR}/policy.json -t test-bud -f $mytmpdir/Containerfile .
+  run_buildah 125 build --output type=wrong,dest=hello $WITH_POLICY_JSON -t test-bud -f $mytmpdir/Containerfile .
   expect_output --substring 'invalid'
 }
 
@@ -2296,24 +2327,32 @@ _EOF
 }
 
 @test "bud and test --unsetlabel" {
-  _prefetch registry.fedoraproject.org/fedora-minimal
+  base=registry.fedoraproject.org/fedora-minimal
+  _prefetch $base
+  target=exp
+
   run_buildah --version
   local -a output_fields=($output)
   buildah_version=${output_fields[2]}
-  run_buildah build $WITH_POLICY_JSON -t exp -f $BUDFILES/base-with-labels/Containerfile
 
-  run_buildah inspect --format '{{ index .Docker.Config.Labels "license"}}' exp
-  expect_output "MIT" "license must be MIT from fedora base image"
-  run_buildah inspect --format '{{ index .Docker.Config.Labels "name"}}' exp
-  expect_output "fedora" "name must be fedora from base image"
-  run_buildah inspect --format '{{ index .Docker.Config.Labels "vendor"}}' exp
-  expect_output "Fedora Project" "vendor must be fedora from base image"
+  buildah inspect --format '{{ .Docker.Config.Labels }}' $base
+  not_want_output='map[]'
+  assert "$output" != "$not_want_output" "expected some labels to be set in base image $base"
 
-  run_buildah build $WITH_POLICY_JSON --unsetlabel license --unsetlabel name --unsetlabel vendor --unsetlabel version --label hello=world -t exp -f $BUDFILES/base-with-labels/Containerfile
-  # no labels should be inherited from base image only the, buildah version label
+  labels=$(buildah inspect --format '{{ range $key, $value := .Docker.Config.Labels }}{{ $key }} {{end}}' $base)
+  labelflags="--label hello=world"
+  for label in $labels; do
+    if test $label != io.buildah.version ; then
+      labelflags="$labelflags --unsetlabel $label"
+    fi
+  done
+
+  run_buildah build $WITH_POLICY_JSON $labelflags -t $target --from $base $BUDFILES/base-with-labels
+
+  # no labels should be inherited from base image, only the buildah version label
   # and `hello=world` which we just added using cli flag
   want_output='map["hello":"world" "io.buildah.version":"'$buildah_version'"]'
-  run_buildah inspect --format '{{printf "%q" .Docker.Config.Labels}}' exp
+  run_buildah inspect --format '{{printf "%q" .Docker.Config.Labels}}' $target
   expect_output "$want_output"
 }
 
@@ -3479,12 +3518,13 @@ _EOF
   _prefetch alpine
   target=alpine-image
   run_buildah build $WITH_POLICY_JSON -t ${target} --format docker $BUDFILES/healthcheck
-  run_buildah inspect -f '{{printf "%q" .Docker.Config.Healthcheck.Test}} {{printf "%d" .Docker.Config.Healthcheck.StartPeriod}} {{printf "%d" .Docker.Config.Healthcheck.Interval}} {{printf "%d" .Docker.Config.Healthcheck.Timeout}} {{printf "%d" .Docker.Config.Healthcheck.Retries}}' ${target}
+  run_buildah inspect -f '{{printf "%q" .Docker.Config.Healthcheck.Test}} {{printf "%d" .Docker.Config.Healthcheck.StartInterval}} {{printf "%d" .Docker.Config.Healthcheck.StartPeriod}} {{printf "%d" .Docker.Config.Healthcheck.Interval}} {{printf "%d" .Docker.Config.Healthcheck.Timeout}} {{printf "%d" .Docker.Config.Healthcheck.Retries}}' ${target}
   second=1000000000
   threeseconds=$(( 3 * $second ))
+  thirtyseconds=$(( 30 * $second ))
   fiveminutes=$(( 5 * 60 * $second ))
   tenminutes=$(( 10 * 60 * $second ))
-  expect_output '["CMD-SHELL" "curl -f http://localhost/ || exit 1"]'" $tenminutes $fiveminutes $threeseconds 4" "Healthcheck config"
+  expect_output '["CMD-SHELL" "curl -f http://localhost/ || exit 1"]'" $thirtyseconds $tenminutes $fiveminutes $threeseconds 4" "Healthcheck config"
 }
 
 @test "bud with unused build arg" {
@@ -4425,9 +4465,70 @@ EOM
 }
 
 @test "bud-implicit-no-history" {
-  _prefetch nixery.dev/shell
-  run_buildah build $WITH_POLICY_JSON --layers=false $BUDFILES/no-history
-  run_buildah build $WITH_POLICY_JSON --layers=true  $BUDFILES/no-history
+  _prefetch busybox
+  local ocidir=${TEST_SCRATCH_DIR}/oci
+  mkdir -p $ocidir/blobs/sha256
+  # Build an image config and image manifest in parallel
+  local configos=$(${BUILDAH_BINARY} info --format '{{.host.os}}')
+  local configarch=$(${BUILDAH_BINARY} info --format '{{.host.arch}}')
+  local configvariant=$(${BUILDAH_BINARY} info --format '{{.host.variant}}')
+  local configvariantkv=${configvariant:+'"variant": "'${configvariant}'", '}
+  echo '{"architecture": "'"${configarch}"'", "os": "'"${configos}"'", '"${configvariantkv}"'"rootfs": {"type": "layers", "diff_ids": [' > ${TEST_SCRATCH_DIR}/config.json
+  echo '{"schemaVersion": 2, "mediaType": "application/vnd.oci.image.manifest.v1+json", "layers": [' > ${TEST_SCRATCH_DIR}/manifest.json
+  # Create some layers
+  for layer in $(seq 8) ; do
+    # Content for the layer
+    createrandom ${TEST_SCRATCH_DIR}/file$layer $((RANDOM+1024))
+    # Layer blob
+    tar -c -C ${TEST_SCRATCH_DIR} -f ${TEST_SCRATCH_DIR}/layer$layer.tar file$layer
+    # Get the layer blob's digest and size
+    local diffid=$(sha256sum ${TEST_SCRATCH_DIR}/layer$layer.tar)
+    local diffsize=$(wc -c ${TEST_SCRATCH_DIR}/layer$layer.tar)
+    # Link the blob into where an OCI layout would put it.
+    ln ${TEST_SCRATCH_DIR}/layer$layer.tar $ocidir/blobs/sha256/${diffid%% *}
+    # Try to keep the resulting files at least kind of readable.
+    if test $layer -gt 1 ; then
+      echo "," >> ${TEST_SCRATCH_DIR}/config.json
+      echo "," >> ${TEST_SCRATCH_DIR}/manifest.json
+    fi
+    # Add the layer to the config blob's list of diffIDs for its rootfs.
+    echo -n '  "sha256:'${diffid%% *}'"' >> ${TEST_SCRATCH_DIR}/config.json
+    # Add the layer blob to the manifest's list of blobs.
+    echo -n '  {"mediaType": "application/vnd.oci.image.layer.v1.tar", "digest": "sha256:'${diffid%% *}'", "size": '${diffsize%% *}'}' >> ${TEST_SCRATCH_DIR}/manifest.json
+  done
+  # Finish the diffID and layer blob lists.
+  echo >> ${TEST_SCRATCH_DIR}/config.json
+  echo >> ${TEST_SCRATCH_DIR}/manifest.json
+  # Finish the config blob with some boilerplate stuff.
+  echo ']}, "config": { "Cmd": ["/bin/sh"], "Env": [ "PATH=/usr/local/sbin:/usr/sbin:/sbin:/usr/local/bin:/usr/bin:/bin" ]}}' >> ${TEST_SCRATCH_DIR}/config.json
+  # Compute the config blob's digest and size, so that we can list it in the manifest.
+  local configsize=$(wc -c ${TEST_SCRATCH_DIR}/config.json)
+  local configdigest=$(sha256sum ${TEST_SCRATCH_DIR}/config.json)
+  # Finish the manifest with information about the config blob.
+  echo '], "config": { "mediaType": "application/vnd.oci.image.config.v1+json", "digest": "sha256:'${configdigest%% *}'", "size": '${configsize%% *}'}}' >> ${TEST_SCRATCH_DIR}/manifest.json
+  # Compute the manifest's digest and size, so that we can list it in the OCI layout index.
+  local manifestsize=$(wc -c ${TEST_SCRATCH_DIR}/manifest.json)
+  local manifestdigest=$(sha256sum ${TEST_SCRATCH_DIR}/manifest.json)
+  # Link the config blob and manifest into where an OCI layout would put them.
+  ln ${TEST_SCRATCH_DIR}/config.json $ocidir/blobs/sha256/${configdigest%% *}
+  ln ${TEST_SCRATCH_DIR}/manifest.json $ocidir/blobs/sha256/${manifestdigest%% *}
+  # Write the layout index with just the one image manifest in it.
+  echo '{"schemaVersion": 2, "manifests": [ {"mediaType": "application/vnd.oci.image.manifest.v1+json", "digest": "sha256:'${manifestdigest%% *}'", "size": '${manifestsize%% *}' } ]}' > $ocidir/index.json
+  # Write the "this is an OCI layout directory" identifier.
+  echo '{"imageLayoutVersion":"1.0.0"}' > $ocidir/oci-layout
+  # Import the image from the OCI layout into buildah's normal storage.
+  run_buildah pull --log-level=debug $WITH_POLICY_JSON oci:$ocidir
+  # Tag the image (we know its ID is the config blob digest, since it's an OCI
+  # image) with the name the Dockerfile will specify as its base image.
+  run_buildah tag ${configdigest%% *} fakeregistry.podman.invalid/notreal
+  # Double-check that the image has no history, which is what we wanted to get
+  # out of all of this.
+  run_buildah inspect --format '{{.History}}' fakeregistry.podman.invalid/notreal
+  assert "${lines}" == '[]'  "base image generated for test had history field that was not an empty slice"
+  # Build images using our image-with-no-history as a base, to check that we
+  # don't trip over ourselves when doing so.
+  run_buildah build $WITH_POLICY_JSON --pull=never --layers=false $BUDFILES/no-history
+  run_buildah build $WITH_POLICY_JSON --pull=never --layers=true  $BUDFILES/no-history
 }
 
 @test "bud with encrypted FROM image" {
@@ -4478,17 +4579,17 @@ EOM
 }
 
 @test "bud arg and env var with same name" {
-  _prefetch centos:8
+  _prefetch busybox
   # Regression test for https://github.com/containers/buildah/issues/2345
   run_buildah build $WITH_POLICY_JSON -t testctr $BUDFILES/dupe-arg-env-name
   expect_output --substring "https://example.org/bar"
 }
 
 @test "bud copy chown with newuser" {
-  _prefetch ubuntu:latest
+  _prefetch quay.io/fedora/fedora
   # Regression test for https://github.com/containers/buildah/issues/2192
   run_buildah build $WITH_POLICY_JSON -t testctr -f $BUDFILES/copy-chown/Containerfile.chown_user $BUDFILES/copy-chown
-  expect_output --substring "myuser myuser"
+  expect_output --substring "myuser:myuser"
 }
 
 @test "bud-builder-identity" {
@@ -5721,9 +5822,9 @@ _EOF
 @test "bud with --pull-always" {
   _prefetch docker.io/library/alpine
   run_buildah build --pull-always $WITH_POLICY_JSON -t testpull $BUDFILES/containerfile
-  expect_output --from="${lines[1]}" "Trying to pull docker.io/library/alpine:latest..."
+  expect_output --substring "Trying to pull docker.io/library/alpine:latest..."
   run_buildah build --pull=always $WITH_POLICY_JSON -t testpull $BUDFILES/containerfile
-  expect_output --from="${lines[1]}" "Trying to pull docker.io/library/alpine:latest..."
+  expect_output --substring "Trying to pull docker.io/library/alpine:latest..."
 }
 
 @test "bud with --memory and --memory-swap" {
@@ -6685,6 +6786,9 @@ _EOF
 
 @test "build test default ulimits" {
   skip_if_no_runtime
+  if grep -qi debian /etc/os-release; then
+      skip "FIXME: 2024-05-29 something broken in debian ulimits"
+  fi
   _prefetch alpine
 
   run podman --events-backend=none run --rm alpine sh -c "echo -n Files=; awk '/open files/{print \$4 \"/\" \$5}' /proc/self/limits"
@@ -6719,4 +6823,35 @@ _EOF
   rm -f /BIND_BREAKOUT
   assert "$status" -eq 2 "exit code from ls"
   expect_output --substring "No such file or directory"
+}
+
+@test "pull policy" {
+  echo FROM busybox > ${TEST_SCRATCH_DIR}/Containerfile
+  arch=amd64
+  if test $(arch) = x86_64 ; then
+    arch=arm64
+  fi
+  # specifying the arch should trigger "just pull it anyway" in containers/common
+  run_buildah build --pull=missing --arch $arch --iidfile ${TEST_SCRATCH_DIR}/image1.txt ${TEST_SCRATCH_DIR}
+  # not specifying the arch should trigger "yeah, fine, whatever we already have is fine" in containers/common
+  run_buildah build --pull=missing --iidfile ${TEST_SCRATCH_DIR}/image2.txt ${TEST_SCRATCH_DIR}
+  # both of these should have just been the base image's ID, which shouldn't have changed the second time around
+  cmp ${TEST_SCRATCH_DIR}/image1.txt ${TEST_SCRATCH_DIR}/image2.txt
+}
+
+# Verify: https://github.com/containers/buildah/issues/5185
+@test "build-test --mount=type=secret test from env with chroot isolation" {
+  skip_if_root_environment "Need to not be root for this test to work"
+  local contextdir=$BUDFILES/secret-env
+  export MYSECRET=SOMESECRETDATA
+  run_buildah build $WITH_POLICY_JSON --no-cache --isolation chroot --secret id=MYSECRET -t test -f $contextdir/Dockerfile
+  expect_output --substring "SOMESECRETDATA"
+}
+
+@test "build-logs-from-platform" {
+  run_buildah info --format '{{.host.os}}/{{.host.arch}}{{if .host.variant}}/{{.host.variant}}{{ end }}'
+  local platform="$output"
+  echo FROM --platform=$platform busybox > ${TEST_SCRATCH_DIR}/Containerfile
+  run_buildah build ${TEST_SCRATCH_DIR}
+  expect_output --substring "\-\-platform=$platform"
 }

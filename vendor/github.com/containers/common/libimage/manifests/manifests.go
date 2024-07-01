@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -40,7 +41,6 @@ import (
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/exp/maps"
-	"golang.org/x/exp/slices"
 )
 
 const (
@@ -662,6 +662,9 @@ func (l *list) Add(ctx context.Context, sys *types.SystemContext, ref types.Imag
 		err = l.List.AddInstance(*instanceInfo.instanceDigest, instanceInfo.Size, manifestType, instanceInfo.OS, instanceInfo.Architecture, instanceInfo.OSVersion, instanceInfo.OSFeatures, instanceInfo.Variant, instanceInfo.Features, instanceInfo.Annotations)
 		if err != nil {
 			return "", fmt.Errorf("adding instance with digest %q: %w", *instanceInfo.instanceDigest, err)
+		}
+		if err := l.List.SetArtifactType(instanceInfo.instanceDigest, instanceInfo.ArtifactType); err != nil {
+			return "", fmt.Errorf("setting artifact manifest type for instance with digest %q: %w", *instanceInfo.instanceDigest, err)
 		}
 		if err = l.List.SetURLs(*instanceInfo.instanceDigest, instanceInfo.URLs); err != nil {
 			return "", fmt.Errorf("setting URLs for instance with digest %q: %w", *instanceInfo.instanceDigest, err)

@@ -11,6 +11,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"reflect"
 	"regexp"
@@ -51,6 +52,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/exp/slices"
 )
 
 const (
@@ -158,13 +160,31 @@ func TestConformance(t *testing.T) {
 	dateStamp := fmt.Sprintf("%d", time.Now().UnixNano())
 	for i := range internalTestCases {
 		t.Run(internalTestCases[i].name, func(t *testing.T) {
-			testConformanceInternal(t, dateStamp, i)
+			if internalTestCases[i].testUsingSetParent {
+				t.Run("new-set-parent", func(t *testing.T) {
+					testConformanceInternal(t, dateStamp, i, func(test *testCase) {
+						test.dockerBuilderVersion = docker.BuilderBuildKit
+						test.compatSetParent = types.OptionalBoolFalse
+					})
+				})
+				t.Run("old-set-parent", func(t *testing.T) {
+					testConformanceInternal(t, dateStamp, i, func(test *testCase) {
+						test.dockerBuilderVersion = docker.BuilderV1
+						test.compatSetParent = types.OptionalBoolTrue
+					})
+				})
+			} else {
+				testConformanceInternal(t, dateStamp, i, nil)
+			}
 		})
 	}
 }
 
-func testConformanceInternal(t *testing.T, dateStamp string, testIndex int) {
+func testConformanceInternal(t *testing.T, dateStamp string, testIndex int, mutate func(*testCase)) {
 	test := internalTestCases[testIndex]
+	if mutate != nil {
+		mutate(&test)
+	}
 	ctx := context.TODO()
 
 	cwd, err := os.Getwd()
@@ -230,6 +250,11 @@ func testConformanceInternal(t *testing.T, dateStamp string, testIndex int) {
 	buildahImage := fmt.Sprintf("conformance-buildah:%s-%d", dateStamp, testIndex)
 	dockerImage := fmt.Sprintf("conformance-docker:%s-%d", dateStamp, testIndex)
 	imagebuilderImage := fmt.Sprintf("conformance-imagebuilder:%s-%d", dateStamp, testIndex)
+	if mutate != nil {
+		buildahImage += path.Base(t.Name())
+		dockerImage += path.Base(t.Name())
+		imagebuilderImage += path.Base(t.Name())
+	}
 
 	// compute the name of the Dockerfile in the build context directory
 	var dockerfileName string
@@ -295,7 +320,7 @@ func testConformanceInternal(t *testing.T, dateStamp string, testIndex int) {
 	dockerClient, err := dockerdockerclient.NewClientWithOpts(dockerdockerclient.FromEnv)
 	require.NoError(t, err, "unable to initialize docker.client")
 	dockerClient.NegotiateAPIVersion(ctx)
-	if test.dockerUseBuildKit {
+	if test.dockerUseBuildKit || test.dockerBuilderVersion != "" {
 		if err := dockerClient.NewVersionError(ctx, "1.38", "buildkit"); err != nil {
 			t.Skipf("%v", err)
 		}
@@ -530,6 +555,16 @@ func buildUsingBuildah(ctx context.Context, t *testing.T, store storage.Store, t
 	}
 	// set up build options
 	output := &bytes.Buffer{}
+	if test.compatSetParent != types.OptionalBoolUndefined {
+		compat := "default"
+		switch test.compatSetParent {
+		case types.OptionalBoolFalse:
+			compat = "false"
+		case types.OptionalBoolTrue:
+			compat = "true"
+		}
+		t.Logf("using buildah flag CompatSetParent = %s", compat)
+	}
 	options := define.BuildOptions{
 		ContextDirectory: contextDir,
 		CommonBuildOpts:  &define.CommonBuildOptions{},
@@ -546,6 +581,7 @@ func buildUsingBuildah(ctx context.Context, t *testing.T, store storage.Store, t
 		NoCache:                 true,
 		RemoveIntermediateCtrs:  true,
 		ForceRmIntermediateCtrs: true,
+		CompatSetParent:         test.compatSetParent,
 	}
 	// build the image and gather output. log the output if the build part of the test failed
 	imageID, _, err := imagebuildah.BuildDockerfiles(ctx, store, options, dockerfileName)
@@ -647,8 +683,23 @@ func buildUsingDocker(ctx context.Context, t *testing.T, client *docker.Client, 
 		RmTmpContainer:      true,
 		ForceRmTmpContainer: true,
 	}
-	if test.dockerUseBuildKit {
-		options.Version = docker.BuilderBuildKit
+	if test.dockerUseBuildKit || test.dockerBuilderVersion != "" {
+		if test.dockerBuilderVersion != "" {
+			var version string
+			switch test.dockerBuilderVersion {
+			case docker.BuilderBuildKit:
+				version = "BuildKit"
+			case docker.BuilderV1:
+				version = "V1 (classic)"
+			default:
+				version = "(unknown)"
+			}
+			t.Logf("requesting docker builder %s", version)
+			options.Version = test.dockerBuilderVersion
+		} else {
+			t.Log("requesting docker builder BuildKit")
+			options.Version = docker.BuilderBuildKit
+		}
 	}
 	// build the image and gather output. log the output if the build part of the test failed
 	err = client.BuildImage(options)
@@ -1239,11 +1290,7 @@ func compareJSON(a, b map[string]interface{}, skip []string) (missKeys, leftKeys
 		}
 	}
 
-	replace := func(slice []string) []string {
-		return append([]string{}, slice...)
-	}
-
-	return replace(missKeys), replace(leftKeys), replace(diffKeys), isSame
+	return slices.Clone(missKeys), slices.Clone(leftKeys), slices.Clone(diffKeys), isSame
 }
 
 // configCompareResult summarizes the output of compareJSON for display
@@ -1318,9 +1365,12 @@ type testCase struct {
 	dockerErrRegex       string                    // if set, expect this to be present in output
 	imagebuilderErrRegex string                    // if set, expect this to be present in output
 	failureRegex         string                    // if set, expect this to be present in output when the build fails
+	withoutImagebuilder  bool                      // don't build this with imagebuilder, because it depends on a buildah-specific feature
 	withoutDocker        bool                      // don't build this with docker, because it depends on a buildah-specific feature
 	dockerUseBuildKit    bool                      // if building with docker, request that dockerd use buildkit
-	withoutImagebuilder  bool                      // don't build this with imagebuilder, because it depends on a buildah-specific feature
+	dockerBuilderVersion docker.BuilderVersion     // if building with docker, request the specific builder
+	testUsingSetParent   bool                      // test both with old (gets set) and new (left blank) config.Parent behavior
+	compatSetParent      types.OptionalBool        // placeholder for a value to set for the buildah compatSetParent flag
 	transientMounts      []string                  // one possible buildah-specific feature
 	fsSkip               []string                  // expected filesystem differences, typically timestamps on files or directories we create or modify during the build and don't reset
 }
@@ -1529,8 +1579,9 @@ var internalTestCases = []testCase{
 	},
 
 	{
-		name:       "exposed default",
-		dockerfile: "Dockerfile.exposedefault",
+		name:               "exposed default",
+		dockerfile:         "Dockerfile.exposedefault",
+		testUsingSetParent: true,
 	},
 
 	{
@@ -3102,6 +3153,31 @@ var internalTestCases = []testCase{
 		contextDir:        "multistage/copyback",
 		dockerUseBuildKit: true,
 	},
+
+	{
+		name:              "heredoc-quoting",
+		dockerfile:        "Dockerfile.heredoc-quoting",
+		dockerUseBuildKit: true,
+		fsSkip:            []string{"(dir):etc:(dir):hostname"}, // buildkit does not create a phantom /etc/hostname
+	},
+
+	{
+		name: "workdir with trailing separator",
+		dockerfileContents: strings.Join([]string{
+			"FROM busybox",
+			"USER daemon",
+			"WORKDIR /tmp/",
+		}, "\n"),
+	},
+
+	{
+		name: "workdir without trailing separator",
+		dockerfileContents: strings.Join([]string{
+			"FROM busybox",
+			"USER daemon",
+			"WORKDIR /tmp",
+		}, "\n"),
+	},
 }
 
 func TestCommit(t *testing.T) {
@@ -3566,11 +3642,11 @@ func TestCommit(t *testing.T) {
 				derivedBuilder, err := buildah.NewBuilder(ctx, store, buildah.BuilderOptions{
 					FromImage: buildahID,
 				})
+				require.NoErrorf(t, err, "creating the derived container with buildah")
 				defer func(builder *buildah.Builder) {
 					err := builder.Delete()
 					assert.NoErrorf(t, err, "removing the derived container")
 				}(derivedBuilder)
-				require.NoErrorf(t, err, "creating the derived container with buildah")
 				var overrideConfig *manifest.Schema2Config
 				if test.derivedConfig != nil {
 					overrideConfig = config.Schema2ConfigFromGoDockerclientConfig(test.derivedConfig)
