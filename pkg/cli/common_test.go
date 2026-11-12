@@ -3,10 +3,10 @@ package cli
 import (
 	"testing"
 
-	"github.com/containers/buildah/define"
-	"github.com/containers/common/pkg/completion"
 	"github.com/spf13/pflag"
 	"github.com/stretchr/testify/assert"
+	"go.podman.io/buildah/define"
+	"go.podman.io/common/pkg/completion"
 )
 
 func testFlagCompletion(t *testing.T, flags pflag.FlagSet, flagCompletions completion.FlagCompletions) {
@@ -23,7 +23,6 @@ func testFlagCompletion(t *testing.T, flags pflag.FlagSet, flagCompletions compl
 			t.Errorf(`Flag %q is a bool flag but has a shell completion function set.
 	You have to remove this shell completion function.`, f.Name)
 			return
-
 		}
 	})
 
@@ -36,24 +35,28 @@ func testFlagCompletion(t *testing.T, flags pflag.FlagSet, flagCompletions compl
 }
 
 func TestUserNsFlagsCompletion(t *testing.T) {
+	t.Parallel()
 	flags := GetUserNSFlags(&UserNSResults{})
 	flagCompletions := GetUserNSFlagsCompletions()
 	testFlagCompletion(t, flags, flagCompletions)
 }
 
 func TestNameSpaceFlagsCompletion(t *testing.T) {
+	t.Parallel()
 	flags := GetNameSpaceFlags(&NameSpaceResults{})
 	flagCompletions := GetNameSpaceFlagsCompletions()
 	testFlagCompletion(t, flags, flagCompletions)
 }
 
 func TestBudFlagsCompletion(t *testing.T) {
+	t.Parallel()
 	flags := GetBudFlags(&BudResults{})
 	flagCompletions := GetBudFlagsCompletions()
 	testFlagCompletion(t, flags, flagCompletions)
 }
 
 func TestFromAndBudFlagsCompletions(t *testing.T) {
+	t.Parallel()
 	flags, err := GetFromAndBudFlags(&FromAndBudResults{}, &UserNSResults{}, &NameSpaceResults{})
 	if err != nil {
 		t.Error("Could load the from and build flags.")
@@ -63,6 +66,7 @@ func TestFromAndBudFlagsCompletions(t *testing.T) {
 }
 
 func TestLookupEnvVarReferences(t *testing.T) {
+	t.Parallel()
 	t.Run("EmptyInput", func(t *testing.T) {
 		assert.Empty(t, LookupEnvVarReferences(nil, nil))
 		assert.Empty(t, LookupEnvVarReferences([]string{}, nil))
@@ -115,6 +119,7 @@ func TestLookupEnvVarReferences(t *testing.T) {
 }
 
 func TestDecryptConfig(t *testing.T) {
+	t.Parallel()
 	// Just a smoke test for the default path.
 	res, err := DecryptConfig(nil)
 	assert.NoError(t, err)
@@ -122,6 +127,7 @@ func TestDecryptConfig(t *testing.T) {
 }
 
 func TestEncryptConfig(t *testing.T) {
+	t.Parallel()
 	// Just a smoke test for the default path.
 	cfg, layers, err := EncryptConfig(nil, nil)
 	assert.NoError(t, err)
@@ -130,6 +136,7 @@ func TestEncryptConfig(t *testing.T) {
 }
 
 func TestGetFormat(t *testing.T) {
+	t.Parallel()
 	_, err := GetFormat("bogus")
 	assert.NotNil(t, err)
 

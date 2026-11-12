@@ -1,15 +1,15 @@
 //go:build linux || darwin
-// +build linux darwin
 
-package parse
+package parse //nolint:revive,nolintlint
 
 import (
 	"fmt"
 	"os"
 	"path/filepath"
 
-	"github.com/containers/buildah/define"
-	"github.com/opencontainers/runc/libcontainer/devices"
+	"github.com/moby/sys/devices"
+	"github.com/opencontainers/cgroups/devices/config"
+	"go.podman.io/buildah/define"
 )
 
 func DeviceFromPath(device string) (define.ContainerDevices, error) {
@@ -48,7 +48,7 @@ func DeviceFromPath(device string) (define.ContainerDevices, error) {
 	}
 	for _, d := range srcDevices {
 		d.Path = filepath.Join(dst, filepath.Base(d.Path))
-		d.Permissions = devices.Permissions(permissions)
+		d.Permissions = config.Permissions(permissions)
 		device := define.BuildahDevice{Device: *d, Source: src, Destination: dst}
 		devs = append(devs, device)
 	}

@@ -1,5 +1,4 @@
 //go:build linux || freebsd
-// +build linux freebsd
 
 package chrootuser
 
@@ -15,7 +14,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/containers/storage/pkg/reexec"
+	"go.podman.io/storage/pkg/reexec"
 	"golang.org/x/sys/unix"
 )
 
@@ -76,9 +75,7 @@ func openChrootedFile(rootdir, filename string) (*exec.Cmd, io.ReadCloser, error
 	return cmd, stdout, nil
 }
 
-var (
-	lookupUser, lookupGroup sync.Mutex
-)
+var lookupUser, lookupGroup sync.Mutex
 
 type lookupPasswdEntry struct {
 	name string
@@ -105,51 +102,57 @@ func scanWithoutComments(rc *bufio.Scanner) (string, bool) {
 	}
 }
 
+// parseNextPasswd returns the next entry it can parse. Lines it cannot parse
+// are skipped, so one bad line does not hide the entries after it. It returns
+// nil at the end of the file and when the scanner failed, so callers need to
+// check rc.Err() to tell those two apart.
 func parseNextPasswd(rc *bufio.Scanner) *lookupPasswdEntry {
-	if !rc.Scan() {
-		return nil
+	for rc.Scan() {
+		fields := strings.Split(rc.Text(), ":")
+		if len(fields) != 7 {
+			continue
+		}
+		uid, err := strconv.ParseUint(fields[2], 10, 32)
+		if err != nil {
+			continue
+		}
+		gid, err := strconv.ParseUint(fields[3], 10, 32)
+		if err != nil {
+			continue
+		}
+		return &lookupPasswdEntry{
+			name: fields[0],
+			uid:  uid,
+			gid:  gid,
+			home: fields[5],
+		}
 	}
-	line := rc.Text()
-	fields := strings.Split(line, ":")
-	if len(fields) != 7 {
-		return nil
-	}
-	uid, err := strconv.ParseUint(fields[2], 10, 32)
-	if err != nil {
-		return nil
-	}
-	gid, err := strconv.ParseUint(fields[3], 10, 32)
-	if err != nil {
-		return nil
-	}
-	return &lookupPasswdEntry{
-		name: fields[0],
-		uid:  uid,
-		gid:  gid,
-		home: fields[5],
-	}
+	return nil
 }
 
+// parseNextGroup behaves like parseNextPasswd, see the comment there.
 func parseNextGroup(rc *bufio.Scanner) *lookupGroupEntry {
-	// On FreeBSD, /etc/group may contain comments:
-	//   https://man.freebsd.org/cgi/man.cgi?query=group&sektion=5&format=html
-	// We need to ignore those lines rather than trying to parse them.
-	line, ok := scanWithoutComments(rc)
-	if !ok {
-		return nil
-	}
-	fields := strings.Split(line, ":")
-	if len(fields) != 4 {
-		return nil
-	}
-	gid, err := strconv.ParseUint(fields[2], 10, 32)
-	if err != nil {
-		return nil
-	}
-	return &lookupGroupEntry{
-		name: fields[0],
-		gid:  gid,
-		user: fields[3],
+	for {
+		// On FreeBSD, /etc/group may contain comments:
+		//   https://man.freebsd.org/cgi/man.cgi?query=group&sektion=5&format=html
+		// We need to ignore those lines rather than trying to parse them.
+		line, ok := scanWithoutComments(rc)
+		if !ok {
+			return nil
+		}
+		fields := strings.Split(line, ":")
+		if len(fields) != 4 {
+			continue
+		}
+		gid, err := strconv.ParseUint(fields[2], 10, 32)
+		if err != nil {
+			continue
+		}
+		return &lookupGroupEntry{
+			name: fields[0],
+			gid:  gid,
+			user: fields[3],
+		}
 	}
 }
 
@@ -176,6 +179,9 @@ func lookupUserInContainer(rootdir, username string) (uid uint64, gid uint64, er
 		return pwd.uid, pwd.gid, nil
 	}
 
+	if err := rc.Err(); err != nil {
+		return 0, 0, fmt.Errorf("reading /etc/passwd: %w", err)
+	}
 	return 0, 0, user.UnknownUserError(fmt.Sprintf("error looking up user %q", username))
 }
 
@@ -202,6 +208,9 @@ func lookupGroupForUIDInContainer(rootdir string, userid uint64) (username strin
 		return pwd.name, pwd.gid, nil
 	}
 
+	if err := rc.Err(); err != nil {
+		return "", 0, fmt.Errorf("reading /etc/passwd: %w", err)
+	}
 	return "", 0, ErrNoSuchUser
 }
 
@@ -232,6 +241,9 @@ func lookupAdditionalGroupsForUIDInContainer(rootdir string, userid uint64) (gid
 		}
 		grp = parseNextGroup(rc)
 	}
+	if err := rc.Err(); err != nil {
+		return nil, fmt.Errorf("reading /etc/group: %w", err)
+	}
 	return gid, nil
 }
 
@@ -258,6 +270,9 @@ func lookupGroupInContainer(rootdir, groupname string) (gid uint64, err error) {
 		return grp.gid, nil
 	}
 
+	if err := rc.Err(); err != nil {
+		return 0, fmt.Errorf("reading /etc/group: %w", err)
+	}
 	return 0, user.UnknownGroupError(fmt.Sprintf("error looking up group %q", groupname))
 }
 
@@ -284,7 +299,10 @@ func lookupUIDInContainer(rootdir string, uid uint64) (string, uint64, error) {
 		return pwd.name, pwd.gid, nil
 	}
 
-	return "", 0, user.UnknownUserError(fmt.Sprintf("error looking up uid %q", uid))
+	if err := rc.Err(); err != nil {
+		return "", 0, fmt.Errorf("reading /etc/passwd: %w", err)
+	}
+	return "", 0, user.UnknownUserError(fmt.Sprintf("error looking up uid %d", uid))
 }
 
 func lookupHomedirInContainer(rootdir string, uid uint64) (string, error) {
@@ -310,5 +328,8 @@ func lookupHomedirInContainer(rootdir string, uid uint64) (string, error) {
 		return pwd.home, nil
 	}
 
-	return "", user.UnknownUserError(fmt.Sprintf("error looking up uid %q for homedir", uid))
+	if err := rc.Err(); err != nil {
+		return "", fmt.Errorf("reading /etc/passwd: %w", err)
+	}
+	return "", user.UnknownUserError(fmt.Sprintf("error looking up homedir for uid %d", uid))
 }

@@ -82,6 +82,10 @@ load helpers
   run_buildah from --pull=false $WITH_POLICY_JSON scratch3
   expect_output --substring "scratch3-working-container"
   run_buildah rm $output
+  # Set --pull=never to prevent looking for a newer scratch3 image.
+  run_buildah from --pull=never $WITH_POLICY_JSON scratch3
+  expect_output --substring "scratch3-working-container"
+  run_buildah rm $output
   run_buildah rmi scratch2 scratch3
 
   # GitHub https://github.com/containers/buildah/issues/396#issuecomment-360949396
@@ -106,13 +110,14 @@ load helpers
   run_buildah rm $output
   run_buildah rmi docker.io/alpine:latest
 
-  run_buildah from --quiet --pull=true $WITH_POLICY_JSON docker.io/centos:7
-  run_buildah rm $output
-  run_buildah rmi docker.io/centos:7
+  # FIXME FIXME FIXME: I don't see the point of these. Any reason not to delete?
+#  run_buildah from --quiet --pull=true $WITH_POLICY_JSON docker.io/centos:7
+#  run_buildah rm $output
+#  run_buildah rmi docker.io/centos:7
 
-  run_buildah from --quiet --pull=true $WITH_POLICY_JSON docker.io/centos:latest
-  run_buildah rm $output
-  run_buildah rmi docker.io/centos:latest
+#  run_buildah from --quiet --pull=true $WITH_POLICY_JSON docker.io/centos:latest
+#  run_buildah rm $output
+#  run_buildah rmi docker.io/centos:latest
 }
 
 @test "from the following transports: docker-archive, oci-archive, and dir" {
@@ -120,8 +125,11 @@ load helpers
   run_buildah from --quiet --pull=true $WITH_POLICY_JSON alpine
   run_buildah rm $output
 
-  run_buildah from --quiet --pull=true $WITH_POLICY_JSON docker:latest
-  run_buildah rm $output
+  # #2205: The important thing here is differentiating 'docker:latest'
+  # (the image) from 'docker:/path' ('docker' as a protocol identifier).
+  # This is a parsing fix so we don't actually need to pull the image.
+  run_buildah 125 from --quiet --pull=false $WITH_POLICY_JSON docker:latest
+  assert "$output" = "Error: docker:latest: image not known"
 
   run_buildah push $WITH_POLICY_JSON alpine docker-archive:${TEST_SCRATCH_DIR}/docker-alp.tar:alpine
   run_buildah push $WITH_POLICY_JSON alpine    oci-archive:${TEST_SCRATCH_DIR}/oci-alp.tar:alpine
@@ -165,112 +173,81 @@ load helpers
 @test "from cpu-period test" {
   skip_if_rootless_environment
   skip_if_chroot
-  skip_if_rootless_and_cgroupv1
   skip_if_no_runtime
 
   _prefetch alpine
   run_buildah from --quiet --cpu-period=5000 --pull $WITH_POLICY_JSON alpine
   cid=$output
-  if is_cgroupsv2; then
-    run_buildah run $cid /bin/sh -c "cut -d ' ' -f 2 /sys/fs/cgroup/\$(awk -F: '{print \$NF}' /proc/self/cgroup)/cpu.max"
-  else
-    run_buildah run $cid cat /sys/fs/cgroup/cpu/cpu.cfs_period_us
-  fi
+  run_buildah run $cid /bin/sh -c "cut -d ' ' -f 2 /sys/fs/cgroup/\$(awk -F: '{print \$NF}' /proc/self/cgroup)/cpu.max"
   expect_output "5000"
 }
 
 @test "from cpu-quota test" {
   skip_if_rootless_environment
   skip_if_chroot
-  skip_if_rootless_and_cgroupv1
   skip_if_no_runtime
 
   _prefetch alpine
   run_buildah from --quiet --cpu-quota=5000 --pull=false $WITH_POLICY_JSON alpine
   cid=$output
-  if is_cgroupsv2; then
-    run_buildah run $cid /bin/sh -c "cut -d ' ' -f 1 /sys/fs/cgroup/\$(awk -F: '{print \$NF}' /proc/self/cgroup)/cpu.max"
-  else
-    run_buildah run $cid cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us
-  fi
+  run_buildah run $cid /bin/sh -c "cut -d ' ' -f 1 /sys/fs/cgroup/\$(awk -F: '{print \$NF}' /proc/self/cgroup)/cpu.max"
   expect_output "5000"
 }
 
 @test "from cpu-shares test" {
   skip_if_rootless_environment
   skip_if_chroot
-  skip_if_rootless_and_cgroupv1
   skip_if_no_runtime
 
   _prefetch alpine
-  shares=2
-  run_buildah from --quiet --cpu-shares=${shares} --pull $WITH_POLICY_JSON alpine
-  cid=$output
-  if is_cgroupsv2; then
-    run_buildah run $cid /bin/sh -c "cat /sys/fs/cgroup/\$(awk -F : '{print \$NF}' /proc/self/cgroup)/cpu.weight"
-    expect_output "$((1 + ((${shares} - 2) * 9999) / 262142))"
-  else
-    run_buildah run $cid cat /sys/fs/cgroup/cpu/cpu.shares
-    expect_output "${shares}"
-  fi
+  for shares in 2 200 2000 12345 20000 200000 ; do
+    run_buildah from --quiet --cpu-shares=${shares} --pull $WITH_POLICY_JSON alpine
+    cid=$output
+    local converted="$(convert_v1_shares_to_v2_weight ${shares})"
+    local expect="(weight ${converted##* }|weight ${converted%% *})"
+    run_buildah run $cid /bin/sh -c "echo -n 'weight '; cat /sys/fs/cgroup/\$(awk -F : '{print \$NF}' /proc/self/cgroup)/cpu.weight"
+    echo expected "${expect}"
+    expect_output --substring "${expect}"
+  done
 }
 
 @test "from cpuset-cpus test" {
   skip_if_rootless_environment
   skip_if_chroot
-  skip_if_rootless_and_cgroupv1
   skip_if_no_runtime
 
   _prefetch alpine
   run_buildah from --quiet --cpuset-cpus=0 --pull=false $WITH_POLICY_JSON alpine
   cid=$output
-  if is_cgroupsv2; then
-    run_buildah run $cid /bin/sh -c "cat /sys/fs/cgroup/\$(awk -F : '{print \$NF}' /proc/self/cgroup)/cpuset.cpus"
-  else
-    run_buildah run $cid cat /sys/fs/cgroup/cpuset/cpuset.cpus
-  fi
+  run_buildah run $cid /bin/sh -c "cat /sys/fs/cgroup/\$(awk -F : '{print \$NF}' /proc/self/cgroup)/cpuset.cpus"
   expect_output "0"
 }
 
 @test "from cpuset-mems test" {
   skip_if_rootless_environment
   skip_if_chroot
-  skip_if_rootless_and_cgroupv1
   skip_if_no_runtime
 
   _prefetch alpine
   run_buildah from --quiet --cpuset-mems=0 --pull $WITH_POLICY_JSON alpine
   cid=$output
-  if is_cgroupsv2; then
-   run_buildah run $cid /bin/sh -c "cat /sys/fs/cgroup/\$(awk -F : '{print \$NF}' /proc/self/cgroup)/cpuset.mems"
-  else
-    run_buildah run $cid cat /sys/fs/cgroup/cpuset/cpuset.mems
-  fi
+  run_buildah run $cid /bin/sh -c "cat /sys/fs/cgroup/\$(awk -F : '{print \$NF}' /proc/self/cgroup)/cpuset.mems"
   expect_output "0"
 }
 
 @test "from memory test" {
   skip_if_rootless_environment
   skip_if_chroot
-  skip_if_rootless_and_cgroupv1
-
   _prefetch alpine
   run_buildah from --quiet --memory=40m --memory-swap=70m --pull=false $WITH_POLICY_JSON alpine
   cid=$output
 
-  # Life is much more complicated under cgroups v2
-  mpath='/sys/fs/cgroup/memory/memory.limit_in_bytes'
-  spath='/sys/fs/cgroup/memory/memory.memsw.limit_in_bytes'
-  expect_sw=73400320
-  if is_cgroupsv2; then
-      mpath="/sys/fs/cgroup\$(awk -F: '{print \$3}' /proc/self/cgroup)/memory.max"
-      spath="/sys/fs/cgroup\$(awk -F: '{print \$3}' /proc/self/cgroup)/memory.swap.max"
-      expect_sw=31457280
-  fi
+  mpath="/sys/fs/cgroup\$(awk -F: '{print \$3}' /proc/self/cgroup)/memory.max"
+  spath="/sys/fs/cgroup\$(awk -F: '{print \$3}' /proc/self/cgroup)/memory.swap.max"
   run_buildah run $cid sh -c "cat $mpath"
   expect_output "41943040" "$mpath"
   run_buildah run $cid sh -c "cat $spath"
-  expect_output "$expect_sw" "$spath"
+  expect_output "31457280" "$spath"
 }
 
 @test "from volume test" {
@@ -402,6 +379,12 @@ load helpers
   run_buildah inspect --format "{{.FromImageDigest}}" docker.io/busybox
   fromDigest="$output"
   run_buildah pull $WITH_POLICY_JSON docker.io/busybox
+  run_buildah from $WITH_POLICY_JSON --name busyboxc --pull docker.io/busybox
+  expect_output --substring "Getting"
+  run_buildah rm busyboxc
+  run_buildah from $WITH_POLICY_JSON --name busyboxc --pull=true docker.io/busybox
+  expect_output --substring "Getting"
+  run_buildah rm busyboxc
   run_buildah from $WITH_POLICY_JSON --name busyboxc --pull-always docker.io/busybox
   expect_output --substring "Getting"
   run_buildah commit $WITH_POLICY_JSON busyboxc fakename-img
@@ -431,8 +414,8 @@ load helpers
   run_buildah push $WITH_POLICY_JSON --tls-verify=false --creds testuser:testpassword --encryption-key jwe:${TEST_SCRATCH_DIR}/tmp/mykey.pub busybox oci:${TEST_SCRATCH_DIR}/tmp/busybox_enc
 
   # Try encrypted image without key should fail
-  run_buildah 1 from oci:${TEST_SCRATCH_DIR}/tmp/busybox_enc
-  expect_output --substring "archive/tar: invalid tar header"
+  run_buildah 125 from oci:${TEST_SCRATCH_DIR}/tmp/busybox_enc
+  expect_output --substring "does not match config's DiffID"
 
   # Try encrypted image with wrong key should fail
   run_buildah 125 from --decryption-key ${TEST_SCRATCH_DIR}/tmp/mykey2.pem oci:${TEST_SCRATCH_DIR}/tmp/busybox_enc
@@ -454,8 +437,8 @@ load helpers
   run_buildah push $WITH_POLICY_JSON --tls-verify=false --creds testuser:testpassword --encryption-key jwe:${TEST_SCRATCH_DIR}/tmp/mykey.pub busybox docker://localhost:${REGISTRY_PORT}/buildah/busybox_encrypted:latest
 
   # Try encrypted image without key should fail
-  run_buildah 1 from --tls-verify=false --creds testuser:testpassword docker://localhost:${REGISTRY_PORT}/buildah/busybox_encrypted:latest
-  expect_output --substring "archive/tar: invalid tar header"
+  run_buildah 125 from --tls-verify=false --creds testuser:testpassword docker://localhost:${REGISTRY_PORT}/buildah/busybox_encrypted:latest
+  expect_output --substring "does not match config's DiffID"
 
   # Try encrypted image with wrong key should fail
   run_buildah 125 from --tls-verify=false --creds testuser:testpassword --decryption-key ${TEST_SCRATCH_DIR}/tmp/mykey2.pem docker://localhost:${REGISTRY_PORT}/buildah/busybox_encrypted:latest
@@ -613,22 +596,6 @@ load helpers
   fi
 }
 
-@test "from cni config test" {
-  _prefetch alpine
-
-  cni_config_dir=${TEST_SCRATCH_DIR}/no-cni-configs
-  cni_plugin_path=${TEST_SCRATCH_DIR}/no-cni-plugin
-  mkdir -p ${cni_config_dir}
-  mkdir -p ${cni_plugin_path}
-  run_buildah from -q --cni-config-dir=${cni_config_dir} --cni-plugin-path=${cni_plugin_path} $WITH_POLICY_JSON alpine
-  cid=$output
-
-  run_buildah inspect --format '{{.CNIConfigDir}}' $cid
-  expect_output "${cni_config_dir}"
-  run_buildah inspect --format '{{.CNIPluginPath}}' $cid
-  expect_output "${cni_plugin_path}"
-}
-
 @test "from-image-with-zstd-compression" {
   copy --format oci --dest-compress --dest-compress-format zstd docker://quay.io/libpod/alpine_nginx:latest dir:${TEST_SCRATCH_DIR}/base-image
   run_buildah from dir:${TEST_SCRATCH_DIR}/base-image
@@ -658,17 +625,162 @@ load helpers
 
   _prefetch busybox
   run_buildah from --cidfile ${TEST_SCRATCH_DIR}/cid busybox
-  cid=$(cat ${TEST_SCRATCH_DIR}/cid)
+  cid=$(< ${TEST_SCRATCH_DIR}/cid)
   createrandom ${TEST_SCRATCH_DIR}/randomfile
   run_buildah copy ${cid} ${TEST_SCRATCH_DIR}/randomfile /
   run_buildah commit --iidfile ${TEST_SCRATCH_DIR}/iid ${cid}
-  iid=$(cat ${TEST_SCRATCH_DIR}/iid)
+  iid=$(< ${TEST_SCRATCH_DIR}/iid)
   run_buildah from --cidfile ${TEST_SCRATCH_DIR}/cid2 ${iid}
-  cid2=$(cat ${TEST_SCRATCH_DIR}/cid2)
+  cid2=$(< ${TEST_SCRATCH_DIR}/cid2)
   run_buildah run ${cid2} cat /etc/hosts
   truncated=${iid##*:}
   truncated="${truncated:0:12}"
   expect_output --substring ${truncated}-working-container
   run_buildah run ${cid2} hostname -f
   expect_output "${cid2:0:12}"
+}
+
+@test "from-onbuild-copy-chown-chmod" {
+  mkdir -p ${TEST_SCRATCH_DIR}/onbuild-src
+  echo test > ${TEST_SCRATCH_DIR}/onbuild-src/file1
+  echo test > ${TEST_SCRATCH_DIR}/onbuild-src/file2
+
+  run_buildah from --quiet $WITH_POLICY_JSON scratch
+  cid=$output
+  run_buildah config --onbuild "COPY --chown=1:1 file1 /file1" --onbuild "COPY --chmod=0640 file2 /file2" $cid
+  run_buildah commit $WITH_POLICY_JSON --format docker $cid onbuild-copy-flags
+  run_buildah rm $cid
+
+  pushd ${TEST_SCRATCH_DIR}/onbuild-src > /dev/null
+  run_buildah from --quiet --cidfile ${TEST_SCRATCH_DIR}/cid $WITH_POLICY_JSON onbuild-copy-flags
+  popd > /dev/null
+  cid=$(< ${TEST_SCRATCH_DIR}/cid)
+
+  run_buildah_mount ${cid}
+  root=$output
+  run stat -c '%u:%g' ${root}/file1
+  expect_output "1:1"
+  run stat -c '%a' ${root}/file2
+  expect_output "640"
+  run_buildah_umount ${cid}
+}
+
+@test "from-onbuild-add-honors-chown" {
+  mkdir -p ${TEST_SCRATCH_DIR}/onbuild-src
+  echo test > ${TEST_SCRATCH_DIR}/onbuild-src/file1
+
+  run_buildah from --quiet $WITH_POLICY_JSON scratch
+  cid=$output
+  run_buildah config --onbuild "ADD --chown=1:1 file1 /file1" $cid
+  run_buildah commit $WITH_POLICY_JSON --format docker $cid onbuild-add-chown
+  run_buildah rm $cid
+
+  pushd ${TEST_SCRATCH_DIR}/onbuild-src > /dev/null
+  run_buildah from --quiet --cidfile ${TEST_SCRATCH_DIR}/cid $WITH_POLICY_JSON onbuild-add-chown
+  popd > /dev/null
+  cid=$(< ${TEST_SCRATCH_DIR}/cid)
+
+  run_buildah_mount ${cid}
+  root=$output
+  test -e ${root}/file1
+  run stat -c '%u:%g' ${root}/file1
+  expect_output "1:1"
+  run_buildah_umount ${cid}
+}
+
+@test "from-onbuild-copy-link" {
+  mkdir -p ${TEST_SCRATCH_DIR}/onbuild-src/dir
+  echo test > ${TEST_SCRATCH_DIR}/onbuild-src/dir/file1
+  echo test > ${TEST_SCRATCH_DIR}/onbuild-src/file2
+
+  run_buildah from --quiet $WITH_POLICY_JSON scratch
+  cid=$output
+  run_buildah config --onbuild "COPY --link=false dir/ /flat/" --onbuild "COPY --link file2 /file2" $cid
+  run_buildah commit $WITH_POLICY_JSON --format docker $cid onbuild-copy-more-flags
+  run_buildah rm $cid
+
+  pushd ${TEST_SCRATCH_DIR}/onbuild-src > /dev/null
+  run_buildah from --quiet --cidfile ${TEST_SCRATCH_DIR}/cid $WITH_POLICY_JSON onbuild-copy-more-flags
+  popd > /dev/null
+  cid=$(< ${TEST_SCRATCH_DIR}/cid)
+
+  run_buildah_mount ${cid}
+  root=$output
+  test -e ${root}/flat/file1
+  # --link content is queued as its own layer and only lands in the image at commit time
+  assert "$(test -e ${root}/file2 && echo present)" = "" "--link content should not be in the working container before commit"
+  run_buildah_umount ${cid}
+
+  run_buildah commit $WITH_POLICY_JSON --format docker $cid onbuild-copy-link-committed
+  run_buildah rm $cid
+  run_buildah from --quiet $WITH_POLICY_JSON onbuild-copy-link-committed
+  cid=$output
+  run_buildah_mount ${cid}
+  root=$output
+  test -e ${root}/flat/file1
+  test -e ${root}/file2
+  run_buildah_umount ${cid}
+}
+
+@test "from-onbuild-add-unpack" {
+  mkdir -p ${TEST_SCRATCH_DIR}/onbuild-src
+  echo test > ${TEST_SCRATCH_DIR}/inner.txt
+  tar -c -C ${TEST_SCRATCH_DIR} -f ${TEST_SCRATCH_DIR}/onbuild-src/archive.tar inner.txt
+
+  run_buildah from --quiet $WITH_POLICY_JSON scratch
+  cid=$output
+  run_buildah config --onbuild "ADD --unpack=false archive.tar /nounpack/" --onbuild "ADD --unpack=true archive.tar /unpack/" --onbuild "ADD archive.tar /default/" $cid
+  run_buildah commit $WITH_POLICY_JSON --format docker $cid onbuild-add-unpack
+  run_buildah rm $cid
+
+  pushd ${TEST_SCRATCH_DIR}/onbuild-src > /dev/null
+  run_buildah from --quiet --cidfile ${TEST_SCRATCH_DIR}/cid $WITH_POLICY_JSON onbuild-add-unpack
+  popd > /dev/null
+  cid=$(< ${TEST_SCRATCH_DIR}/cid)
+
+  run_buildah_mount ${cid}
+  root=$output
+  test -f ${root}/nounpack/archive.tar
+  assert "$(test -e ${root}/nounpack/inner.txt && echo present)" = "" "--unpack=false should leave the archive alone"
+  test -e ${root}/unpack/inner.txt
+  test -e ${root}/default/inner.txt
+  run_buildah_umount ${cid}
+}
+
+@test "from-onbuild-invalid-flag-value" {
+  while IFS='|' read -r spec msg; do
+    run_buildah from --quiet $WITH_POLICY_JSON scratch
+    cid=$output
+    run_buildah config --onbuild "$spec" $cid
+    run_buildah commit $WITH_POLICY_JSON --format docker $cid onbuild-bad-value
+    run_buildah rm $cid
+    run_buildah 125 from --quiet $WITH_POLICY_JSON onbuild-bad-value
+    expect_output --substring "$msg"
+    run_buildah rm --all
+    run_buildah rmi onbuild-bad-value
+  done <<'SPECS'
+COPY --link=maybe a /a|invalid value for --link
+ADD --keep-git-dir=maybe a /a|invalid value for --keep-git-dir
+ADD --unpack=maybe a /a|invalid value for --unpack
+SPECS
+}
+
+@test "from-onbuild-wrong-command-flag" {
+  while IFS='|' read -r spec msg; do
+    run_buildah from --quiet $WITH_POLICY_JSON scratch
+    cid=$output
+    run_buildah config --onbuild "$spec" $cid
+    run_buildah commit $WITH_POLICY_JSON --format docker $cid onbuild-wrong-flag
+    run_buildah rm $cid
+    run_buildah 125 from --quiet $WITH_POLICY_JSON onbuild-wrong-flag
+    expect_output --substring "$msg"
+    run_buildah rm --all
+    run_buildah rmi onbuild-wrong-flag
+  done <<'SPECS'
+COPY --parents a /a|unrecognized flag "--parents"
+COPY --keep-git-dir a /a|unrecognized flag "--keep-git-dir"
+COPY --unpack=true a /a|unrecognized flag "--unpack=true"
+ADD --unpack a /a|unrecognized flag "--unpack"
+COPY --exclude=foo a /a|unrecognized flag "--exclude=foo"
+SPECS
 }

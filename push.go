@@ -6,31 +6,31 @@ import (
 	"io"
 	"time"
 
-	"github.com/containers/buildah/pkg/blobcache"
-	"github.com/containers/common/libimage"
-	"github.com/containers/image/v5/docker/reference"
-	"github.com/containers/image/v5/manifest"
-	"github.com/containers/image/v5/pkg/compression"
-	"github.com/containers/image/v5/transports"
-	"github.com/containers/image/v5/types"
 	encconfig "github.com/containers/ocicrypt/config"
-	"github.com/containers/storage"
-	"github.com/containers/storage/pkg/archive"
 	digest "github.com/opencontainers/go-digest"
 	"github.com/sirupsen/logrus"
+	"go.podman.io/buildah/pkg/blobcache"
+	"go.podman.io/common/libimage"
+	"go.podman.io/image/v5/docker/reference"
+	"go.podman.io/image/v5/manifest"
+	"go.podman.io/image/v5/pkg/compression"
+	"go.podman.io/image/v5/transports"
+	"go.podman.io/image/v5/types"
+	"go.podman.io/storage"
+	"go.podman.io/storage/pkg/archive"
 )
 
 // cacheLookupReferenceFunc wraps a BlobCache into a
 // libimage.LookupReferenceFunc to allow for using a BlobCache during
 // image-copy operations.
-func cacheLookupReferenceFunc(directory string, compress types.LayerCompression) libimage.LookupReferenceFunc {
+func cacheLookupReferenceFunc(directory string, compress types.LayerCompression, opts ...blobcache.Option) libimage.LookupReferenceFunc {
 	// Using a closure here allows us to reference a BlobCache without
 	// having to explicitly maintain it in the libimage API.
 	return func(ref types.ImageReference) (types.ImageReference, error) {
 		if directory == "" {
 			return ref, nil
 		}
-		ref, err := blobcache.NewBlobCache(ref, directory, compress)
+		ref, err := blobcache.NewBlobCache(ref, directory, compress, opts...)
 		if err != nil {
 			return nil, fmt.Errorf("using blobcache %q: %w", directory, err)
 		}
@@ -66,6 +66,8 @@ type PushOptions struct {
 	// prebuilt copies of layer blobs that we might otherwise need to
 	// regenerate from on-disk layers, substituting them in the list of
 	// blobs to copy whenever possible.
+	//
+	// Not applicable if SourceLookupReferenceFunc is set.
 	BlobDirectory string
 	// Quiet is a boolean value that determines if minimal output to
 	// the user will be displayed, this is best used for logging.
@@ -90,6 +92,12 @@ type PushOptions struct {
 	// integers in the slice represent 0-indexed layer indices, with support for negative
 	// indexing. i.e. 0 is the first layer, -1 is the last (top-most) layer.
 	OciEncryptLayers *[]int
+	// SourceLookupReference provides a function to look up source
+	// references. Overrides BlobDirectory, if set.
+	SourceLookupReferenceFunc libimage.LookupReferenceFunc
+	// DestinationLookupReference provides a function to look up destination
+	// references.
+	DestinationLookupReferenceFunc libimage.LookupReferenceFunc
 
 	// CompressionFormat is the format to use for the compression of the blobs
 	CompressionFormat *compression.Algorithm
@@ -103,6 +111,12 @@ type PushOptions struct {
 
 // Push copies the contents of the image to a new location.
 func Push(ctx context.Context, image string, dest types.ImageReference, options PushOptions) (reference.Canonical, digest.Digest, error) {
+	select {
+	case <-ctx.Done():
+		return nil, "", ctx.Err()
+	default:
+	}
+
 	libimageOptions := &libimage.PushOptions{}
 	libimageOptions.SignaturePolicyPath = options.SignaturePolicyPath
 	libimageOptions.Writer = options.ReportWriter
@@ -122,10 +136,19 @@ func Push(ctx context.Context, image string, dest types.ImageReference, options 
 	}
 
 	compress := types.PreserveOriginal
-	if options.Compression == archive.Gzip {
+	if options.Compression != archive.Uncompressed {
 		compress = types.Compress
 	}
-	libimageOptions.SourceLookupReferenceFunc = cacheLookupReferenceFunc(options.BlobDirectory, compress)
+	if options.SourceLookupReferenceFunc != nil {
+		libimageOptions.SourceLookupReferenceFunc = options.SourceLookupReferenceFunc
+	} else {
+		var cacheOpts []blobcache.Option
+		if options.CompressionFormat != nil {
+			cacheOpts = append(cacheOpts, blobcache.WithCompressAlgorithm(options.CompressionFormat))
+		}
+		libimageOptions.SourceLookupReferenceFunc = cacheLookupReferenceFunc(options.BlobDirectory, compress, cacheOpts...)
+	}
+	libimageOptions.DestinationLookupReferenceFunc = options.DestinationLookupReferenceFunc
 
 	runtime, err := libimage.RuntimeFromStore(options.Store, &libimage.RuntimeOptions{SystemContext: options.SystemContext})
 	if err != nil {

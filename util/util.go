@@ -1,4 +1,4 @@
-package util
+package util //nolint:revive,nolintlint
 
 import (
 	"errors"
@@ -7,24 +7,24 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"syscall"
 
-	"github.com/containers/buildah/define"
-	"github.com/containers/common/libimage"
-	"github.com/containers/common/pkg/config"
-	"github.com/containers/image/v5/docker/reference"
-	"github.com/containers/image/v5/pkg/shortnames"
-	"github.com/containers/image/v5/signature"
-	"github.com/containers/image/v5/transports/alltransports"
-	"github.com/containers/image/v5/types"
-	"github.com/containers/storage"
 	"github.com/docker/distribution/registry/api/errcode"
 	"github.com/opencontainers/go-digest"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
-	"golang.org/x/exp/slices"
+	"go.podman.io/buildah/define"
+	"go.podman.io/common/libimage"
+	"go.podman.io/common/pkg/config"
+	"go.podman.io/image/v5/docker/reference"
+	"go.podman.io/image/v5/pkg/shortnames"
+	"go.podman.io/image/v5/signature"
+	"go.podman.io/image/v5/transports/alltransports"
+	"go.podman.io/image/v5/types"
+	"go.podman.io/storage"
 )
 
 const (
@@ -35,16 +35,14 @@ const (
 	DefaultTransport = "docker://"
 )
 
-var (
-	// RegistryDefaultPathPrefix contains a per-registry listing of default prefixes
-	// to prepend to image names that only contain a single path component.
-	RegistryDefaultPathPrefix = map[string]string{
-		"index.docker.io": "library",
-		"docker.io":       "library",
-	}
-)
+// RegistryDefaultPathPrefix contains a per-registry listing of default prefixes
+// to prepend to image names that only contain a single path component.
+var RegistryDefaultPathPrefix = map[string]string{
+	"index.docker.io": "library",
+	"docker.io":       "library",
+}
 
-// StringInSlice is deprecated, use golang.org/x/exp/slices.Contains
+// StringInSlice is deprecated, use slices.Contains
 func StringInSlice(s string, slice []string) bool {
 	return slices.Contains(slice, s)
 }
@@ -138,10 +136,10 @@ func ExpandNames(names []string, systemContext *types.SystemContext, store stora
 	return expanded, nil
 }
 
-// FindImage locates the locally-stored image which corresponds to a given name.
-// Please note that the `firstRegistry` argument has been deprecated and has no
+// FindImage locates the locally-stored image which corresponds to a given
+// name.  Please note that the second argument has been deprecated and has no
 // effect anymore.
-func FindImage(store storage.Store, firstRegistry string, systemContext *types.SystemContext, image string) (types.ImageReference, *storage.Image, error) {
+func FindImage(store storage.Store, _ string, systemContext *types.SystemContext, image string) (types.ImageReference, *storage.Image, error) {
 	runtime, err := libimage.RuntimeFromStore(store, &libimage.RuntimeOptions{SystemContext: systemContext})
 	if err != nil {
 		return nil, nil, err
@@ -190,9 +188,8 @@ func ResolveNameToReferences(
 }
 
 // AddImageNames adds the specified names to the specified image.  Please note
-// that the `firstRegistry` argument has been deprecated and has no effect
-// anymore.
-func AddImageNames(store storage.Store, firstRegistry string, systemContext *types.SystemContext, image *storage.Image, addNames []string) error {
+// that the second argument has been deprecated and has no effect anymore.
+func AddImageNames(store storage.Store, _ string, systemContext *types.SystemContext, image *storage.Image, addNames []string) error {
 	runtime, err := libimage.RuntimeFromStore(store, &libimage.RuntimeOptions{SystemContext: systemContext})
 	if err != nil {
 		return err
@@ -338,12 +335,8 @@ func logIfNotErrno(err error, what string, ignores ...syscall.Errno) (logged boo
 	if err == nil {
 		return false
 	}
-	if errno, isErrno := err.(syscall.Errno); isErrno {
-		for _, ignore := range ignores {
-			if errno == ignore {
-				return false
-			}
-		}
+	if errno, ok := err.(syscall.Errno); ok && slices.Contains(ignores, errno) {
+		return false
 	}
 	logrus.Error(what)
 	return true

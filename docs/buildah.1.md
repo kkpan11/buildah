@@ -27,7 +27,16 @@ The CGroup manager to use for container cgroups. Supported values are cgroupfs o
 Note: Setting this flag can cause certain commands to break when called on containers previously created by the other CGroup manager type.
 Note: CGroup manager is not supported in rootless mode when using CGroups Version V1.
 
-**--log-level** **value**
+**--imagestore** *path*
+
+Path under which content for pulled and built images will be stored.  By default, the configured **--root** location
+is used for pulled and built images as well as containers.  If the storage driver is
+*overlay*, then any images which have previously been written to the **--root** location will still
+be available.
+
+This will override the *imagestore* option in containers-storage.conf(5).
+
+**--log-level** *level*
 
 The log level to be used. Either "trace", "debug", "info", "warn", "error", "fatal", or "panic", defaulting to "warn".
 
@@ -51,15 +60,15 @@ include a registry or domain portion.  It is not recommended that this option
 be used, as the default behavior of using the system-wide configuration
 (*/etc/containers/registries.d*) is most often preferred.
 
-**--root** **value**
+**--root** *path*
 
-Storage root dir (default: "/var/lib/containers/storage" for UID 0, "$HOME/.local/share/containers/storage" for other users)
-Default root dir is configured in /etc/containers/storage.conf
+Storage root dir (default: "/var/lib/containers/storage" for UID 0, "$HOME/.local/share/containers/storage" for other users).
+The default root dir is configured in /etc/containers/storage.conf.
 
-**--runroot** **value**
+**--runroot** *path*
 
-Storage state dir (default: "/run/containers/storage" for UID 0, "/run/user/$UID" for other users)
-Default state dir is configured in /etc/containers/storage.conf
+Storage state dir (default: "/run/containers/storage" for UID 0, "/run/user/$UID" for other users).
+The default state dir is configured in /etc/containers/storage.conf.
 
 **--short-name-alias-conf** *path*
 
@@ -85,7 +94,11 @@ specify additional options via the `--storage-opt` flag.
 
 **--storage-opt** **value**
 
-Storage driver option, Default storage driver options are configured in /etc/containers/storage.conf (`$HOME/.config/containers/storage.conf` in rootless mode). The `STORAGE_OPTS` environment variable overrides the default. The --storage-opt specified options overrides all.
+Storage driver option. Default storage driver options are configured in /etc/containers/storage.conf (`$HOME/.config/containers/storage.conf` in rootless mode). The `STORAGE_OPTS` environment variable overrides the default. The --storage-opt specified options override all.
+
+**--transient-store** *bool-value*
+
+Store metadata about containers under the storage state directory (**--runroot**), with the intention that records about them will be removed when the system is rebooted.  Additional garbage collection must still be performed at boot-time, so this option should remain disabled in most configurations. (default: false)
 
 **--userns-gid-map** *mapping*
 

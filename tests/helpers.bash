@@ -7,9 +7,15 @@ BUILDAH_BINARY=${BUILDAH_BINARY:-$TEST_SOURCES/../bin/buildah}
 IMGTYPE_BINARY=${IMGTYPE_BINARY:-$TEST_SOURCES/../bin/imgtype}
 COPY_BINARY=${COPY_BINARY:-$TEST_SOURCES/../bin/copy}
 TUTORIAL_BINARY=${TUTORIAL_BINARY:-$TEST_SOURCES/../bin/tutorial}
+INET_BINARY=${INET_BINARY:-$TEST_SOURCES/../bin/inet}
+DUMPSPEC_BINARY=${DUMPSPEC_BINARY:-$TEST_SOURCES/../bin/dumpspec}
+CRASH_BINARY=${CRASH_BINARY:-$TEST_SOURCES/../bin/crash}
+WAIT_BINARY=${WAIT_BINARY:-$TEST_SOURCES/../bin/wait}
+PASSWD_BINARY=${PASSWD_BINARY:-$TEST_SOURCES/../bin/passwd}
+GRPCNOOP_BINARY=${GRPCNOOP_BINARY:-$TEST_SOURCES/../bin/grpcnoop}
+PIPELOOP_BINARY=${PIPELOOP_BINARY:-$TEST_SOURCES/../bin/pipeloop}
 STORAGE_DRIVER=${STORAGE_DRIVER:-vfs}
 PATH=$(dirname ${BASH_SOURCE})/../bin:${PATH}
-OCI=${CI_DESIRED_RUNTIME:-$(${BUILDAH_BINARY} info --format '{{.host.OCIRuntime}}' || command -v runc || command -v crun)}
 # Default timeout for a buildah command.
 BUILDAH_TIMEOUT=${BUILDAH_TIMEOUT:-300}
 
@@ -18,6 +24,7 @@ SAFEIMAGE_REGISTRY=${SAFEIMAGE_REGISTRY:-quay.io}
 SAFEIMAGE_USER=${SAFEIMAGE_USER:-libpod}
 SAFEIMAGE_NAME=${SAFEIMAGE_NAME:-testimage}
 SAFEIMAGE_TAG=${SAFEIMAGE_TAG:-20221018}
+SAFEIMAGE_DIGEST=sha256:c782d03c968791b10300fb15478f7555be560329c5182ea27cba5fc299c98911
 SAFEIMAGE="${SAFEIMAGE:-$SAFEIMAGE_REGISTRY/$SAFEIMAGE_USER/$SAFEIMAGE_NAME:$SAFEIMAGE_TAG}"
 
 # Prompt to display when logging buildah commands; distinguish root/rootless
@@ -31,6 +38,7 @@ BUDFILES=${TEST_SOURCES}/bud
 
 # Used hundreds of times throughout all the tests
 WITH_POLICY_JSON="--signature-policy ${TEST_SOURCES}/policy.json"
+export CONTAINERS_POLICY_JSON=${TEST_SOURCES}/policy.json
 
 # We don't invoke gnupg directly in many places, but this avoids ENOTTY errors
 # when we invoke it directly in batch mode, and CI runs us without a terminal
@@ -53,6 +61,9 @@ function setup_tests() {
     # me: "but it's a local file path, not a repository name!"
     # buildah/podman: "i dont care. no caps anywhere!"
     TEST_SCRATCH_DIR=$(mktemp -d --dry-run --tmpdir=${BATS_TMPDIR:-${TMPDIR:-/tmp}} buildah_tests.XXXXXX | tr A-Z a-z)
+    if test -z "${TEST_SCRATCH_DIR}" ; then
+        die error creating temporary directory
+    fi
     mkdir --mode=0700 $TEST_SCRATCH_DIR
 
     mkdir -p ${TEST_SCRATCH_DIR}/{root,runroot,sigstore,registries.d}
@@ -68,30 +79,60 @@ EOF
 
     # Common options for all buildah and podman invocations
     ROOTDIR_OPTS="--root ${TEST_SCRATCH_DIR}/root --runroot ${TEST_SCRATCH_DIR}/runroot --storage-driver ${STORAGE_DRIVER}"
-    BUILDAH_REGISTRY_OPTS="--registries-conf ${TEST_SOURCES}/registries.conf --registries-conf-dir ${TEST_SCRATCH_DIR}/registries.d --short-name-alias-conf ${TEST_SCRATCH_DIR}/cache/shortnames.conf"
-    COPY_REGISTRY_OPTS="--registries-conf ${TEST_SOURCES}/registries.conf --registries-conf-dir ${TEST_SCRATCH_DIR}/registries.d --short-name-alias-conf ${TEST_SCRATCH_DIR}/cache/shortnames.conf"
-    PODMAN_REGISTRY_OPTS="--registries-conf ${TEST_SOURCES}/registries.conf"
+
+    # When running in CI, use a local registry for all image pulls
+    local cached=
+    if [[ -n "$CI_USE_REGISTRY_CACHE" ]]; then
+        cached="-cached"
+    fi
+    regconfopt="--registries-conf ${TEST_SOURCES}/registries$cached.conf"
+    regconfdir="--registries-conf-dir ${TEST_SCRATCH_DIR}/registries.d"
+    BUILDAH_REGISTRY_OPTS="${regconfopt} ${regconfdir} --short-name-alias-conf ${TEST_SCRATCH_DIR}/cache/shortnames.conf"
+    COPY_REGISTRY_OPTS="${BUILDAH_REGISTRY_OPTS}"
+    PODMAN_REGISTRY_OPTS="${regconfopt}"
 }
 
-function starthttpd() {
+function starthttpd() { # directoryspecs [working-directory-or-"" [certfile, keyfile]]
+# directoryspecs is a comma-separated list of one or more of:
+# * default content root directory (required)
+# * locationPattern=path (map a location to a path - patterns are passed to a net/http.ServeMux, see documentation associated with the type)
+# * locationPattern=workingDirectory:cgiBinary (map a location to a CGI binary started in a working directory)
+# * locationPattern=workingDirectory:cgiBinary:envVars (as above, but with "key=value" environment variables set, and "key" variables inherited)
+    if test -n "$4" ; then
+      if ! openssl req -newkey rsa:4096 -nodes -sha256 -keyout "$4" -x509 -days 2 -addext "subjectAltName = DNS:localhost,IP:0.0.0.0,IP:127.0.0.1" -out "$3" -subj "/CN=localhost" ; then
+        die error creating new key and certificate
+      fi
+      chmod 644 "$3"
+      chmod 600 "$4"
+    fi
     pushd ${2:-${TEST_SCRATCH_DIR}} > /dev/null
     go build -o serve ${TEST_SOURCES}/serve/serve.go
     portfile=$(mktemp)
     if test -z "${portfile}"; then
-        echo error creating temporaty file
-        exit 1
+        die error creating temporary file
     fi
-    ./serve ${1:-${BATS_TMPDIR}} 0 ${portfile} &
-    HTTP_SERVER_PID=$!
+    pidfile=$(mktemp)
+    if test -z "${pidfile}"; then
+        die error creating temporary file
+    fi
+    sh -c "./serve \"${1:-${BATS_TMPDIR}}\" 0 \"${portfile}\" \"${3}\" \"${4}\" ${pidfile} &"
+    waited=0
+    while ! test -s ${pidfile} ; do
+        sleep 0.1
+        if test $((++waited)) -ge 300 ; then
+            die test http server did not write pid file within timeout
+        fi
+    done
+    HTTP_SERVER_PID=$(< ${pidfile})
+    rm -f ${pidfile}
     waited=0
     while ! test -s ${portfile} ; do
         sleep 0.1
         if test $((++waited)) -ge 300 ; then
-            echo test http server did not start within timeout
-            exit 1
+            die test http server did not start listening within timeout
         fi
     done
-    HTTP_SERVER_PORT=$(cat ${portfile})
+    HTTP_SERVER_PORT=$(< ${portfile})
     rm -f ${portfile}
     popd > /dev/null
 }
@@ -142,9 +183,11 @@ function normalize_image_name() {
 
 function _prefetch() {
     if [ -z "${_BUILDAH_IMAGE_CACHEDIR}" ]; then
-        _pgid=$(sed -ne 's/^NSpgid:\s*//p' /proc/$$/status)
-        export _BUILDAH_IMAGE_CACHEDIR=${BATS_TMPDIR}/buildah-image-cache.$_pgid
+        export _BUILDAH_IMAGE_CACHEDIR=${BATS_SUITE_TMPDIR}/buildah-image-cache
         mkdir -p ${_BUILDAH_IMAGE_CACHEDIR}
+
+        # It's 700 by default; that prevents 'unshare' from reading cached images
+        chmod 711 ${BATS_SUITE_TMPDIR:?is unset} ${BATS_SUITE_TMPDIR}/..
     fi
 
     local storage=
@@ -156,22 +199,33 @@ function _prefetch() {
         img=$(normalize_image_name "$img")
         echo "# [checking for: $img]" >&2
         fname=$(tr -c a-zA-Z0-9.- - <<< "$img")
-        if [ -d $_BUILDAH_IMAGE_CACHEDIR/$fname ]; then
-            echo "# [restoring from cache: $_BUILDAH_IMAGE_CACHEDIR / $img]" >&2
-            copy dir:$_BUILDAH_IMAGE_CACHEDIR/$fname containers-storage:"$storage""$img"
-        else
-            rm -fr $_BUILDAH_IMAGE_CACHEDIR/$fname
-            echo "# [copy docker://$img dir:$_BUILDAH_IMAGE_CACHEDIR/$fname]" >&2
-            for attempt in $(seq 3) ; do
-                if copy $COPY_REGISTRY_OPTS docker://"$img" dir:$_BUILDAH_IMAGE_CACHEDIR/$fname ; then
-                    break
-                fi
-                sleep 5
-            done
-            echo "# [copy dir:$_BUILDAH_IMAGE_CACHEDIR/$fname containers-storage:$storage$img]" >&2
-            copy dir:$_BUILDAH_IMAGE_CACHEDIR/$fname containers-storage:"$storage""$img"
-        fi
+        ( flock --timeout 300 9 || die "Could not flock"; _prefetch_locksafe $img $fname ) 9> $_BUILDAH_IMAGE_CACHEDIR/$fname.lock
     done
+}
+
+# DO NOT CALL THIS. EVER. This must only be called from _prefetch().
+function _prefetch_locksafe() {
+    local img="$1"
+    local fname="$2"
+
+    if [ -d $_BUILDAH_IMAGE_CACHEDIR/$fname ]; then
+        echo "# [restoring from cache: $_BUILDAH_IMAGE_CACHEDIR / $img]" >&2
+        copy dir:$_BUILDAH_IMAGE_CACHEDIR/$fname containers-storage:"$storage""$img"
+    else
+        rm -fr ${_BUILDAH_IMAGE_CACHEDIR:?THIS CAN NEVER HAPPEN}/$fname
+        echo "# [copy docker://$img dir:$_BUILDAH_IMAGE_CACHEDIR/$fname]" >&2
+        for attempt in $(seq 3) ; do
+            if copy $COPY_REGISTRY_OPTS docker://"$img" dir:$_BUILDAH_IMAGE_CACHEDIR/$fname ; then
+                break
+            else
+                # Failed. Clean up, so we don't leave incomplete remnants
+                rm -fr ${_BUILDAH_IMAGE_CACHEDIR:?THIS CAN NEVER HAPPEN EITHER}/$fname
+            fi
+            sleep 5
+        done
+        echo "# [copy dir:$_BUILDAH_IMAGE_CACHEDIR/$fname containers-storage:$storage$img]" >&2
+        copy dir:$_BUILDAH_IMAGE_CACHEDIR/$fname containers-storage:"$storage""$img"
+    fi
 }
 
 function createrandom() {
@@ -190,16 +244,35 @@ function random_string() {
     head /dev/urandom | tr -dc a-zA-Z0-9 | head -c$length
 }
 
+##############
+#  safename  #  Returns a pseudorandom string suitable for container/image/etc names
+##############
+#
+# Name will include the bats test number and a pseudorandom element,
+# eg "t123-xyz123". safename() will return the same string across
+# multiple invocations within a given test; this makes it easier for
+# a maintainer to see common name patterns.
+#
+# String is lower-case so it can be used as an image name
+#
+function safename() {
+    safenamepath=$BATS_SUITE_TMPDIR/.safename.$BATS_SUITE_TEST_NUMBER
+    if [[ ! -e $safenamepath ]]; then
+        echo -n "t${BATS_SUITE_TEST_NUMBER}-$(random_string 8 | tr A-Z a-z)" >$safenamepath
+    fi
+    cat $safenamepath
+}
+
 function buildah() {
     ${BUILDAH_BINARY} ${BUILDAH_REGISTRY_OPTS} ${ROOTDIR_OPTS} "$@"
 }
 
 function imgtype() {
-    ${IMGTYPE_BINARY} ${ROOTDIR_OPTS} "$@"
+    ${IMGTYPE_BINARY} -signature-policy ${TEST_SOURCES}/policy.json ${ROOTDIR_OPTS} "$@"
 }
 
 function copy() {
-    ${COPY_BINARY} --max-parallel-downloads=1 ${ROOTDIR_OPTS} ${BUILDAH_REGISTRY_OPTS} "$@"
+    ${COPY_BINARY} $WITH_POLICY_JSON --max-parallel-downloads=1 ${ROOTDIR_OPTS} ${BUILDAH_REGISTRY_OPTS} "$@"
 }
 
 function podman() {
@@ -234,6 +307,49 @@ function rm() {
     run_unshared rm "$@"
 }
 
+#################
+#  run_with_log  #  Logs command before running it
+#################
+#
+function run_with_log() {
+    local expected_rc=0
+    local retry=1
+    local cmd="$*"
+    case "$1" in
+        [0-9])           expected_rc=$1; shift;;
+        [1-9][0-9])      expected_rc=$1; shift;;
+        [12][0-9][0-9])  expected_rc=$1; shift;;
+        '?')             expected_rc=  ; shift;;  # ignore exit code
+        --retry)         retry=3;        shift;;  # retry with sleep of 1 sec
+    esac
+    while [ $retry -gt 0 ]; do
+        retry=$(( retry - 1 ))
+        echo "$_LOG_PROMPT $cmd"
+        run "$@"
+        echo "$output"
+        if [ "$status" -ne 0 ]; then
+            echo -n "[ rc=$status ";
+            if [ -n "$expected_rc" ]; then
+                if [ "$status" -eq "$expected_rc" ]; then
+                    echo -n "(expected) ";
+                else
+                    echo -n "(** EXPECTED $expected_rc **) ";
+                fi
+            fi
+            echo "]"
+        fi
+        if [ -n "$expected_rc" ]; then
+            if [ "$status" -eq "$expected_rc" ]; then
+                return
+            elif [ $retry -gt 0 ]; then
+                echo "[ RETRYING ]" >&2
+                sleep 1
+            else
+                die "exit code is $status; expected $expected_rc"
+            fi
+        fi
+    done
+}
 
 #################
 #  run_buildah  #  Invoke buildah, with timeout, using BATS 'run'
@@ -270,19 +386,11 @@ function run_buildah() {
     # Remember command args, for possible use in later diagnostic messages
     MOST_RECENT_BUILDAH_COMMAND="buildah $*"
 
-    # If session is rootless and `buildah mount` is invoked, perform unshare,
-    # since normal user cannot mount a filesystem unless they're in a user namespace along with its own mount namespace.
-    if is_rootless; then
-        if [[ "$1" =~ mount ]]; then
-            set "unshare" "$BUILDAH_BINARY" ${BUILDAH_REGISTRY_OPTS} ${ROOTDIR_OPTS} "$@"
-        fi
-    fi
-
     while [ $retry -gt 0 ]; do
         retry=$(( retry - 1 ))
 
         # stdout is only emitted upon error; this echo is to help a debugger
-        echo "${_LOG_PROMPT} $BUILDAH_BINARY $*"
+        echo "${_LOG_PROMPT} ${BUILDAH_BINARY} $*"
         run env CONTAINERS_CONF=${CONTAINERS_CONF:-$(dirname ${BASH_SOURCE})/containers.conf} timeout --foreground --kill=10 $BUILDAH_TIMEOUT ${BUILDAH_BINARY} ${BUILDAH_REGISTRY_OPTS} ${ROOTDIR_OPTS} "$@"
         # without "quotes", multiple lines are glommed together into one
         if [ -n "$output" ]; then
@@ -321,6 +429,49 @@ function run_buildah() {
             fi
         fi
     done
+}
+
+#######################
+#  run_buildah_mount  #  Invoke buildah mount or buildah mount-sshfs, depending on UID
+#######################
+function run_buildah_mount() {
+    case "$1" in
+        [0-9])           expected_rc=$1; shift;;
+        [1-9][0-9])      expected_rc=$1; shift;;
+        [12][0-9][0-9])  expected_rc=$1; shift;;
+        '?')             expected_rc='?'  ; shift;;  # ignore exit code
+    esac
+    if test $(id -u) -eq 0 ; then
+        run_buildah $expected_rc mount "$@"
+    else
+        skip_if_no_sshfs
+        run_buildah $expected_rc mount-sshfs -o no_contain_symlinks "$@"
+    fi
+}
+
+########################
+#  run_buildah_umount  #  Invoke buildah umount or buildah umount-sshfs, depending on UID
+########################
+function run_buildah_umount() {
+    case "$1" in
+        [0-9])           expected_rc=$1; shift;;
+        [1-9][0-9])      expected_rc=$1; shift;;
+        [12][0-9][0-9])  expected_rc=$1; shift;;
+        '?')             expected_rc='?'  ; shift;;  # ignore exit code
+    esac
+    if test $(id -u) -eq 0 ; then
+        run_buildah $expected_rc umount "$@"
+    else
+        run_buildah $expected_rc umount-sshfs "$@"
+    fi
+}
+
+######################
+#  find_oci_runtime  #  Sets $OCI to the command for the OCI runtime, for invoking it directly
+######################
+function find_oci_runtime() {
+    run_buildah info --format '{{.host.OCIRuntime}}'
+    OCI="$output"
 }
 
 #########
@@ -445,7 +596,7 @@ function expect_output() {
     # option processing: recognize --from="...", --substring
     local opt
     for opt; do
-        local value=$(expr "$opt" : '[^=]*=\(.*\)')
+        local value=$(expr -- "$opt" : '[^=]*=\(.*\)')
         case "$opt" in
             --from=*)       actual="$value";   shift;;
             --substring)    operator='=~';     shift;;
@@ -498,9 +649,9 @@ function is_rootless() {
     [ "$(id -u)" -ne 0 ]
 }
 
-#################
+#############################
 #  has_supplemental_groups  #  Check that account has additional groups
-#################
+#############################
 function has_supplemental_groups() {
     [ "$(id -g)" != "$(id -G)" ]
 }
@@ -541,21 +692,13 @@ function skip_if_rootless() {
     fi
 }
 
-##################################
-#  skip_if_rootless_and_cgroupv1 #
-##################################
-function skip_if_rootless_and_cgroupv1() {
-    if test "$BUILDAH_ISOLATION" = "rootless"; then
-        if ! is_cgroupsv2; then
-            skip "${1:-test does not work when \$BUILDAH_ISOLATION = rootless} and not cgroupv2"
-        fi
-    fi
-}
 
 ########################
 #  skip_if_no_runtime  #  'buildah run' can't work without a runtime
 ########################
 function skip_if_no_runtime() {
+    find_oci_runtime
+
     if type -p "${OCI}" &> /dev/null; then
         return
     fi
@@ -573,29 +716,16 @@ function skip_if_no_podman() {
     fi
 }
 
-##################
-#  is_cgroupsv2  #  Returns true if host system has cgroupsv2 enabled
-##################
-function is_cgroupsv2() {
-    local cgroupfs_t=$(stat -f -c %T /sys/fs/cgroup)
-    test "$cgroupfs_t" = "cgroup2fs"
-}
-
-#######################
-#  skip_if_cgroupsv2  #  Some tests don't work with cgroupsv2
-#######################
-function skip_if_cgroupsv2() {
-    if is_cgroupsv2; then
-        skip "${1:-test does not work with cgroups v2}"
+######################
+#  skip_if_no_sshfs  #  we need 'sshfs' to mount things as an unprivileged user
+######################
+function skip_if_no_sshfs() {
+    if ! [ -c /dev/fuse ]; then
+        skip "/dev/fuse is not available for sshfs"
     fi
-}
-
-#######################
-#  skip_if_cgroupsv1  #  Some tests don't work with cgroupsv1
-#######################
-function skip_if_cgroupsv1() {
-    if ! is_cgroupsv2; then
-        skip "${1:-test does not work with cgroups v1}"
+    run which ${SSHFS_BINARY:-sshfs}
+    if [[ $status -ne 0 ]]; then
+        skip "sshfs is not installed"
     fi
 }
 
@@ -622,6 +752,9 @@ function skip_if_no_docker() {
   fi
 }
 
+########################
+#  skip_if_no_unshare  #
+########################
 function skip_if_no_unshare() {
   run which ${UNSHARE_BINARY:-unshare}
   if [[ $status -ne 0 ]]; then
@@ -644,21 +777,62 @@ function skip_if_no_unshare() {
   fi
 }
 
+######################
+#  skip_unless_arch  #
+######################
+function skip_unless_arch() {
+  local goarch
+  goarch="$(go env GOARCH 2>/dev/null)"
+
+  [ -z "$goarch" ] && return 0
+
+  for arch in "$@"; do
+    if [ "$arch" = "$goarch" ]; then
+      return 0
+    fi
+  done
+
+  skip "test requires one of these architectures: $* (current: $goarch)"
+}
+
+######################
+#  start_git_daemon  #
+######################
 function start_git_daemon() {
   daemondir=${TEST_SCRATCH_DIR}/git-daemon
   mkdir -p ${daemondir}/repo
   gzip -dc < ${1:-${TEST_SOURCES}/git-daemon/repo.tar.gz} | tar x -C ${daemondir}/repo
-  GITPORT=$(($RANDOM + 32768))
-  git daemon --detach --pid-file=${TEST_SCRATCH_DIR}/git-daemon/pid --reuseaddr --port=${GITPORT} --base-path=${daemondir} ${daemondir}
+
+  # git >=2.45 aborts with "dubious ownership" error if serving other user's files as root
+  if ! is_rootless; then
+      chown -R root:root ${daemondir}/repo
+  fi
+
+  ${INET_BINARY} -port-file ${TEST_SCRATCH_DIR}/git-daemon/port -pid-file=${TEST_SCRATCH_DIR}/git-daemon/pid -- git daemon --inetd --base-path=${daemondir} ${daemondir} &
+
+  local waited=0
+  while ! test -s ${TEST_SCRATCH_DIR}/git-daemon/pid ; do
+    sleep 0.1
+    if test $((++waited)) -ge 300 ; then
+      die test git server did not write pid file within timeout
+    fi
+  done
+  GITPORT=$(< ${TEST_SCRATCH_DIR}/git-daemon/port)
 }
 
+#####################
+#  stop_git_daemon  #
+#####################
 function stop_git_daemon() {
   if test -s ${TEST_SCRATCH_DIR}/git-daemon/pid ; then
-    kill $(cat ${TEST_SCRATCH_DIR}/git-daemon/pid)
+    kill $(< ${TEST_SCRATCH_DIR}/git-daemon/pid)
     rm -f ${TEST_SCRATCH_DIR}/git-daemon/pid
   fi
 }
 
+####################
+#  start_registry  #
+####################
 # Bring up a registry server using buildah with vfs and chroot as a cheap
 # substitute for podman, accessible only to user $1 using password $2 on the
 # local system at a dynamically-allocated port.
@@ -670,7 +844,7 @@ function stop_git_daemon() {
 function start_registry() {
   local testuser="${1:-testuser}"
   local testpassword="${2:-testpassword}"
-  local REGISTRY_IMAGE=quay.io/libpod/registry:2.8
+  local REGISTRY_IMAGE=quay.io/libpod/registry:2.8.2
   local config='
 version: 0.1
 log:
@@ -700,7 +874,7 @@ auth:
 '
   # roughly equivalent to "htpasswd -nbB testuser testpassword", the registry uses
   # the same package this does for verifying passwords against hashes in htpasswd files
-  htpasswd=${testuser}:$(buildah passwd ${testpassword})
+  htpasswd=${testuser}:$(${PASSWD_BINARY} ${testpassword})
 
   # generate the htpasswd and config.yml files for the registry
   mkdir -p "${TEST_SCRATCH_DIR}"/registry/root "${TEST_SCRATCH_DIR}"/registry/run "${TEST_SCRATCH_DIR}"/registry/certs "${TEST_SCRATCH_DIR}"/registry/config
@@ -752,6 +926,9 @@ auth:
   fi
 }
 
+###################
+#  stop_registry  #
+###################
 function stop_registry() {
   if test -n "${REGISTRY_PID}" ; then
     kill "${REGISTRY_PID}"
@@ -764,4 +941,217 @@ function stop_registry() {
     rm -fr "${REGISTRY_DIR}"
   fi
   unset REGISTRY_DIR
+}
+
+###############################
+#  oci_image_manifest_digest  #
+###############################
+# prints the digest of the form "sha256:xxx" of the manifest for the main image
+# in an OCI layout in "$1"
+function oci_image_manifest_digest() {
+  run jq -r '.manifests[0].digest' "$1"/index.json
+  assert $status = 0 "looking for the digest of the image manifest"
+  assert "$output" != ""
+  echo "$output"
+}
+
+########################
+#  oci_image_manifest  #
+########################
+# prints the relative path of the manifest for the main image in an OCI
+# layout in "$1"
+function oci_image_manifest() {
+  local diff_id=$(oci_image_manifest_digest "$@")
+  local alg=${diff_id%%:*}
+  local val=${diff_id##*:}
+  echo blobs/"$alg"/"$val"
+}
+
+#############################
+#  oci_image_config_digest  #
+#############################
+# prints the digest of the form "sha256:xxx" of the config blob for the main
+# image in an OCI layout in "$1"
+function oci_image_config_digest() {
+  local digest=$(oci_image_manifest_digest "$1")
+  local alg=${digest%%:*}
+  local val=${digest##*:}
+  run jq -r '.config.digest' "$1"/blobs/"$alg"/"$val"
+  assert $status = 0 "looking for the digest of the image config"
+  assert "$output" != ""
+  echo "$output"
+}
+
+######################
+#  oci_image_config  #
+######################
+# prints the relative path of the config blob for the main image in an OCI
+# layout in "$1"
+function oci_image_config() {
+  local diff_id=$(oci_image_config_digest "$@")
+  local alg=${diff_id%%:*}
+  local val=${diff_id##*:}
+  echo blobs/"$alg"/"$val"
+}
+
+########################
+#  oci_image_diff_ids  #
+########################
+# prints the list of digests of the diff IDs for the main image in an OCI
+# layout in "$1"
+function oci_image_diff_ids() {
+  local digest=$(oci_image_config_digest "$1")
+  local alg=${digest%%:*}
+  local val=${digest##*:}
+  run jq -r '.rootfs.diff_ids[]' "$1"/blobs/"$alg"/"$val"
+  assert $status = 0 "looking for the diff IDs in the image config"
+  assert "$output" != ""
+  echo "$output"
+}
+
+#######################
+#  oci_image_diff_id  #
+#######################
+# prints a single diff ID for the main image in an OCI layout in "$1", choosing
+# which one to print based on an index and arithmetic operands passed in
+# subsequent arguments
+function oci_image_diff_id() {
+  local diff_ids=($(oci_image_diff_ids "$1"))
+  shift
+  case "$*" in
+      -*) echo ${diff_ids[$((${#diff_ids[@]} "$@"))]} ;;
+      *) echo ${diff_ids[$(("$@"))]} ;;
+  esac
+}
+
+############################
+#  oci_image_last_diff_id  #
+############################
+# prints the diff ID of the most recent layer for the main image in an OCI
+# layout in "$1"
+function oci_image_last_diff_id() {
+  local diff_id=($(oci_image_diff_id "$1" - 1))
+  echo "$diff_id"
+}
+
+####################
+#  oci_image_diff  #
+####################
+# prints the relative path of a single layer diff for the main image in an OCI
+# layout in "$1", choosing which one to print based on an index and arithmetic
+# operands passed in subsequent arguments
+function oci_image_diff() {
+  local diff_id=$(oci_image_diff_id "$@")
+  local alg=${diff_id%%:*}
+  local val=${diff_id##*:}
+  echo blobs/"$alg"/"$val"
+}
+
+#########################
+#  oci_image_last_diff  #
+#########################
+# prints the relative path of the most recent layer for the main image in an
+# OCI layout in "$1"
+function oci_image_last_diff() {
+  local output=$(oci_image_diff "$1" - 1)
+  echo "$output"
+}
+
+#############################
+#  dir_image_config_digest  #
+#############################
+# prints the digest of the form "sha256:xxx" of the config blob for the "dir"
+# image in "$1"
+function dir_image_config_digest() {
+  run jq -r '.config.digest' "$1"/manifest.json
+  assert $status = 0 "looking for the digest of the image config"
+  assert "$output" != ""
+  echo "$output"
+}
+
+########################
+#  dir_image_diff_ids  #
+########################
+# prints the list of digests of the diff IDs for the "dir" image in "$1"
+function dir_image_diff_ids() {
+  local digest=$(dir_image_config_digest "$1")
+  local alg=${digest%%:*}
+  local val=${digest##*:}
+  run jq -r '.rootfs.diff_ids[]' "$1"/"$val"
+  assert $status = 0 "looking for the diff IDs in the image config"
+  assert "$output" != ""
+  echo "$output"
+}
+
+#######################
+#  dir_image_diff_id  #
+#######################
+# prints a single diff ID for the "dir" image in "$1", choosing which one to
+# print based on an index and arithmetic operands passed in subsequent
+# arguments
+function dir_image_diff_id() {
+  local diff_ids=($(dir_image_diff_ids "$1"))
+  shift
+  case "$*" in
+      -*) echo ${diff_ids[$((${#diff_ids[@]} "$@"))]} ;;
+      *) echo ${diff_ids[$(("$@"))]} ;;
+  esac
+}
+
+############################
+#  dir_image_last_diff_id  #
+############################
+# prints the diff ID of the most recent layer for "dir" image in "$1"
+function dir_image_last_diff_id() {
+  local diff_id=($(dir_image_diff_id "$1" - 1))
+  echo "$diff_id"
+}
+
+######################
+#  dir_image_config  #
+######################
+# prints the relative path of the config blob for the "dir" image in "$1"
+function dir_image_config() {
+  local diff_id=$(dir_image_config_digest "$@")
+  local alg=${diff_id%%:*}
+  local val=${diff_id##*:}
+  echo "$val"
+}
+
+####################
+#  dir_image_diff  #
+####################
+# prints the relative path of a single layer diff for the "dir" image in "$1",
+# choosing which one to print based on an index and arithmetic operands passed
+# in subsequent arguments
+function dir_image_diff() {
+  local diff_id=$(dir_image_diff_id "$@")
+  local alg=${diff_id%%:*}
+  local val=${diff_id##*:}
+  echo "$val"
+}
+
+#########################
+#  dir_image_last_diff  #
+#########################
+# prints the relative path of the most recent layer for "dir" image in "$1"
+function dir_image_last_diff() {
+  local output=$(dir_image_diff "$1" - 1)
+  echo "$output"
+}
+
+####################################
+#  convert_v1_shares_to_v2_weight  #
+####################################
+function convert_v1_shares_to_v2_weight() {
+  # https://kubernetes.io/blog/2026/01/30/new-cgroup-v1-to-v2-cpu-conversion-formula/
+  # there's an old way to convert the value, and a new way to convert the value, and we
+  # don't know which one our runtime is using, so return the values we would get from
+  # using both methods
+  local shares="$1"
+  local oldconverted="$((1 + ((${shares} - 2) * 9999) / 262142))"
+  test -n "$oldconverted"
+  local newconverted=$(awk '{if ($1 <= 2) { print "1"} else if ($1 >= 262144) {print "10000"} else {l=log($1)/log(2); e=((((l+125)*l)/612.0) - 7.0/34.0); p = exp(e*log(10)); if ( p == int(p) ) {print p} else { print int(p+1) }}}' <<< "${shares}")
+  test -n "$newconverted"
+  echo "$oldconverted" "$newconverted"
 }

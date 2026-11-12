@@ -11,9 +11,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/containers/buildah/internal/tmpdir"
 	"github.com/opencontainers/selinux/go-selinux"
 	"github.com/sirupsen/logrus"
+	"go.podman.io/buildah/internal/tmpdir"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 )
@@ -38,7 +38,7 @@ func NewAgentServer(source *Source) (*AgentServer, error) {
 }
 
 // newAgentServerKeyring creates a new agent from scratch and adds keys
-func newAgentServerKeyring(keys []interface{}) (*AgentServer, error) {
+func newAgentServerKeyring(keys []any) (*AgentServer, error) {
 	a := agent.NewKeyring()
 	for _, k := range keys {
 		if err := a.Add(agent.AddedKey{PrivateKey: k}); err != nil {
@@ -64,14 +64,13 @@ func newAgentServerSocket(socketPath string) (*AgentServer, error) {
 		conn:     &conn,
 		shutdown: make(chan bool, 1),
 	}, nil
-
 }
 
 // Serve starts the SSH agent on the host and returns the path of the socket where the agent is serving
 func (a *AgentServer) Serve(processLabel string) (string, error) {
 	// Calls to `selinux.SetSocketLabel` should be wrapped in
 	// runtime.LockOSThread()/runtime.UnlockOSThread() until
-	// the the socket is created to guarantee another goroutine
+	// the socket is created to guarantee another goroutine
 	// does not migrate to the current thread before execution
 	// is complete.
 	// Ref: https://github.com/opencontainers/selinux/blob/main/go-selinux/selinux.go#L158
@@ -104,7 +103,7 @@ func (a *AgentServer) Serve(processLabel string) (string, error) {
 
 	go func() {
 		for {
-			//listener.Accept blocks
+			// listener.Accept blocks
 			c, err := listener.Accept()
 			if err != nil {
 				select {
@@ -115,15 +114,13 @@ func (a *AgentServer) Serve(processLabel string) (string, error) {
 					continue
 				}
 			}
-			a.wg.Add(1)
-			go func() {
+			a.wg.Go(func() {
 				// agent.ServeAgent will only ever return with error,
 				err := agent.ServeAgent(a.agent, c)
 				if err != io.EOF {
 					logrus.Errorf("error serving agent: %v", err)
 				}
-				a.wg.Done()
-			}()
+			})
 			// the only way to get agent.ServeAgent is to close the connection it's serving on
 			// TODO: ideally we should use some sort of forwarding mechanism for output instead of manually closing connection.
 			go func() {
@@ -192,12 +189,12 @@ func (a *readOnlyAgent) Extension(_ string, _ []byte) ([]byte, error) {
 // The source of the forwarded agent can be from a socket on the host, or from individual key files
 type Source struct {
 	Socket string
-	Keys   []interface{}
+	Keys   []any
 }
 
 // NewSource takes paths and checks of they are keys or sockets, and creates a source
 func NewSource(paths []string) (*Source, error) {
-	var keys []interface{}
+	var keys []any
 	var socket string
 	if len(paths) == 0 {
 		socket = os.Getenv("SSH_AUTH_SOCK")

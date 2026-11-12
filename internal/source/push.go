@@ -5,12 +5,12 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/containers/buildah/pkg/parse"
-	"github.com/containers/image/v5/copy"
-	"github.com/containers/image/v5/manifest"
-	"github.com/containers/image/v5/oci/layout"
-	"github.com/containers/image/v5/signature"
-	"github.com/containers/image/v5/types"
+	"go.podman.io/buildah/pkg/parse"
+	"go.podman.io/image/v5/copy"
+	"go.podman.io/image/v5/manifest"
+	"go.podman.io/image/v5/oci/layout"
+	"go.podman.io/image/v5/signature"
+	"go.podman.io/image/v5/types"
 )
 
 // PushOptions includes data to alter certain knobs when pushing a source
@@ -29,6 +29,12 @@ type PushOptions struct {
 // Push the source image at `sourcePath` to `imageInput` at a container
 // registry.
 func Push(ctx context.Context, sourcePath string, imageInput string, options PushOptions) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
 	srcRef, err := layout.ParseReference(sourcePath)
 	if err != nil {
 		return err
@@ -74,7 +80,7 @@ func Push(ctx context.Context, sourcePath string, imageInput string, options Pus
 		if err != nil {
 			return fmt.Errorf("computing digest of manifest of source: %w", err)
 		}
-		if err = os.WriteFile(options.DigestFile, []byte(manifestDigest.String()), 0644); err != nil {
+		if err = os.WriteFile(options.DigestFile, []byte(manifestDigest.String()+"\n"), 0o644); err != nil {
 			return fmt.Errorf("failed to write digest to file %q: %w", options.DigestFile, err)
 		}
 	}

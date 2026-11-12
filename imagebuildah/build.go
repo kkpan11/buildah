@@ -5,39 +5,44 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	gotypes "go/types"
 	"io"
+	"maps"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
-	"github.com/containerd/containerd/platforms"
-	"github.com/containers/buildah"
-	"github.com/containers/buildah/define"
-	internalUtil "github.com/containers/buildah/internal/util"
-	"github.com/containers/buildah/pkg/parse"
-	"github.com/containers/buildah/util"
-	"github.com/containers/common/libimage"
-	"github.com/containers/common/pkg/config"
-	"github.com/containers/image/v5/docker"
-	"github.com/containers/image/v5/docker/reference"
-	"github.com/containers/image/v5/manifest"
-	"github.com/containers/image/v5/pkg/shortnames"
-	istorage "github.com/containers/image/v5/storage"
-	"github.com/containers/image/v5/types"
-	"github.com/containers/storage"
-	"github.com/containers/storage/pkg/archive"
+	"github.com/containerd/platforms"
 	"github.com/hashicorp/go-multierror"
 	"github.com/mattn/go-shellwords"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/openshift/imagebuilder"
 	"github.com/sirupsen/logrus"
-	"golang.org/x/exp/slices"
+	"go.podman.io/buildah"
+	"go.podman.io/buildah/define"
+	"go.podman.io/buildah/internal"
+	"go.podman.io/buildah/internal/ctxreader"
+	internalUtil "go.podman.io/buildah/internal/util"
+	"go.podman.io/buildah/pkg/parse"
+	"go.podman.io/buildah/util"
+	"go.podman.io/common/libimage"
+	"go.podman.io/common/pkg/config"
+	"go.podman.io/image/v5/docker"
+	"go.podman.io/image/v5/docker/reference"
+	"go.podman.io/image/v5/image"
+	"go.podman.io/image/v5/manifest"
+	"go.podman.io/image/v5/pkg/shortnames"
+	istorage "go.podman.io/image/v5/storage"
+	"go.podman.io/image/v5/types"
+	"go.podman.io/storage"
+	"go.podman.io/storage/pkg/archive"
 	"golang.org/x/sync/semaphore"
 )
 
@@ -66,8 +71,17 @@ type BuildOptions = define.BuildOptions
 // returns the ID of the built image, and if a name was assigned to it, a
 // canonical reference for that image.
 func BuildDockerfiles(ctx context.Context, store storage.Store, options define.BuildOptions, paths ...string) (id string, ref reference.Canonical, err error) {
+	select {
+	case <-ctx.Done():
+		return "", nil, ctx.Err()
+	default:
+	}
+
 	if options.CommonBuildOpts == nil {
 		options.CommonBuildOpts = &define.CommonBuildOptions{}
+	}
+	if options.Args == nil {
+		options.Args = make(map[string]string)
 	}
 	if err := parse.Volumes(options.CommonBuildOpts.Volumes); err != nil {
 		return "", nil, fmt.Errorf("validating volumes: %w", err)
@@ -75,8 +89,16 @@ func BuildDockerfiles(ctx context.Context, store storage.Store, options define.B
 	if len(paths) == 0 {
 		return "", nil, errors.New("building: no dockerfiles specified")
 	}
-	if len(options.Platforms) > 1 && options.IIDFile != "" {
-		return "", nil, fmt.Errorf("building multiple images, but iidfile %q can only be used to store one image ID", options.IIDFile)
+	if len(options.Platforms) > 1 {
+		if options.IIDFile != "" {
+			return "", nil, fmt.Errorf("building multiple images, but iidfile %q can only be used to store one image ID", options.IIDFile)
+		}
+		if options.IIDFileRaw != "" {
+			return "", nil, fmt.Errorf("building multiple images, but iidfile-raw %q can only be used to store one image ID", options.IIDFileRaw)
+		}
+		if options.MetadataFile != "" {
+			return "", nil, fmt.Errorf("building multiple images, but metadata file %q can only be used to store information about one image", options.MetadataFile)
+		}
 	}
 
 	logger := logrus.New()
@@ -87,12 +109,7 @@ func BuildDockerfiles(ctx context.Context, store storage.Store, options define.B
 	}
 	logger.SetLevel(logrus.GetLevel())
 
-	var dockerfiles []io.ReadCloser
-	defer func(dockerfiles ...io.ReadCloser) {
-		for _, d := range dockerfiles {
-			d.Close()
-		}
-	}(dockerfiles...)
+	var dockerfiles []io.Reader
 
 	for _, tag := range append([]string{options.Output}, options.AdditionalTags...) {
 		if tag == "" {
@@ -104,16 +121,20 @@ func BuildDockerfiles(ctx context.Context, store storage.Store, options define.B
 	}
 
 	for _, dfile := range paths {
-		var data io.ReadCloser
+		var data io.Reader
 
 		if strings.HasPrefix(dfile, "http://") || strings.HasPrefix(dfile, "https://") {
 			logger.Debugf("reading remote Dockerfile %q", dfile)
-			resp, err := http.Get(dfile)
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, dfile, nil)
 			if err != nil {
 				return "", nil, err
 			}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				return "", nil, err
+			}
+			defer resp.Body.Close()
 			if resp.ContentLength == 0 {
-				resp.Body.Close()
 				return "", nil, fmt.Errorf("no contents in %q", dfile)
 			}
 			data = resp.Body
@@ -138,30 +159,35 @@ func BuildDockerfiles(ctx context.Context, store storage.Store, options define.B
 			}
 			contents, err = os.Open(dfile)
 			if err != nil {
-				return "", nil, err
+				return "", nil, fmt.Errorf("reading build instructions: %w", err)
 			}
+			defer contents.Close()
 			dinfo, err = contents.Stat()
 			if err != nil {
-				contents.Close()
 				return "", nil, fmt.Errorf("reading info about %q: %w", dfile, err)
 			}
 			if dinfo.Mode().IsRegular() && dinfo.Size() == 0 {
-				contents.Close()
 				return "", nil, fmt.Errorf("no contents in %q", dfile)
 			}
-			data = contents
+			data = ctxreader.NewCancelableReader(ctx, contents)
 		}
 
 		// pre-process Dockerfiles with ".in" suffix
 		if strings.HasSuffix(dfile, ".in") {
-			pData, err := preprocessContainerfileContents(logger, dfile, data, options.ContextDirectory, options.CPPFlags)
+			pData, err := preprocessContainerfileContents(ctx, logger, dfile, data, options.ContextDirectory, options.CPPFlags)
 			if err != nil {
 				return "", nil, err
 			}
-			data = io.NopCloser(pData)
+			data = pData
 		}
 
 		dockerfiles = append(dockerfiles, data)
+
+		select {
+		case <-ctx.Done():
+			return "", nil, ctx.Err()
+		default:
+		}
 	}
 
 	var files [][]byte
@@ -200,6 +226,9 @@ func BuildDockerfiles(ctx context.Context, store storage.Store, options define.B
 	if options.SystemContext == nil {
 		options.SystemContext = &types.SystemContext{}
 	}
+	if options.AdditionalBuildContexts == nil {
+		options.AdditionalBuildContexts = make(map[string]*define.AdditionalBuildContext)
+	}
 
 	if len(options.Platforms) == 0 {
 		options.Platforms = append(options.Platforms, struct{ OS, Arch, Variant string }{
@@ -209,18 +238,38 @@ func BuildDockerfiles(ctx context.Context, store storage.Store, options define.B
 	}
 
 	if options.AllPlatforms {
-		if options.AdditionalBuildContexts == nil {
-			options.AdditionalBuildContexts = make(map[string]*define.AdditionalBuildContext)
-		}
 		options.Platforms, err = platformsForBaseImages(ctx, logger, paths, files, options.From, options.Args, options.AdditionalBuildContexts, options.SystemContext)
 		if err != nil {
 			return "", nil, err
 		}
 	}
 
+	if sourceDateEpoch, ok := options.Args[internal.SourceDateEpochName]; ok && options.SourceDateEpoch == nil {
+		sde, err := strconv.ParseInt(sourceDateEpoch, 10, 64)
+		if err != nil {
+			return "", nil, fmt.Errorf("parsing SOURCE_DATE_EPOCH build-arg %q: %w", sourceDateEpoch, err)
+		}
+		sdeTime := time.Unix(sde, 0)
+		options.SourceDateEpoch = &sdeTime
+	}
+
 	systemContext := options.SystemContext
 	for _, platform := range options.Platforms {
 		platformContext := *systemContext
+		if platform.OS == "" && platform.Arch != "" {
+			platform.OS = runtime.GOOS
+		}
+		if platform.OS == "" && platform.Arch == "" {
+			if targetPlatform, ok := options.Args["TARGETPLATFORM"]; ok {
+				targetPlatform, err := platforms.Parse(targetPlatform)
+				if err != nil {
+					return "", nil, fmt.Errorf("parsing TARGETPLATFORM value %q: %w", targetPlatform, err)
+				}
+				platform.OS = targetPlatform.OS
+				platform.Arch = targetPlatform.Architecture
+				platform.Variant = targetPlatform.Variant
+			}
+		}
 		platformSpec := internalUtil.NormalizePlatform(v1.Platform{
 			OS:           platform.OS,
 			Architecture: platform.Arch,
@@ -244,12 +293,24 @@ func BuildDockerfiles(ctx context.Context, store storage.Store, options define.B
 			logPrefix = "[" + platforms.Format(platformSpec) + "] "
 		}
 		// Deep copy args to prevent concurrent read/writes over Args.
-		argsCopy := make(map[string]string)
-		for key, value := range options.Args {
-			argsCopy[key] = value
+		platformOptions.Args = maps.Clone(options.Args)
+
+		if options.SourceDateEpoch != nil {
+			if options.Timestamp != nil {
+				return "", nil, errors.New("timestamp and source-date-epoch would be ambiguous if allowed together")
+			}
+			if _, alreadySet := platformOptions.Args[internal.SourceDateEpochName]; !alreadySet {
+				platformOptions.Args[internal.SourceDateEpochName] = fmt.Sprintf("%d", options.SourceDateEpoch.Unix())
+			}
 		}
-		platformOptions.Args = argsCopy
+
 		builds.Go(func() error {
+			contextDirectory, processLabel, mountLabel, usingContextOverlay, cleanupOverlay, err := platformSetupContextDirectoryOverlay(store, &options)
+			if err != nil {
+				return fmt.Errorf("mounting an overlay over build context directory: %w", err)
+			}
+			defer cleanupOverlay()
+			platformOptions.ContextDirectory = contextDirectory
 			loggerPerPlatform := logger
 			if platformOptions.LogFile != "" && platformOptions.LogSplitByPlatform {
 				logFile := platformOptions.LogFile + "_" + platformOptions.OS + "_" + platformOptions.Architecture
@@ -268,7 +329,7 @@ func BuildDockerfiles(ctx context.Context, store storage.Store, options define.B
 				platformOptions.ReportWriter = reporter
 				platformOptions.Err = stderr
 			}
-			thisID, thisRef, err := buildDockerfilesOnce(ctx, store, loggerPerPlatform, logPrefix, platformOptions, paths, files)
+			thisID, thisRef, err := buildDockerfilesOnce(ctx, store, loggerPerPlatform, logPrefix, platformOptions, paths, files, processLabel, mountLabel, usingContextOverlay)
 			if err != nil {
 				if errorContext := strings.TrimSpace(logPrefix); errorContext != "" {
 					return fmt.Errorf("%s: %w", errorContext, err)
@@ -303,7 +364,7 @@ func BuildDockerfiles(ctx context.Context, store storage.Store, options define.B
 	//   multiple platforms ( more than one platform ) and --manifest
 	//   option then this assignment is insignificant since it will be
 	//   overridden anyways with the id and ref of manifest list later in
-	//   in this code.
+	//   this code.
 	//
 	// * Multi-platform build without manifest list: If this is a build for
 	//   multiple platforms without --manifest then we are free to return
@@ -354,7 +415,7 @@ func BuildDockerfiles(ctx context.Context, store storage.Store, options define.B
 			return "", nil, err
 		}
 		defer imgSource.Close()
-		manifestBytes, _, err := imgSource.GetManifest(ctx, nil)
+		manifestBytes, _, err := image.UnparsedInstance(imgSource, nil).Manifest(ctx)
 		if err != nil {
 			return "", nil, err
 		}
@@ -379,7 +440,13 @@ func BuildDockerfiles(ctx context.Context, store storage.Store, options define.B
 	return id, ref, nil
 }
 
-func buildDockerfilesOnce(ctx context.Context, store storage.Store, logger *logrus.Logger, logPrefix string, options define.BuildOptions, containerFiles []string, dockerfilecontents [][]byte) (string, reference.Canonical, error) {
+func buildDockerfilesOnce(ctx context.Context, store storage.Store, logger *logrus.Logger, logPrefix string, options define.BuildOptions, containerFiles []string, dockerfilecontents [][]byte, processLabel, mountLabel string, usingContextOverlay bool) (string, reference.Canonical, error) {
+	select {
+	case <-ctx.Done():
+		return "", nil, ctx.Err()
+	default:
+	}
+
 	mainNode, err := imagebuilder.ParseDockerfile(bytes.NewReader(dockerfilecontents[0]))
 	if err != nil {
 		return "", nil, fmt.Errorf("parsing main Dockerfile: %s: %w", containerFiles[0], err)
@@ -388,36 +455,28 @@ func buildDockerfilesOnce(ctx context.Context, store storage.Store, logger *logr
 	// --platform was explicitly selected for this build
 	// so set correct TARGETPLATFORM in args if it is not
 	// already selected by the user.
+	builtinArgDefaults := make(map[string]string)
 	if options.SystemContext.OSChoice != "" && options.SystemContext.ArchitectureChoice != "" {
 		// os component from --platform string populates TARGETOS
 		// buildkit parity: give priority to user's `--build-arg`
-		if _, ok := options.Args["TARGETOS"]; !ok {
-			options.Args["TARGETOS"] = options.SystemContext.OSChoice
-		}
+		builtinArgDefaults["TARGETOS"] = options.SystemContext.OSChoice
 		// arch component from --platform string populates TARGETARCH
 		// buildkit parity: give priority to user's `--build-arg`
-		if _, ok := options.Args["TARGETARCH"]; !ok {
-			options.Args["TARGETARCH"] = options.SystemContext.ArchitectureChoice
-		}
+		builtinArgDefaults["TARGETARCH"] = options.SystemContext.ArchitectureChoice
 		// variant component from --platform string populates TARGETVARIANT
 		// buildkit parity: give priority to user's `--build-arg`
-		if _, ok := options.Args["TARGETVARIANT"]; !ok {
-			if options.SystemContext.VariantChoice != "" {
-				options.Args["TARGETVARIANT"] = options.SystemContext.VariantChoice
-			}
-		}
+		builtinArgDefaults["TARGETVARIANT"] = options.SystemContext.VariantChoice
 		// buildkit parity: give priority to user's `--build-arg`
-		if _, ok := options.Args["TARGETPLATFORM"]; !ok {
-			// buildkit parity: TARGETPLATFORM should be always created
-			// from SystemContext and not `TARGETOS` and `TARGETARCH` because
-			// users can always override values of `TARGETOS` and `TARGETARCH`
-			// but `TARGETPLATFORM` should be set independent of those values.
-			options.Args["TARGETPLATFORM"] = options.SystemContext.OSChoice + "/" + options.SystemContext.ArchitectureChoice
-			if options.SystemContext.VariantChoice != "" {
-				options.Args["TARGETPLATFORM"] = options.Args["TARGETPLATFORM"] + "/" + options.SystemContext.VariantChoice
-			}
+		// buildkit parity: TARGETPLATFORM should be always created
+		// from SystemContext and not `TARGETOS` and `TARGETARCH` because
+		// users can always override values of `TARGETOS` and `TARGETARCH`
+		// but `TARGETPLATFORM` should be set independent of those values.
+		builtinArgDefaults["TARGETPLATFORM"] = builtinArgDefaults["TARGETOS"] + "/" + builtinArgDefaults["TARGETARCH"]
+		if options.SystemContext.VariantChoice != "" {
+			builtinArgDefaults["TARGETPLATFORM"] += "/" + options.SystemContext.VariantChoice
 		}
 	}
+	delete(options.Args, "TARGETPLATFORM")
 
 	for i, d := range dockerfilecontents[1:] {
 		additionalNode, err := imagebuilder.ParseDockerfile(bytes.NewReader(d))
@@ -428,11 +487,13 @@ func buildDockerfilesOnce(ctx context.Context, store storage.Store, logger *logr
 		mainNode.Children = append(mainNode.Children, additionalNode.Children...)
 	}
 
-	exec, err := newExecutor(logger, logPrefix, store, options, mainNode, containerFiles)
+	exec, err := newExecutor(logger, logPrefix, store, options, mainNode, containerFiles, processLabel, mountLabel, usingContextOverlay)
 	if err != nil {
 		return "", nil, fmt.Errorf("creating build executor: %w", err)
 	}
 	b := imagebuilder.NewBuilder(options.Args)
+	maps.Copy(b.BuiltinArgDefaults, builtinArgDefaults)
+
 	defaultContainerConfig, err := config.Default()
 	if err != nil {
 		return "", nil, fmt.Errorf("failed to get container config: %w", err)
@@ -445,7 +506,7 @@ func buildDockerfilesOnce(ctx context.Context, store storage.Store, logger *logr
 	if options.Target != "" {
 		stagesTargeted, ok := stages.ThroughTarget(options.Target)
 		if !ok {
-			return "", nil, fmt.Errorf("The target %q was not found in the provided Dockerfile", options.Target)
+			return "", nil, fmt.Errorf("the target %q was not found in the provided Dockerfile", options.Target)
 		}
 		stages = stagesTargeted
 	}
@@ -454,7 +515,13 @@ func buildDockerfilesOnce(ctx context.Context, store storage.Store, logger *logr
 
 // preprocessContainerfileContents runs CPP(1) in preprocess-only mode on the input
 // dockerfile content and will use ctxDir as the base include path.
-func preprocessContainerfileContents(logger *logrus.Logger, containerfile string, r io.Reader, ctxDir string, cppFlags []string) (stdout io.Reader, err error) {
+func preprocessContainerfileContents(ctx context.Context, logger *logrus.Logger, containerfile string, r io.Reader, ctxDir string, cppFlags []string) (stdout io.Reader, err error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
 	cppCommand := "cpp"
 	cppPath, err := exec.LookPath(cppCommand)
 	if err != nil {
@@ -476,7 +543,7 @@ func preprocessContainerfileContents(logger *logrus.Logger, containerfile string
 		cppArgs = append(cppArgs, args...)
 	}
 	cppArgs = append(cppArgs, cppFlags...)
-	cmd := exec.Command(cppPath, cppArgs...)
+	cmd := exec.CommandContext(ctx, cppPath, cppArgs...)
 	cmd.Stdin = r
 	cmd.Stdout = &stdoutBuffer
 	cmd.Stderr = &stderrBuffer
@@ -502,9 +569,9 @@ func platformIsAcceptable(platform *v1.Platform, logger *logrus.Logger) bool {
 		logger.Trace("rejecting potential base image with no platform information")
 		return false
 	}
-	if gotypes.SizesFor("gc", platform.Architecture) == nil {
-		// the compiler's never heard of this
-		logger.Tracef("rejecting potential base image architecture %q for which Go has no knowledge of how to do unsafe code", platform.Architecture)
+	if slices.Contains([]string{"", "unknown"}, platform.Architecture) {
+		// we're hard-wired to reject images with these values
+		logger.Tracef("rejecting potential base image for which the Architecture value is always-rejected value %q", platform.Architecture)
 		return false
 	}
 	if slices.Contains([]string{"", "unknown"}, platform.OS) {
@@ -519,6 +586,12 @@ func platformIsAcceptable(platform *v1.Platform, logger *logrus.Logger) bool {
 // dockerfiles, and if they are all valid references to manifest lists, returns
 // the list of platforms that are supported by all of the base images.
 func platformsForBaseImages(ctx context.Context, logger *logrus.Logger, dockerfilepaths []string, dockerfiles [][]byte, from string, args map[string]string, additionalBuildContext map[string]*define.AdditionalBuildContext, systemContext *types.SystemContext) ([]struct{ OS, Arch, Variant string }, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
 	baseImages, err := baseImages(dockerfilepaths, dockerfiles, from, args, additionalBuildContext)
 	if err != nil {
 		return nil, fmt.Errorf("determining list of base images: %w", err)
@@ -539,15 +612,37 @@ func platformsForBaseImages(ctx context.Context, logger *logrus.Logger, dockerfi
 		for _, candidate := range resolved.PullCandidates {
 			ref, err := docker.NewReference(candidate.Value)
 			if err != nil {
-				logrus.Debugf("parsing image reference %q: %v", candidate.Value.String(), err)
-				continue
+				// github.com/containers/common/libimage.Runtime.Pull() will catch
+				// references that include both a tag and a digest, and drop the
+				// tag as part of pulling the image.  Fall back to doing roughly
+				// the same here.
+				var nonDigestedRef reference.Named
+				if named, err2 := reference.ParseNamed(candidate.Value.String()); err2 == nil {
+					_, isTagged := named.(reference.NamedTagged)
+					digested, isDigested := named.(reference.Digested)
+					if isTagged && isDigested {
+						if nonDigestedRef, err2 = reference.WithDigest(reference.TrimNamed(named), digested.Digest()); err2 != nil {
+							nonDigestedRef = nil
+						}
+					}
+				}
+				if nonDigestedRef == nil {
+					// not a tagged-and-digested reference, either, so log the original error
+					logrus.Debugf("parsing image reference %q: %v", candidate.Value.String(), err)
+					continue
+				}
+				ref, err = docker.NewReference(nonDigestedRef)
+				if err != nil {
+					logrus.Debugf("re-parsing image reference %q: %v", nonDigestedRef.String(), err)
+					continue
+				}
 			}
 			src, err := ref.NewImageSource(ctx, systemContext)
 			if err != nil {
 				logrus.Debugf("preparing to read image manifest for %q: %v", baseImage, err)
 				continue
 			}
-			candidateBytes, candidateType, err := src.GetManifest(ctx, nil)
+			candidateBytes, candidateType, err := image.UnparsedInstance(src, nil).Manifest(ctx)
 			_ = src.Close()
 			if err != nil {
 				logrus.Debugf("reading image manifest for %q: %v", baseImage, err)
@@ -702,12 +797,12 @@ func baseImages(dockerfilenames []string, dockerfilecontents [][]byte, from stri
 						}
 						base := child.Next.Value
 						if base != "" && base != buildah.BaseImageFakeName && !internalUtil.SetHas(nicknames, base) {
+							builtinArgs := argsMapToSlice(stage.Builder.BuiltinArgDefaults)
 							headingArgs := argsMapToSlice(stage.Builder.HeadingArgs)
 							userArgs := argsMapToSlice(stage.Builder.Args)
-							// append heading args so if --build-arg key=value is not
-							// specified but default value is set in Containerfile
-							// via `ARG key=value` so default value can be used.
-							userArgs = append(headingArgs, userArgs...)
+							// ProcessWord uses first match; put highest priority first so
+							// --build-arg overrides header ARG overrides builtin.
+							userArgs = slices.Concat(userArgs, headingArgs, builtinArgs)
 							baseWithArg, err := imagebuilder.ProcessWord(base, userArgs)
 							if err != nil {
 								return nil, fmt.Errorf("while replacing arg variables with values for format %q: %w", base, err)

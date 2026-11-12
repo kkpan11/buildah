@@ -2,26 +2,30 @@
 
 load helpers
 
-@test "run" {
+@test "run-basic" {
 	skip_if_no_runtime
 
 	_prefetch alpine
+
+	find_oci_runtime
+
 	${OCI} --version
 	createrandom ${TEST_SCRATCH_DIR}/randomfile
 	run_buildah from --quiet --pull=false $WITH_POLICY_JSON alpine
-	cid=$output
-	run_buildah mount $cid
-	root=$output
+	local cid=$output
 	run_buildah config --workingdir /tmp $cid
 	run_buildah run $cid pwd
 	expect_output "/tmp"
 	run_buildah config --workingdir /root $cid
-	run_buildah run        $cid pwd
+	run_buildah run $cid pwd
 	expect_output "/root"
-	cp ${TEST_SCRATCH_DIR}/randomfile $root/tmp/
-	run_buildah run        $cid cp /tmp/randomfile /tmp/other-randomfile
+	run_buildah add $cid ${TEST_SCRATCH_DIR}/randomfile $root/tmp/
+	run_buildah run $cid cp /tmp/randomfile /tmp/other-randomfile
+	run_buildah_mount $cid
+	local root=$output
 	test -s $root/tmp/other-randomfile
 	cmp ${TEST_SCRATCH_DIR}/randomfile $root/tmp/other-randomfile
+	run_buildah_umount $cid
 
 	seq 100000 | buildah run $cid -- sh -c 'while read i; do echo $i; done'
 }
@@ -191,7 +195,7 @@ function configure_and_check_user() {
 	_prefetch alpine
 	run_buildah from --quiet --pull=false $WITH_POLICY_JSON alpine
 	cid=$output
-	run_buildah mount $cid
+	run_buildah_mount $cid
 	root=$output
 
 	testuser=jimbo
@@ -203,6 +207,7 @@ function configure_and_check_user() {
 	testgroupid=$(random_unused_id $root/etc/group)
 	echo "$testuser:x:$testuid:$testgid:Jimbo Jenkins:/home/$testuser:/bin/sh" >> $root/etc/passwd
 	echo "$testgroup:x:$testgroupid:" >> $root/etc/group
+	run_buildah_umount $cid
 
         configure_and_check_user ""                             0             0
         configure_and_check_user "${testuser}"                  $testuid      $testgid
@@ -220,7 +225,8 @@ function configure_and_check_user() {
         run_buildah 125 run -- $cid id -g
         expect_output --substring "unknown user" "id -g (bogus user)"
 
-	ln -vsf /etc/passwd $root/etc/passwd
+	run_buildah config -u root:root $cid
+	run_buildah run -- $cid ln -vsf /etc/passwd /etc/passwd
 	run_buildah config -u ${testuser}:${testgroup} $cid
 	run_buildah 125 run -- $cid id -u
 	echo "$output"
@@ -262,11 +268,15 @@ function configure_and_check_user() {
 	run_buildah run $cid id -G
 	expect_output --substring "$id"
 
-	if is_rootless && has_supplemental_groups; then
+	find_oci_runtime
+
+	if is_rootless && has_supplemental_groups && ! [[ $OCI =~ runc ]]; then
 	   run_buildah from --group-add keep-groups --quiet --pull=false $WITH_POLICY_JSON alpine
 	   cid=$output
 	   run_buildah run $cid id -G
 	   expect_output --substring "65534"
+	else
+	   skip "test is being run by root or without any supplemental groups ($(id))"
 	fi
 }
 
@@ -274,6 +284,9 @@ function configure_and_check_user() {
 	skip_if_no_runtime
 
 	_prefetch alpine
+
+	find_oci_runtime
+
 	${OCI} --version
 	run_buildah from --quiet --pull=false $WITH_POLICY_JSON alpine
 	cid=$output
@@ -287,6 +300,9 @@ function configure_and_check_user() {
 	skip_if_no_runtime
 
 	_prefetch alpine
+
+	find_oci_runtime
+
 	${OCI} --version
 	run_buildah from --quiet --pull=false $WITH_POLICY_JSON alpine
 	cid=$output
@@ -314,6 +330,9 @@ function configure_and_check_user() {
 			zflag=z
 		fi
 	fi
+
+	find_oci_runtime
+
 	${OCI} --version
 	_prefetch alpine
 	run_buildah from --quiet --pull=false $WITH_POLICY_JSON alpine
@@ -343,6 +362,9 @@ function configure_and_check_user() {
 			zflag=z
 		fi
 	fi
+
+	find_oci_runtime
+
 	${OCI} --version
 	_prefetch alpine
 	run_buildah from --quiet --pull=false $WITH_POLICY_JSON alpine
@@ -359,7 +381,7 @@ function configure_and_check_user() {
 	run_buildah run -v ${TEST_SCRATCH_DIR}/lower:/test:O,upperdir=${TEST_SCRATCH_DIR}/upperdir,workdir=${TEST_SCRATCH_DIR}/workdir${zflag:+:${zflag}}  $cid sh -c 'echo "world" > /test/world'
 
 	#upper dir should persist content
-	result="$(cat ${TEST_SCRATCH_DIR}/upperdir/world)"
+	result="$(< ${TEST_SCRATCH_DIR}/upperdir/world)"
 	test "$result" == "world"
 }
 
@@ -417,23 +439,38 @@ function configure_and_check_user() {
 	zflag=
 	if which selinuxenabled > /dev/null 2> /dev/null ; then
 		if selinuxenabled ; then
-			zflag=z
+			zflag=,z
 		fi
 	fi
+
+	find_oci_runtime
+
 	${OCI} --version
 	_prefetch alpine
 	run_buildah from --quiet --pull=false $WITH_POLICY_JSON alpine
 	cid=$output
 	mkdir -p ${TEST_SCRATCH_DIR}/was:empty
 	# As a baseline, this should succeed.
-	run_buildah run --mount type=tmpfs,dst=/var/tmpfs-not-empty                                           $cid touch /var/tmpfs-not-empty/testfile
-	run_buildah run --mount type=bind,src=${TEST_SCRATCH_DIR}/was:empty,dst=/var/not-empty,rw${zflag:+,${zflag}}      $cid touch /var/not-empty/testfile
+	run_buildah run --mount type=tmpfs,dst=/var/tmpfs-not-empty                                                      $cid touch /var/tmpfs-not-empty/testfile
+	# This should succeed, but the writes should effectively be discarded
+	run_buildah run --mount type=bind,src=${TEST_SCRATCH_DIR}/was:empty,dst=/var/not-empty,rw${zflag}                $cid touch /var/not-empty/testfile
+	if test -r ${TEST_SCRATCH_DIR}/was:empty/testfile ; then
+		die write to mounted type=bind was not discarded, ${TEST_SCRATCH_DIR}/was:empty/testfile exists
+	fi
 	# If we're parsing the options at all, this should be read-only, so it should fail.
-	run_buildah 1 run --mount type=bind,src=${TEST_SCRATCH_DIR}/was:empty,dst=/var/not-empty,ro${zflag:+,${zflag}} $cid touch /var/not-empty/testfile
-	# Even if the parent directory doesn't exist yet, this should succeed.
-	run_buildah run --mount type=bind,src=${TEST_SCRATCH_DIR}/was:empty,dst=/var/multi-level/subdirectory,rw          $cid touch /var/multi-level/subdirectory/testfile
-	# And check the same for file volumes.
-	run_buildah run --mount type=bind,src=${TEST_SCRATCH_DIR}/was:empty/testfile,dst=/var/different-multi-level/subdirectory/testfile,rw        $cid touch /var/different-multi-level/subdirectory/testfile
+	run_buildah 1 run --mount type=bind,src=${TEST_SCRATCH_DIR}/was:empty,dst=/var/not-empty,ro${zflag}              $cid touch /var/not-empty/testfile
+	# Even if the parent directory doesn't exist yet, this should succeed, but again the write should be discarded.
+	run_buildah run --mount type=bind,src=${TEST_SCRATCH_DIR}/was:empty,dst=/var/multi-level/subdirectory,rw${zflag} $cid touch /var/multi-level/subdirectory/testfile
+	if test -r ${TEST_SCRATCH_DIR}/was:empty/testfile ; then
+		die write to mounted type=bind was not discarded, ${TEST_SCRATCH_DIR}/was:empty/testfile exists
+	fi
+	# And check the same for file volumes, which make life harder because the kernel's overlay
+	# filesystem really only wants to be dealing with directories.
+	: > ${TEST_SCRATCH_DIR}/was:empty/testfile
+	run_buildah run --mount type=bind,src=${TEST_SCRATCH_DIR}/was:empty/testfile,dst=/var/different-multi-level/subdirectory/testfile,rw${zflag} $cid sh -c 'echo wrote > /var/different-multi-level/subdirectory/testfile'
+	if test -s ${TEST_SCRATCH_DIR}/was:empty/testfile ; then
+		die write to mounted type=bind was not discarded, ${TEST_SCRATCH_DIR}/was:empty/testfile was written to
+	fi
 }
 
 @test "run --mount=type=bind with from like buildkit" {
@@ -441,16 +478,17 @@ function configure_and_check_user() {
 	zflag=
 	if which selinuxenabled > /dev/null 2> /dev/null ; then
 		if selinuxenabled ; then
-			skip "skip if selinux enabled, since stages have different selinux label"
+			zflag=,z
 		fi
 	fi
 	run_buildah build -t buildkitbase $WITH_POLICY_JSON -f $BUDFILES/buildkit-mount-from/Dockerfilebuildkitbase $BUDFILES/buildkit-mount-from/
 	_prefetch alpine
 	run_buildah from --quiet --pull=false $WITH_POLICY_JSON alpine
 	cid=$output
-	run_buildah run --mount type=bind,source=.,from=buildkitbase,target=/test,z  $cid cat /test/hello
-	expect_output --substring "hello"
-	run_buildah rmi -f buildkitbase
+	run_buildah run --mount type=bind,source=.,from=buildkitbase,target=/test${zflag}  $cid cat /test/hello1
+	expect_output --substring "hello1"
+	run_buildah run --mount type=bind,source=subdir,from=buildkitbase,target=/test${zflag}  $cid cat /test/hello
+	expect_output --substring "hello2"
 }
 
 @test "run --mount=type=cache like buildkit" {
@@ -458,19 +496,78 @@ function configure_and_check_user() {
 	zflag=
 	if which selinuxenabled > /dev/null 2> /dev/null ; then
 		if selinuxenabled ; then
-			skip "skip if selinux enabled, since stages have different selinux label"
+			zflag=,z
 		fi
 	fi
 	_prefetch alpine
 	run_buildah from --quiet --pull=false $WITH_POLICY_JSON alpine
 	cid=$output
-	run_buildah run --mount type=cache,target=/test,z  $cid sh -c 'echo "hello" > /test/hello && cat /test/hello'
-	run_buildah run --mount type=cache,target=/test,z  $cid cat /test/hello
+	run_buildah run --mount type=cache,target=/test${zflag}  $cid sh -c 'mkdir -p /test/subdir && echo "hello" > /test/subdir/h.txt && cat /test/subdir/h.txt'
+	run_buildah run --mount type=cache,src=subdir,target=/test${zflag}  $cid cat /test/h.txt
 	expect_output --substring "hello"
+}
+
+@test "run --mount=type=cache,sharing=private like buildkit" {
+	skip_if_no_runtime
+	_prefetch alpine
+	run_buildah from --quiet --pull=false $WITH_POLICY_JSON alpine
+	local holdercid=$output
+	run_buildah from --quiet --pull=false $WITH_POLICY_JSON alpine
+	local probecid=$output
+	local cachemount=type=cache,target=/cache,sharing=private
+	local holderlog=${TEST_SCRATCH_DIR}/holder.log
+	# put the cache under our scratch directory, not the real /var/tmp
+	export TMPDIR=${TEST_SCRATCH_DIR}
+	local cacheparent=${TEST_SCRATCH_DIR}/buildah-cache-$UID
+
+	# Hold the cache until we create /cache/release.  Invoked directly
+	# because run_buildah would give us the wrong $!.
+	CONTAINERS_CONF=${CONTAINERS_CONF:-${TEST_SOURCES}/containers.conf} \
+	      timeout --foreground --kill=10 90 \
+	      ${BUILDAH_BINARY} ${BUILDAH_REGISTRY_OPTS} ${ROOTDIR_OPTS} \
+	      run --mount $cachemount $holdercid \
+	      sh -c 'touch /cache/taken; while [ ! -e /cache/release ] ; do sleep 1; done' \
+	      > $holderlog 2>&1 3>&- &
+	local holderpid=$!
+
+	# wait for it to have taken a cache directory
+	local waited=0
+	while ! ls ${cacheparent}/*/taken > /dev/null 2>&1 ; do
+		kill -0 $holderpid 2> /dev/null || die "holder exited early: $(< $holderlog)"
+		test $((++waited)) -lt 600 || die "holder never took a cache directory"
+		sleep 0.1
+	done
+	local holderdir=$(dirname ${cacheparent}/*/taken)
+
+	# while the holder has that one, a second private mount gets a different
+	# directory, which starts out empty
+	run_buildah '?' run --mount $cachemount $probecid ls -A /cache
+	local privatestatus=$status privateoutput=$output
+	# but a shared mount takes no lock, so it uses the holder's directory
+	run_buildah '?' run --mount type=cache,target=/cache $probecid ls -A /cache
+	local sharedstatus=$status sharedoutput=$output
+
+	# release the holder before checking, so a failed check can't leave it running
+	touch $holderdir/release
+	wait $holderpid || die "holder failed: $(< $holderlog)"
+	assert "$privatestatus" -eq 0 "private mount failed: $privateoutput"
+	assert "$privateoutput" = "" "the private mount should have gotten an empty cache directory"
+	assert "$sharedstatus" -eq 0 "shared mount failed: $sharedoutput"
+	assert "$sharedoutput" = "taken" "the shared mount should have used the holder's directory"
+
+	# once the holder's directory is free again, the next private mount reuses it
+	run_buildah run --mount $cachemount $holdercid ls -A /cache
+	expect_output --substring "taken"
+
+	# the two cache directories, plus the one which holds their lock files
+	local -a dirs=(${cacheparent}/*/)
+	assert "${#dirs[@]}" -eq 3 "directories under ${cacheparent}: ${dirs[*]}"
 }
 
 @test "run symlinks" {
 	skip_if_no_runtime
+
+	find_oci_runtime
 
 	${OCI} --version
 	_prefetch alpine
@@ -479,11 +576,16 @@ function configure_and_check_user() {
 	mkdir -p ${TEST_SCRATCH_DIR}/tmp
 	ln -s tmp ${TEST_SCRATCH_DIR}/tmp2
 	export TMPDIR=${TEST_SCRATCH_DIR}/tmp2
-	run_buildah run $cid id
+	# As rootless pasta is using TMPDIR for writing our requested pidfile
+	# but the security profiles will block this path by default. Because
+	# we do not care about testing pasta here use --network none.
+	run_buildah run --network none $cid id
 }
 
 @test "run --cap-add/--cap-drop" {
 	skip_if_no_runtime
+
+	find_oci_runtime
 
 	${OCI} --version
 	_prefetch alpine
@@ -511,6 +613,7 @@ function configure_and_check_user() {
 
 @test "Check if containers run with correct open files/processes limits" {
 	skip_if_no_runtime
+	skip "FIXME: we cannot rely on podman-run ulimits matching buildah-bud (see #5820)"
 
 	# we need to not use the list of limits that are set in our default
 	# ${TEST_SOURCES}/containers.conf for the sake of other tests, and override
@@ -554,20 +657,25 @@ function configure_and_check_user() {
 @test "run-builtin-volume-omitted" {
 	# This image is known to include a volume, but not include the mountpoint
 	# in the image.
-	_prefetch quay.io/libpod/registry:volume_omitted
-	run_buildah from --quiet --pull=ifmissing $WITH_POLICY_JSON quay.io/libpod/registry:volume_omitted
-	cid=$output
-	run_buildah mount $cid
+	image=quay.io/libpod/registry:volume_omitted
+	_prefetch $image
+	run_buildah from --cidfile ${TEST_SCRATCH_DIR}/cid --pull=ifmissing $WITH_POLICY_JSON $image
+	cid="$(< ${TEST_SCRATCH_DIR}/cid)"
+
+	# Initially, the volume's mountpoint should not be there.
+	run_buildah_mount $cid
 	mnt=$output
-	# By default, the mountpoint should not be there.
 	run test -d "$mnt"/var/lib/registry
 	echo "$output"
 	[ "$status" -ne 0 ]
-	# We'll create the mountpoint for "run".
-	run_buildah run $cid ls -1 /var/lib
-        expect_output --substring "registry"
+	run_buildah_umount $cid
 
-	# Double-check that the mountpoint is there.
+	# This will create the volume's mountpoint for a "run".
+	run_buildah run $cid ls -1 /var/lib
+	expect_output --substring "registry"
+
+	# Double-check that the mountpoint is there now.
+	run_buildah_mount $cid
 	test -d "$mnt"/var/lib/registry
 }
 
@@ -590,7 +698,6 @@ function configure_and_check_user() {
 }
 
 @test "Verify /run/.containerenv exist" {
-        skip_if_rootless_environment
 	skip_if_no_runtime
 
 	_prefetch alpine
@@ -610,7 +717,7 @@ function configure_and_check_user() {
 	expect_output --substring "alpine:latest"
 
 	rootless=0
-	if ["$(id -u)" -ne 0 ]; then
+	if [ "$(id -u)" -ne 0 ]; then
 		rootless=1
 	fi
 
@@ -653,15 +760,20 @@ function configure_and_check_user() {
 	skip_if_no_runtime
 	skip_if_in_container
 
+	find_oci_runtime
+
 	${OCI} --version
-	_prefetch debian
+        # We use ubuntu image because it has no /etc/hosts file. This
+        # allows the fake_host test below to be an equality check,
+        # not a substring check.
+	_prefetch ubuntu
 
 	local hostname=h-$(random_string)
 
-	run_buildah from --quiet --pull=false $WITH_POLICY_JSON debian
+	run_buildah from --quiet --pull=false $WITH_POLICY_JSON ubuntu
 	cid=$output
 	run_buildah 125 run --network=bogus $cid cat /etc/hosts
-	expect_output --substring "unable to find network with name or ID bogus: network not found"
+	expect_output --substring "unable to find network with name bogus: network not found"
 	run_buildah run --hostname $hostname $cid cat /etc/hosts
 	expect_output --substring "(10.88.*|10.0.2.100)[[:blank:]]$hostname $cid"
 	ip=$(hostname -I | cut -f 1 -d " ")
@@ -685,10 +797,6 @@ function configure_and_check_user() {
 	expect_output --substring "(10.88.*|10.0.2.100)[[:blank:]]$cid"
 	assert "$output" !~ "(10.88.*|10.0.2.100)[[:blank:]]host1 $cid" "Container IP should not contain host1"
 
-	# check slirp4netns sets correct hostname with another cidr
-	run_buildah run --network slirp4netns:cidr=192.168.2.0/24 --hostname $hostname $cid cat /etc/hosts
-	expect_output --substring "192.168.2.100[[:blank:]]$hostname $cid"
-
 	run_buildah run --network=container $cid cat /etc/hosts
 	m=$(buildah mount $cid)
 	run cat $m/etc/hosts
@@ -696,7 +804,7 @@ function configure_and_check_user() {
 	expect_output --substring ""
 	run_buildah rm -a
 
-	run_buildah from --quiet --pull=false $WITH_POLICY_JSON debian
+	run_buildah from --quiet --pull=false $WITH_POLICY_JSON ubuntu
 	cid=$output
 	run_buildah run --network=host --hostname $hostname $cid cat /etc/hosts
 	assert "$output" =~ "$ip[[:blank:]]$hostname"
@@ -712,7 +820,7 @@ function configure_and_check_user() {
 	assert "$output" =~ "$ip[[:blank:]]$hostname"
 	run_buildah rm -a
 
-	run_buildah from --quiet --pull=false $WITH_POLICY_JSON debian
+	run_buildah from --quiet --pull=false $WITH_POLICY_JSON ubuntu
 	cid=$output
 	run_buildah run --network=none $cid sh -c 'echo "110.110.110.0 fake_host" >> /etc/hosts; cat /etc/hosts'
 	expect_output "110.110.110.0 fake_host"
@@ -736,6 +844,8 @@ function configure_and_check_user() {
 	ip=$(hostname -I | cut -f 1 -d " ")
 	run_buildah run --network pasta --hostname $hostname $cid cat /etc/hosts
 	assert "$output" =~ "$ip[[:blank:]]$hostname $cid" "--network pasta adds correct hostname"
+	# FIXME we need pasta 20240814 or newer in the VMs to enable this
+	# assert "$output" =~ "169.254.1.2[[:blank:]]host.containers.internal" "--network pasta adds correct internal entry"
 
 	# check with containers.conf setting
 	echo -e "[network]\ndefault_rootless_network_cmd = \"pasta\"" > ${TEST_SCRATCH_DIR}/containers.conf
@@ -744,7 +854,7 @@ function configure_and_check_user() {
 
 	# resolv.conf checks
 	run_buildah run --network pasta $cid grep nameserver /etc/resolv.conf
-	assert "${lines[0]}" == "nameserver 169.254.0.1" "first pasta nameserver should be stub forwarder"
+	assert "${lines[0]}" == "nameserver 169.254.1.1" "first pasta nameserver should be stub forwarder"
 
 	run_buildah run --network pasta:--dns-forward,192.168.0.1 $cid grep nameserver /etc/resolv.conf
 	assert "${lines[0]}" == "nameserver 192.168.0.1" "pasta nameserver with --dns-forward"
@@ -753,6 +863,8 @@ function configure_and_check_user() {
 @test "run check /etc/resolv.conf" {
         skip_if_rootless_environment
 	skip_if_no_runtime
+
+	find_oci_runtime
 
 	${OCI} --version
 	_prefetch alpine
@@ -767,9 +879,9 @@ function configure_and_check_user() {
 	# filter out 127... nameservers
 	run grep -v "nameserver 127." <<< "$output"
 	nameservers="$output"
-	# in case of rootless add extra slirp4netns nameserver
+	# in case of rootless add extra pasta nameserver
 	if is_rootless; then
-		nameservers="nameserver 10.0.2.3
+		nameservers="nameserver 169.254.1.1
 $output"
 	fi
 	run_buildah from --quiet --pull=false $WITH_POLICY_JSON alpine
@@ -779,9 +891,13 @@ $output"
 	assert "$output" !~ "^nameserver 127." "Container contains local nameserver"
 	assert "$nameservers" "Container nameservers match correct host nameservers"
 	if ! is_rootless; then
-		run_buildah mount $cid
+		run_buildah_mount $cid
 		assert "$output" != ""
-		assert "$(< $output/etc/resolv.conf)" = "" "resolv.conf is empty"
+		if test -e "$output/etc/resolv.conf" ; then
+			assert "$(< $output/etc/resolv.conf)" = "" "resolv.conf is empty"
+		else
+			: # not there, like in the base image, which is what we really want
+		fi
 	fi
 	run_buildah rm -a
 
@@ -792,9 +908,13 @@ $output"
 	run_buildah run --isolation=chroot --network=host $cid grep nameserver /etc/resolv.conf
 	assert "$nameservers" "Container nameservers match the host nameservers"
 	if ! is_rootless; then
-		run_buildah mount $cid
+		run_buildah_mount $cid
 		assert "$output" != ""
-		assert "$(< $output/etc/resolv.conf)" = "" "resolv.conf is empty"
+		if test -e "$output/etc/resolv.conf" ; then
+			assert "$(< $output/etc/resolv.conf)" = "" "resolv.conf is empty"
+		else
+			: # not there, like in the base image, which is what we really want
+		fi
 	fi
 	run_buildah rm -a
 
@@ -879,14 +999,8 @@ _EOF
 
 	if [ -n "$(command -v runc)" ]; then
 		found_runtime=y
-		run_buildah '?' run --runtime=runc --runtime-flag=debug $cid true
-		if [ "$status" -eq 0 ]; then
-			assert "$output" != "" "Output from running 'true' with --runtime-flag=debug"
-		else
-			# runc fully supports cgroup v2 (unified mode) since v1.0.0-rc93.
-			# older runc doesn't work on cgroup v2.
-			expect_output --substring "this version of runc doesn't work on cgroups v2" "should fail by unsupportability for cgroupv2"
-		fi
+		run_buildah run --runtime=runc --runtime-flag=debug $cid true
+		assert "$output" != "" "Output from running 'true' with --runtime-flag=debug"
 	fi
 
 	if [ -n "$(command -v crun)" ]; then
@@ -918,7 +1032,6 @@ _EOF
 
 @test "rootless on cgroupv2 and systemd runs under user.slice" {
 	skip_if_no_runtime
-	skip_if_cgroupsv1
 	skip_if_in_container
 	skip_if_root_environment
 	if test "$DBUS_SESSION_BUS_ADDRESS" = ""; then
@@ -952,14 +1065,14 @@ _EOF
 
 	run_buildah from --quiet --pull=false $WITH_POLICY_JSON alpine
 	cid=$output
-	for mask in /proc/acpi /proc/kcore /proc/keys /proc/latency_stats /proc/sched_debug /proc/scsi /proc/timer_list /proc/timer_stats /sys/dev/block /sys/devices/virtual/powercap /sys/firmware /sys/fs/selinux; do
-	        if test -d $mask; then
-		   run_buildah run $cid ls $mask
-		   expect_output "" "Directories should be empty"
+	for mask in /proc/acpi /proc/interrupts /proc/kcore /proc/keys /proc/latency_stats /proc/sched_debug /proc/scsi /proc/timer_list /proc/timer_stats /sys/devices/virtual/powercap /sys/firmware /sys/fs/selinux; do
+		if test -d $mask; then
+			run_buildah run $cid sh -c "echo $mask/*" # globbing will fail whether it's simply unreadable, or readable but empty
+			expect_output "$mask/*" "Directories should be empty"
 		fi
 		if test -f $mask; then
-		   run_buildah run $cid cat $mask
-		   expect_output "" "Directories should be empty"
+			run_buildah run $cid cat $mask
+			expect_output "" "Directories should be empty"
 		fi
 	done
 }
@@ -977,4 +1090,94 @@ _EOF
 	printf 'FROM alpine\nRUN\n echo && echo' > Dockerfile
 	run_buildah ? bud --pull=false --layers .
         expect_output --substring -- "-c requires an argument"
+}
+
+@test "container_name_as_hostname" {
+  skip_if_no_runtime
+
+  _prefetch alpine
+  echo '[containers]' > ${TEST_SCRATCH_DIR}/containers.conf
+  echo container_name_as_hostname = true >> ${TEST_SCRATCH_DIR}/containers.conf
+  name=alpine-working_containeR-4-test
+  sanitizedname=alpine-workingcontaineR-4-test
+  run_buildah from --name :"$name": --cidfile ${TEST_SCRATCH_DIR}/cid alpine
+  cname="$output"
+  run_buildah run "$cname" hostname
+  assert "$output" = $(cut -c1-12 < ${TEST_SCRATCH_DIR}/cid)
+  CONTAINERS_CONF=${TEST_SCRATCH_DIR}/containers.conf run_buildah run "$cname" hostname
+  expect_output "$sanitizedname"
+  CONTAINERS_CONF=${TEST_SCRATCH_DIR}/containers.conf run_buildah run "$(< ${TEST_SCRATCH_DIR}/cid)" hostname
+  expect_output "$sanitizedname"
+}
+
+@test "root fs only mounted once" {
+  if test `uname` != Linux ; then
+    skip "not meaningful except on Linux"
+  fi
+  _prefetch busybox
+  run_buildah from --pull=never --quiet busybox
+  cid="$output"
+  run_buildah run $cid cat /proc/self/mountinfo
+  echo "$output" > ${TEST_SCRATCH_DIR}/mountinfo1
+  echo "# mountinfo unfiltered:"
+  cat ${TEST_SCRATCH_DIR}/mountinfo1
+  grep ' / rw[, ]' ${TEST_SCRATCH_DIR}/mountinfo1 > ${TEST_SCRATCH_DIR}/mountinfo2
+  echo "# mountinfo grepped:"
+  cat ${TEST_SCRATCH_DIR}/mountinfo2
+  wc -l < ${TEST_SCRATCH_DIR}/mountinfo2 > ${TEST_SCRATCH_DIR}/mountinfo3
+  echo "# mountinfo count:"
+  cat ${TEST_SCRATCH_DIR}/mountinfo3
+  assert $(< ${TEST_SCRATCH_DIR}/mountinfo3) -eq 1
+}
+
+@test "run reaps stray processes" {
+  if test `uname` != Linux ; then
+    skip "not meaningful except on Linux"
+  fi
+  _prefetch busybox
+  run_buildah from --pull=never --quiet busybox
+  local cid="$output"
+  echo '$' ${WAIT_BINARY} ${BUILDAH_BINARY} ${BUILDAH_REGISTRY_OPTS} ${ROOTDIR_OPTS} run --runtime=${CRASH_BINARY} "$cid" pwd
+  run ${WAIT_BINARY} ${BUILDAH_BINARY} ${BUILDAH_REGISTRY_OPTS} ${ROOTDIR_OPTS} run --runtime=${CRASH_BINARY} "$cid" pwd
+  echo "$output"
+  assert "$output" !~ "caught reparented child process"
+}
+
+@test "run-umask" {
+  skip_if_no_runtime
+
+  _prefetch busybox
+  run_buildah from --quiet --pull=false $WITH_POLICY_JSON busybox
+  cid=$output
+
+  for umaskval in 2 22 222 123 ; do
+    run_buildah run --umask=$umaskval $cid sh -c umask
+    expect_output $(printf %04o 0$umaskval)
+  done
+
+  run_buildah 125 run --umask=1000 $cid sh -c umask
+  expect_output --substring "umask value 01000 is out of range"
+}
+
+@test "run-valid-exit-codes" {
+  skip_if_no_runtime
+
+  _prefetch alpine
+  run_buildah from --quiet --pull=false $WITH_POLICY_JSON alpine
+  cid=$output
+
+  # Exit 1 fails by default
+  run_buildah 1 run $cid sh -c "exit 1"
+  expect_output --substring "exit status 1"
+
+  # Exit 1 succeeds with --valid-exit-codes 0,1
+  run_buildah run --valid-exit-codes 0,1 $cid sh -c "exit 1"
+
+  # Exit 2 still fails with --valid-exit-codes 0,1
+  run_buildah 2 run --valid-exit-codes 0,1 $cid sh -c "exit 2"
+  expect_output --substring "exit status 2"
+
+  # Exit 0 fails when not in the valid exit codes list
+  run_buildah 125 run --valid-exit-codes 1 $cid sh -c "exit 0"
+  expect_output --substring "not in the valid exit codes list"
 }

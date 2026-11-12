@@ -3,31 +3,55 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io"
+	"log"
+	"log/slog"
 	"os"
 	"os/exec"
 	"runtime"
 	"runtime/pprof"
 	"strings"
 	"syscall"
+	"time"
 
-	"github.com/containers/buildah"
-	"github.com/containers/buildah/define"
-	"github.com/containers/buildah/pkg/cli"
-	"github.com/containers/buildah/pkg/parse"
-	"github.com/containers/common/pkg/config"
-	"github.com/containers/storage"
-	"github.com/containers/storage/pkg/unshare"
 	ispecs "github.com/opencontainers/image-spec/specs-go"
 	rspecs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
+	lslog "github.com/sirupsen/logrus/hooks/slog"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
+	"go.podman.io/buildah"
+	"go.podman.io/buildah/define"
+	"go.podman.io/buildah/pkg/cli"
+	"go.podman.io/buildah/pkg/parse"
+	"go.podman.io/common/pkg/config"
+	"go.podman.io/storage"
+	"go.podman.io/storage/pkg/unshare"
+	"golang.org/x/term"
 )
+
+const (
+	// command group IDs
+	groupImages     = "images"
+	groupContainers = "containers"
+	groupRegistries = "registries"
+	groupSystem     = "system"
+)
+
+var commandGroups = []*cobra.Group{
+	{ID: groupImages, Title: "Image Commands:"},
+	{ID: groupContainers, Title: "Container Commands:"},
+	{ID: groupRegistries, Title: "Registry Commands:"},
+	{ID: groupSystem, Title: "System Commands:"},
+}
 
 type globalFlags struct {
 	Debug                      bool
 	LogLevel                   string
 	Root                       string
 	RunRoot                    string
+	ImageStore                 string
+	TransientStore             bool
 	StorageDriver              string
 	RegistriesConf             string
 	RegistriesConfDir          string
@@ -40,18 +64,19 @@ type globalFlags struct {
 	MemoryProfile              string
 	UserShortNameAliasConfPath string
 	CgroupManager              string
+	ExperimentalTimeout        time.Duration
 }
 
 var rootCmd = &cobra.Command{
 	Use:  "buildah",
 	Long: "A tool that facilitates building OCI images",
-	RunE: func(cmd *cobra.Command, args []string) error {
+	RunE: func(cmd *cobra.Command, _ []string) error {
 		return cmd.Help()
 	},
-	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+	PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
 		return before(cmd)
 	},
-	PersistentPostRunE: func(cmd *cobra.Command, args []string) error {
+	PersistentPostRunE: func(cmd *cobra.Command, _ []string) error {
 		return after(cmd)
 	},
 	SilenceUsage:  true,
@@ -64,15 +89,12 @@ var (
 	defaultContainerConfig *config.Config
 )
 
-func init() {
-	var (
-		defaultStoreDriverOptions []string
-	)
+func mainInit() {
+	var defaultStoreDriverOptions []string
 	storageOptions, err := storage.DefaultStoreOptions()
 	if err != nil {
-		logrus.Errorf(err.Error())
+		logrus.Error(err.Error())
 		os.Exit(1)
-
 	}
 
 	if len(storageOptions.GraphDriverOptions) > 0 {
@@ -82,16 +104,17 @@ func init() {
 
 	defaultContainerConfig, err = config.Default()
 	if err != nil {
-		logrus.Errorf(err.Error())
+		logrus.Error(err.Error())
 		os.Exit(1)
 	}
 	defaultContainerConfig.CheckCgroupsAndAdjustConfig()
 
 	cobra.OnInitialize(initConfig)
-	// Disable the implicit `completion` command in cobra.
-	rootCmd.CompletionOptions.DisableDefaultCmd = true
-	//rootCmd.TraverseChildren = true
+	// Hide the implicit `completion` command in cobra.
+	rootCmd.CompletionOptions.HiddenDefaultCmd = true
+	// rootCmd.TraverseChildren = true
 	rootCmd.Version = fmt.Sprintf("%s (image-spec %s, runtime-spec %s)", define.Version, ispecs.Version, rspecs.Version)
+	rootCmd.PersistentFlags().DurationVar(&globalFlagResults.ExperimentalTimeout, "experimental-timeout", 0, "global timeout") // maybe rename this at some point?
 	rootCmd.PersistentFlags().BoolVar(&globalFlagResults.Debug, "debug", false, "print debugging information")
 	// TODO Need to allow for environment variable
 	rootCmd.PersistentFlags().StringVar(&globalFlagResults.RegistriesConf, "registries-conf", "", "path to registries.conf file (not usually used)")
@@ -101,6 +124,8 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&globalFlagResults.RunRoot, "runroot", storageOptions.RunRoot, "storage state dir")
 	rootCmd.PersistentFlags().StringVar(&globalFlagResults.CgroupManager, "cgroup-manager", defaultContainerConfig.Engine.CgroupManager, "cgroup manager")
 	rootCmd.PersistentFlags().StringVar(&globalFlagResults.StorageDriver, "storage-driver", storageOptions.GraphDriverName, "storage-driver")
+	rootCmd.PersistentFlags().StringVar(&globalFlagResults.ImageStore, "imagestore", storageOptions.ImageStore, "storage imagestore")
+	rootCmd.PersistentFlags().BoolVar(&globalFlagResults.TransientStore, "transient-store", storageOptions.TransientStore, "store some information in transient storage")
 	rootCmd.PersistentFlags().StringSliceVar(&globalFlagResults.StorageOpts, "storage-opt", defaultStoreDriverOptions, "storage driver option")
 	rootCmd.PersistentFlags().StringSliceVar(&globalFlagResults.UserNSUID, "userns-uid-map", []string{}, "default `ctrID:hostID:length` UID mapping to use")
 	rootCmd.PersistentFlags().StringSliceVar(&globalFlagResults.UserNSGID, "userns-gid-map", []string{}, "default `ctrID:hostID:length` GID mapping to use")
@@ -121,6 +146,20 @@ func init() {
 	if err := rootCmd.PersistentFlags().MarkHidden("memory-profile"); err != nil {
 		logrus.Fatalf("unable to mark memory-profile flag as hidden: %v", err)
 	}
+	if err := rootCmd.PersistentFlags().MarkHidden("experimental-timeout"); err != nil {
+		logrus.Fatalf("unable to mark experimental-timeout flag as hidden: %v", err)
+	}
+	rootCmd.AddGroup(commandGroups...)
+}
+
+func getInheritedFlags(c *cobra.Command) []string {
+	var flags []string
+	c.InheritedFlags().VisitAll(func(f *pflag.Flag) {
+		if f.Changed {
+			flags = append(flags, fmt.Sprintf("--%s=%s", f.Name, f.Value.String()))
+		}
+	})
+	return flags
 }
 
 func initConfig() {
@@ -139,13 +178,20 @@ func before(cmd *cobra.Command) error {
 	if err != nil {
 		return fmt.Errorf("unable to parse log level: %w", err)
 	}
+	logrus.SetOutput(io.Discard)
+	logrus.AddHook(lslog.NewHook(slog.Default(), nil))
 	logrus.SetLevel(logrusLvl)
+	slog.SetLogLoggerLevel(lslog.Level(logrusLvl).Level())
 	if globalFlagResults.Debug {
 		logrus.SetLevel(logrus.DebugLevel)
+		slog.SetLogLoggerLevel(slog.LevelDebug)
+	}
+	if term.IsTerminal(int(os.Stderr.Fd())) {
+		log.SetFlags(0) // We don’t want date/time in interactive output
 	}
 
 	switch cmd.Use {
-	case "", "help", "version", "mount":
+	case "", "help", "version", "mount", mountSshfs, umountSshfs:
 		return nil
 	}
 	debugCapabilities()
@@ -230,18 +276,51 @@ func main() {
 		return
 	}
 
+	mainInit()
+
+	addcopyInit()
+	buildInit()
+	commitInit()
+	configInit()
+	containersInit()
+	dumpboltInit()
+	fromInit()
+	imagesInit()
+	infoInit()
+	inspectInit()
+	loginInit()
+	logoutInit()
+	manifestInit()
+	mkcwInit()
+	mountInit()
+	pruneInit()
+	pullInit()
+	pushInit()
+	renameInit()
+	rmiInit()
+	rmInit()
+	rpcInit()
+	runInit()
+	sftpInit()
+	sourceInit()
+	tagInit()
+	umountInit()
+	unshareInit()
+	versionInit()
+
 	// Hard code TMPDIR functions to use $TMPDIR or /var/tmp
 	os.Setenv("TMPDIR", parse.GetTempDir())
 
-	if err := rootCmd.Execute(); err != nil {
+	err := rootCmd.Execute()
+	getContextCancel()()
+	if err != nil {
 		if logrus.IsLevelEnabled(logrus.TraceLevel) {
 			fmt.Fprintf(os.Stderr, "Error: %+v\n", err)
 		} else {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		}
 		exitCode = cli.ExecErrorCodeGeneric
-		var ee *exec.ExitError
-		if errors.As(err, &ee) {
+		if ee, ok := errors.AsType[*exec.ExitError](err); ok {
 			if w, ok := ee.Sys().(syscall.WaitStatus); ok {
 				exitCode = w.ExitStatus()
 			}

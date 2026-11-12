@@ -30,7 +30,7 @@ original instance.
 **--all**
 
 Push the images mentioned in the manifest list or image index, in addition to
-the list or index itself.
+the list or index itself. (Default true)
 
 **--authfile** *path*
 
@@ -98,6 +98,13 @@ Delete the manifest list or image index from local storage if pushing succeeds.
 **--sign-by** *fingerprint*
 
 Sign the pushed images using the GPG key that matches the specified fingerprint.
+
+**--timestamp** *seconds*
+
+Set the "created" timestamp for outputs to this number of seconds since
+the epoch (Unix time 0, i.e., 00:00:00 UTC on 1 January 1970) (defaults to
+current time). For example, if an oci-archive output is used, the tar entries
+created times are set to this value.
 
 **--tls-verify** *bool-value*
 

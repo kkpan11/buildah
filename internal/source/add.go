@@ -8,10 +8,10 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/containers/image/v5/types"
-	"github.com/containers/storage/pkg/archive"
-	"github.com/containers/storage/pkg/fileutils"
 	specV1 "github.com/opencontainers/image-spec/specs-go/v1"
+	"go.podman.io/image/v5/types"
+	"go.podman.io/storage/pkg/archive"
+	"go.podman.io/storage/pkg/fileutils"
 )
 
 // AddOptions include data to alter certain knobs when adding a source artifact
@@ -44,6 +44,12 @@ func (o *AddOptions) annotations() (map[string]string, error) {
 // at `sourcePath`.  Note that the artifact will be added as a gzip-compressed
 // tar ball.  Add attempts to auto-tar and auto-compress only if necessary.
 func Add(ctx context.Context, sourcePath string, artifactPath string, options AddOptions) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
 	// Let's first make sure `sourcePath` exists and that we can access it.
 	if err := fileutils.Exists(sourcePath); err != nil {
 		return err
@@ -130,5 +136,5 @@ func updateIndexWithNewManifestDescriptor(manifest *specV1.Descriptor, sourcePat
 		return err
 	}
 
-	return os.WriteFile(indexPath, rawData, 0644)
+	return os.WriteFile(indexPath, rawData, 0o644)
 }

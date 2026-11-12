@@ -7,7 +7,10 @@ import (
 )
 
 func TestPullPolicy(t *testing.T) {
-	for name, val := range PolicyMap {
-		assert.Equal(t, name, val.String())
+	t.Parallel()
+	for key, val := range PolicyMap {
+		t.Run(key, func(t *testing.T) {
+			assert.Equal(t, val, PolicyMap[val.String()])
+		})
 	}
 }

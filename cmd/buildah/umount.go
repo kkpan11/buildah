@@ -5,20 +5,21 @@ import (
 	"fmt"
 	"os"
 
-	buildahcli "github.com/containers/buildah/pkg/cli"
 	"github.com/spf13/cobra"
+	buildahcli "go.podman.io/buildah/pkg/cli"
 )
 
-func init() {
+func umountInit() {
 	umountCommand := &cobra.Command{
 		Use:     "umount",
 		Aliases: []string{"unmount"},
-		Short:   "Unmount the root file system of the specified working containers",
+		Short:   "Unmount the root file system of one or more working containers",
 		Long:    "Unmounts the root file system of the specified working containers.",
 		RunE:    umountCmd,
 		Example: `buildah umount containerID
   buildah umount containerID1 containerID2 containerID3
   buildah umount --all`,
+		GroupID: groupContainers,
 	}
 	umountCommand.SetUsageTemplate(UsageTemplate())
 
@@ -30,10 +31,8 @@ func init() {
 }
 
 func umountCmd(c *cobra.Command, args []string) error {
-	umountAll := false
-	if c.Flag("all").Changed {
-		umountAll = true
-	}
+	umountAll := c.Flag("all").Changed
+
 	umountContainerErrStr := "error unmounting container"
 	if len(args) == 0 && !umountAll {
 		return errors.New("at least one container ID must be specified")

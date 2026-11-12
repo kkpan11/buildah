@@ -2,23 +2,27 @@ package main
 
 import (
 	"flag"
+	"io"
+	"log/slog"
 	"os"
 	"os/user"
 	"testing"
 
-	"github.com/containers/buildah"
-	"github.com/containers/buildah/define"
-	is "github.com/containers/image/v5/storage"
-	"github.com/containers/image/v5/types"
-	"github.com/containers/storage"
 	"github.com/sirupsen/logrus"
+	lslog "github.com/sirupsen/logrus/hooks/slog"
 	"github.com/spf13/cobra"
+	"go.podman.io/buildah"
+	"go.podman.io/image/v5/types"
+	"go.podman.io/storage"
 )
 
 var (
 	signaturePolicyPath = ""
 	storeOptions, _     = storage.DefaultStoreOptions()
-	testSystemContext   = types.SystemContext{}
+	testSystemContext   = types.SystemContext{
+		SignaturePolicyPath:      "../../tests/policy.json",
+		SystemRegistriesConfPath: "../../tests/registries.conf",
+	}
 )
 
 func TestMain(m *testing.M) {
@@ -28,6 +32,8 @@ func TestMain(m *testing.M) {
 	flag.StringVar(&options.GraphRoot, "root", "", "storage root dir")
 	flag.StringVar(&options.RunRoot, "runroot", "", "storage state dir")
 	flag.StringVar(&options.GraphDriverName, "storage-driver", "", "storage driver")
+	flag.StringVar(&options.ImageStore, "imagestore", "", "storage imagestore")
+	flag.BoolVar(&options.TransientStore, "transient-store", false, "use transient storage")
 	flag.StringVar(&testSystemContext.SystemRegistriesConfPath, "registries-conf", "", "registries list")
 	flag.BoolVar(&debug, "debug", false, "turn on debug logging")
 	flag.Parse()
@@ -37,9 +43,13 @@ func TestMain(m *testing.M) {
 	if buildah.InitReexec() {
 		return
 	}
+	logrus.SetOutput(io.Discard)
+	logrus.AddHook(lslog.NewHook(slog.Default(), nil))
 	logrus.SetLevel(logrus.ErrorLevel)
+	slog.SetLogLoggerLevel(slog.LevelError)
 	if debug {
 		logrus.SetLevel(logrus.DebugLevel)
+		slog.SetLogLoggerLevel(slog.LevelDebug)
 	}
 	os.Exit(m.Run())
 }
@@ -49,7 +59,7 @@ func TestGetStore(t *testing.T) {
 	failTestIfNotRoot(t)
 	testCmd := &cobra.Command{
 		Use: "test",
-		RunE: func(cmd *cobra.Command, args []string) error {
+		RunE: func(cmd *cobra.Command, _ []string) error {
 			_, err := getStore(cmd)
 			return err
 		},
@@ -57,6 +67,8 @@ func TestGetStore(t *testing.T) {
 	flags := testCmd.PersistentFlags()
 	flags.String("root", storeOptions.GraphRoot, "")
 	flags.String("runroot", storeOptions.RunRoot, "")
+	flags.String("imagestore", storeOptions.ImageStore, "")
+	flags.Bool("transient-store", storeOptions.TransientStore, "")
 	flags.String("storage-driver", storeOptions.GraphDriverName, "")
 	flags.String("signature-policy", "", "")
 	if err := flags.MarkHidden("signature-policy"); err != nil {
@@ -68,32 +80,7 @@ func TestGetStore(t *testing.T) {
 	flags.String("registries-conf", "", "")
 	flags.String("userns-uid-map", "", "")
 	flags.String("userns-gid-map", "", "")
-	err := testCmd.Execute()
-	if err != nil {
-		t.Error(err)
-	}
-}
-
-func TestGetSize(t *testing.T) {
-	// Make sure the tests are running as root
-	failTestIfNotRoot(t)
-
-	store, err := storage.GetStore(storeOptions)
-	if err != nil {
-		t.Fatal(err)
-	} else if store != nil {
-		is.Transport.SetStore(store)
-	}
-
-	// Pull an image so that we know we have at least one
-	pullTestImage(t)
-
-	images, err := store.Images()
-	if err != nil {
-		t.Fatalf("Error reading images: %v", err)
-	}
-
-	_, _, _, err = getDateAndDigestAndSize(getContext(), &testSystemContext, store, images[0])
+	err := testCmd.ExecuteContext(t.Context())
 	if err != nil {
 		t.Error(err)
 	}
@@ -106,31 +93,4 @@ func failTestIfNotRoot(t *testing.T) {
 	} else if u.Uid != "0" {
 		t.Fatal("tests will fail unless run as root")
 	}
-}
-
-func pullTestImage(t *testing.T) string {
-	store, err := storage.GetStore(storeOptions)
-	if err != nil {
-		t.Fatal(err)
-	}
-	commonOpts := &define.CommonBuildOptions{
-		LabelOpts: nil,
-	}
-	options := buildah.BuilderOptions{
-		FromImage:           "busybox:latest",
-		SignaturePolicyPath: signaturePolicyPath,
-		CommonBuildOpts:     commonOpts,
-		SystemContext:       &testSystemContext,
-	}
-
-	b, err := buildah.NewBuilder(getContext(), store, options)
-	if err != nil {
-		t.Fatal(err)
-	}
-	id := b.FromImageID
-	err = b.Delete()
-	if err != nil {
-		t.Fatal(err)
-	}
-	return id
 }

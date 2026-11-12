@@ -15,7 +15,7 @@ var (
 	_ AverageDecorator = (*averageETA)(nil)
 )
 
-// TimeNormalizer interface. Implementors could be passed into
+// TimeNormalizer interface. Implementers could be passed into
 // MovingAverageETA, in order to affect i.e. normalize its output.
 type TimeNormalizer interface {
 	Normalize(time.Duration) time.Duration
@@ -33,13 +33,12 @@ func (f TimeNormalizerFunc) Normalize(src time.Duration) time.Duration {
 // decorator to work correctly you have to measure each iteration's duration
 // and pass it to one of the (*Bar).EwmaIncr... family methods.
 func EwmaETA(style TimeStyle, age float64, wcc ...WC) Decorator {
-	var average ewma.MovingAverage
-	if age == 0 {
-		average = ewma.NewMovingAverage()
-	} else {
-		average = ewma.NewMovingAverage(age)
-	}
-	return MovingAverageETA(style, NewThreadSafeMovingAverage(average), nil, wcc...)
+	return EwmaNormalizedETA(style, age, nil, wcc...)
+}
+
+// EwmaNormalizedETA same as EwmaETA but with TimeNormalizer option.
+func EwmaNormalizedETA(style TimeStyle, age float64, normalizer TimeNormalizer, wcc ...WC) Decorator {
+	return MovingAverageETA(style, ewma.NewMovingAverage(age), normalizer, wcc...)
 }
 
 // MovingAverageETA decorator relies on MovingAverage implementation to calculate its average.
@@ -55,7 +54,7 @@ func MovingAverageETA(style TimeStyle, average ewma.MovingAverage, normalizer Ti
 	d := &movingAverageETA{
 		WC:         initWC(wcc...),
 		producer:   chooseTimeProducer(style),
-		average:    average,
+		average:    NewThreadSafeMovingAverage(average),
 		normalizer: normalizer,
 	}
 	return d
@@ -79,14 +78,10 @@ func (d *movingAverageETA) Decor(s Statistics) (string, int) {
 }
 
 func (d *movingAverageETA) EwmaUpdate(n int64, dur time.Duration) {
-	if n <= 0 {
+	durPerItem := float64(d.zDur+dur) / float64(n)
+	if math.IsInf(durPerItem, 0) || math.IsNaN(durPerItem) {
 		d.zDur += dur
-	} else {
-		durPerItem := float64(d.zDur+dur) / float64(n)
-		if math.IsInf(durPerItem, 0) || math.IsNaN(durPerItem) {
-			d.zDur += dur
-			return
-		}
+	} else if !math.Signbit(durPerItem) {
 		d.zDur = 0
 		d.average.Add(durPerItem)
 	}
@@ -105,15 +100,15 @@ func AverageETA(style TimeStyle, wcc ...WC) Decorator {
 //
 //	`style` one of [ET_STYLE_GO|ET_STYLE_HHMMSS|ET_STYLE_HHMM|ET_STYLE_MMSS]
 //
-//	`startTime` start time
+//	`start` start time
 //
 //	`normalizer` available implementations are [FixedIntervalTimeNormalizer|MaxTolerateTimeNormalizer]
 //
 //	`wcc` optional WC config
-func NewAverageETA(style TimeStyle, startTime time.Time, normalizer TimeNormalizer, wcc ...WC) Decorator {
+func NewAverageETA(style TimeStyle, start time.Time, normalizer TimeNormalizer, wcc ...WC) Decorator {
 	d := &averageETA{
 		WC:         initWC(wcc...),
-		startTime:  startTime,
+		start:      start,
 		normalizer: normalizer,
 		producer:   chooseTimeProducer(style),
 	}
@@ -122,7 +117,7 @@ func NewAverageETA(style TimeStyle, startTime time.Time, normalizer TimeNormaliz
 
 type averageETA struct {
 	WC
-	startTime  time.Time
+	start      time.Time
 	normalizer TimeNormalizer
 	producer   func(time.Duration) string
 }
@@ -130,7 +125,7 @@ type averageETA struct {
 func (d *averageETA) Decor(s Statistics) (string, int) {
 	var remaining time.Duration
 	if s.Current != 0 {
-		durPerItem := float64(time.Since(d.startTime)) / float64(s.Current)
+		durPerItem := float64(time.Since(d.start)) / float64(s.Current)
 		durPerItem = math.Round(durPerItem)
 		remaining = time.Duration((s.Total - s.Current) * int64(durPerItem))
 		if d.normalizer != nil {
@@ -140,8 +135,8 @@ func (d *averageETA) Decor(s Statistics) (string, int) {
 	return d.Format(d.producer(remaining))
 }
 
-func (d *averageETA) AverageAdjust(startTime time.Time) {
-	d.startTime = startTime
+func (d *averageETA) AverageAdjust(start time.Time) {
+	d.start = start
 }
 
 // MaxTolerateTimeNormalizer returns implementation of TimeNormalizer.
@@ -156,7 +151,10 @@ func MaxTolerateTimeNormalizer(maxTolerate time.Duration) TimeNormalizer {
 		}
 		normalized -= time.Since(lastCall)
 		lastCall = time.Now()
-		return normalized
+		if normalized > 0 {
+			return normalized
+		}
+		return remaining
 	})
 }
 
@@ -175,7 +173,10 @@ func FixedIntervalTimeNormalizer(updInterval int) TimeNormalizer {
 		count--
 		normalized -= time.Since(lastCall)
 		lastCall = time.Now()
-		return normalized
+		if normalized > 0 {
+			return normalized
+		}
+		return remaining
 	})
 }
 
@@ -183,20 +184,20 @@ func chooseTimeProducer(style TimeStyle) func(time.Duration) string {
 	switch style {
 	case ET_STYLE_HHMMSS:
 		return func(remaining time.Duration) string {
-			hours := int64(remaining/time.Hour) % 60
+			hours := int64(remaining / time.Hour)
 			minutes := int64(remaining/time.Minute) % 60
 			seconds := int64(remaining/time.Second) % 60
 			return fmt.Sprintf("%02d:%02d:%02d", hours, minutes, seconds)
 		}
 	case ET_STYLE_HHMM:
 		return func(remaining time.Duration) string {
-			hours := int64(remaining/time.Hour) % 60
+			hours := int64(remaining / time.Hour)
 			minutes := int64(remaining/time.Minute) % 60
 			return fmt.Sprintf("%02d:%02d", hours, minutes)
 		}
 	case ET_STYLE_MMSS:
 		return func(remaining time.Duration) string {
-			hours := int64(remaining/time.Hour) % 60
+			hours := int64(remaining / time.Hour)
 			minutes := int64(remaining/time.Minute) % 60
 			seconds := int64(remaining/time.Second) % 60
 			if hours > 0 {

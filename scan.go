@@ -6,14 +6,14 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
-	"github.com/containers/buildah/define"
-	"github.com/containers/buildah/internal/sbom"
 	"github.com/mattn/go-shellwords"
 	rspec "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
-	"golang.org/x/exp/slices"
+	"go.podman.io/buildah/define"
+	"go.podman.io/buildah/internal/sbom"
 )
 
 func stringSliceReplaceAll(slice []string, replacements map[string]string, important []string) (built []string, replacedAnImportantValue bool) {
@@ -36,6 +36,12 @@ func stringSliceReplaceAll(slice []string, replacements map[string]string, impor
 // sbomScan iterates through the scanning configuration settings, generating
 // SBOM files and storing them either in the rootfs or in a local file path.
 func (b *Builder) sbomScan(ctx context.Context, options CommitOptions) (imageFiles, localFiles map[string]string, scansDir string, err error) {
+	select {
+	case <-ctx.Done():
+		return nil, nil, "", ctx.Err()
+	default:
+	}
+
 	// We'll use a temporary per-container directory for this one.
 	cdir, err := b.store.ContainerDirectory(b.ContainerID)
 	if err != nil {
@@ -52,6 +58,13 @@ func (b *Builder) sbomScan(ctx context.Context, options CommitOptions) (imageFil
 			}
 		}
 	}()
+	scansSubdir := filepath.Join(scansDir, "scans")
+	if err = os.Mkdir(scansSubdir, 0o700); err != nil {
+		return nil, nil, "", err
+	}
+	if err = os.Chmod(scansSubdir, 0o777); err != nil {
+		return nil, nil, "", err
+	}
 
 	// We may be producing sets of outputs using temporary containers, and
 	// there's no need to create more than one container for any one
@@ -107,7 +120,7 @@ func (b *Builder) sbomScan(ctx context.Context, options CommitOptions) (imageFil
 			// Start by assuming it's shell -c $whatever.
 			parsedCommand := []string{"/bin/sh", "-c", commandSpec}
 			if shell := scanBuilder.Shell(); len(shell) != 0 {
-				parsedCommand = append(append([]string{}, shell...), commandSpec)
+				parsedCommand = append(slices.Clone(shell), commandSpec)
 			}
 			if !strings.ContainsAny(commandSpec, "<>|") { // An imperfect check for shell redirection being used.
 				// If we can parse it ourselves, though, prefer to use that result,
@@ -127,7 +140,7 @@ func (b *Builder) sbomScan(ctx context.Context, options CommitOptions) (imageFil
 			// Our temporary directory, read-write.
 			{
 				Type:        define.TypeBind,
-				Source:      scansDir,
+				Source:      scansSubdir,
 				Destination: scansTargetDir,
 				Options:     []string{"rw", "z"},
 			},
@@ -204,7 +217,7 @@ func (b *Builder) sbomScan(ctx context.Context, options CommitOptions) (imageFil
 		// or more files named "scan%d.json" in our temporary directory.
 		for _, resolvedCommand := range resolvedCommands {
 			logrus.Debugf("Running scan command %q", resolvedCommand)
-			if err = scanBuilder.Run(resolvedCommand, runOptions); err != nil {
+			if err = scanBuilder.RunContext(ctx, resolvedCommand, runOptions); err != nil {
 				return nil, nil, "", fmt.Errorf("running scanning command %v: %w", resolvedCommand, err)
 			}
 		}
@@ -212,19 +225,19 @@ func (b *Builder) sbomScan(ctx context.Context, options CommitOptions) (imageFil
 		var sbomResult, purlResult string
 		switch {
 		case scanSpec.ImageSBOMOutput != "":
-			sbomResult = filepath.Join(scansDir, filepath.Base(scanSpec.ImageSBOMOutput))
+			sbomResult = filepath.Join(scansSubdir, filepath.Base(scanSpec.ImageSBOMOutput))
 		case scanSpec.SBOMOutput != "":
-			sbomResult = filepath.Join(scansDir, filepath.Base(scanSpec.SBOMOutput))
+			sbomResult = filepath.Join(scansSubdir, filepath.Base(scanSpec.SBOMOutput))
 		default:
-			sbomResult = filepath.Join(scansDir, "sbom-result")
+			sbomResult = filepath.Join(scansSubdir, "sbom-result")
 		}
 		switch {
 		case scanSpec.ImagePURLOutput != "":
-			purlResult = filepath.Join(scansDir, filepath.Base(scanSpec.ImagePURLOutput))
+			purlResult = filepath.Join(scansSubdir, filepath.Base(scanSpec.ImagePURLOutput))
 		case scanSpec.PURLOutput != "":
-			purlResult = filepath.Join(scansDir, filepath.Base(scanSpec.PURLOutput))
+			purlResult = filepath.Join(scansSubdir, filepath.Base(scanSpec.PURLOutput))
 		default:
-			purlResult = filepath.Join(scansDir, "purl-result")
+			purlResult = filepath.Join(scansSubdir, "purl-result")
 		}
 		copyFile := func(destination, source string) error {
 			dst, err := os.Create(destination)
@@ -244,7 +257,7 @@ func (b *Builder) sbomScan(ctx context.Context, options CommitOptions) (imageFil
 		}
 		err = func() error {
 			for i := range resultFiles {
-				thisResultFile := filepath.Join(scansDir, filepath.Base(resultFiles[i]))
+				thisResultFile := filepath.Join(scansSubdir, filepath.Base(resultFiles[i]))
 				switch i {
 				case 0:
 					// Straight-up copy to create the first version of the final output.

@@ -1,10 +1,10 @@
-package util
+package util //nolint:revive,nolintlint
 
 import (
 	"bytes"
 	"errors"
-	"time"
 	"os"
+	"time"
 )
 
 func ReadUptime() (time.Duration, error) {

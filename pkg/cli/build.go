@@ -7,24 +7,32 @@ package cli
 // here we are.
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
+	"log"
+	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
-	"github.com/containers/buildah/define"
-	"github.com/containers/buildah/pkg/parse"
-	"github.com/containers/buildah/pkg/util"
-	"github.com/containers/common/pkg/auth"
-	"github.com/containers/image/v5/docker/reference"
-	"github.com/containers/image/v5/types"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
-	"golang.org/x/exp/slices"
+	"go.podman.io/buildah/define"
+	"go.podman.io/buildah/internal/output"
+	"go.podman.io/buildah/pkg/parse"
+	"go.podman.io/buildah/pkg/tmpdir"
+	"go.podman.io/buildah/pkg/util"
+	"go.podman.io/common/pkg/auth"
+	"go.podman.io/common/pkg/config"
+	"go.podman.io/image/v5/docker/reference"
+	imgCompression "go.podman.io/image/v5/pkg/compression"
+	"go.podman.io/image/v5/types"
 )
 
 type BuildOptions struct {
@@ -47,7 +55,7 @@ func GenBuildOptions(c *cobra.Command, inputArgs []string, iopts BuildOptions) (
 
 	var removeAll []string
 
-	output := ""
+	outputSpec := ""
 	cleanTmpFile := false
 	tags := []string{}
 	if iopts.Network == "none" {
@@ -60,19 +68,16 @@ func GenBuildOptions(c *cobra.Command, inputArgs []string, iopts BuildOptions) (
 		if c.Flag("dns-search").Changed {
 			return options, nil, nil, errors.New("the --dns-search option cannot be used with --network=none")
 		}
-
 	}
 	if c.Flag("tag").Changed {
 		tags = iopts.Tag
 		if len(tags) > 0 {
-			output = tags[0]
+			outputSpec = tags[0]
 			tags = tags[1:]
 		}
 		if c.Flag("manifest").Changed {
-			for _, tag := range tags {
-				if tag == iopts.Manifest {
-					return options, nil, nil, errors.New("the same name must not be specified for both '--tag' and '--manifest'")
-				}
+			if slices.Contains(tags, iopts.Manifest) {
+				return options, nil, nil, errors.New("the same name must not be specified for both '--tag' and '--manifest'")
 			}
 		}
 	}
@@ -114,7 +119,10 @@ func GenBuildOptions(c *cobra.Command, inputArgs []string, iopts BuildOptions) (
 	if c.Flag("build-context").Changed {
 		for _, contextString := range iopts.BuildContext {
 			av := strings.SplitN(contextString, "=", 2)
-			if len(av) > 1 {
+			// the key should be non-empty: we use "" as internal
+			// shorthand for the default build context when there's
+			// an overlay mounted over it
+			if len(av) > 1 && av[0] != "" {
 				parseAdditionalBuildContext, err := parse.GetAdditionalBuildContext(av[1])
 				if err != nil {
 					return options, nil, nil, fmt.Errorf("while parsing additional build context: %w", err)
@@ -147,7 +155,20 @@ func GenBuildOptions(c *cobra.Command, inputArgs []string, iopts BuildOptions) (
 		}
 	} else {
 		// The context directory could be a URL.  Try to handle that.
-		tempDir, subDir, err := define.TempDirForURL("", "buildah", cliArgs[0])
+		ctx := c.Context()
+		if ctx == nil {
+			ctx = context.TODO()
+		}
+		urlOptions := tmpdir.URLOptions{
+			Proxy: http.ProxyFromEnvironment,
+		}
+		if c.Flag("cert-dir").Changed {
+			urlOptions.CertPath = iopts.CertDir
+		}
+		if c.Flag("tls-verify").Changed {
+			urlOptions.InsecureSkipTLSVerify = types.NewOptionalBool(!iopts.TLSVerify)
+		}
+		tempDir, subDir, err := tmpdir.ForURL(ctx, "", "buildah", cliArgs[0], &urlOptions)
 		if err != nil {
 			return options, nil, nil, fmt.Errorf("prepping temporary context directory: %w", err)
 		}
@@ -191,7 +212,7 @@ func GenBuildOptions(c *cobra.Command, inputArgs []string, iopts BuildOptions) (
 	stderr = os.Stderr
 	reporter = os.Stderr
 	if iopts.Logwriter != nil {
-		logrus.SetOutput(iopts.Logwriter)
+		log.SetOutput(iopts.Logwriter)
 		stdout = iopts.Logwriter
 		stderr = iopts.Logwriter
 		reporter = iopts.Logwriter
@@ -221,6 +242,10 @@ func GenBuildOptions(c *cobra.Command, inputArgs []string, iopts BuildOptions) (
 		return options, nil, nil, errors.New("'rm' and 'force-rm' can only be set with either 'layers' or 'no-cache'")
 	}
 
+	if iopts.StageLabels && !iopts.SaveStages {
+		return options, nil, nil, errors.New(`"--stage-labels" requires "--save-stages"`)
+	}
+
 	if c.Flag("compress").Changed {
 		logrus.Debugf("--compress option specified but is ignored")
 	}
@@ -228,6 +253,40 @@ func GenBuildOptions(c *cobra.Command, inputArgs []string, iopts BuildOptions) (
 	compression := define.Gzip
 	if iopts.DisableCompression {
 		compression = define.Uncompressed
+	}
+
+	var compressionFormat *imgCompression.Algorithm
+	forceCompressionFormat := iopts.ForceCompressionFormat
+	defaultContainerConfig, err := config.Default()
+	if err != nil {
+		return options, nil, nil, fmt.Errorf("failed to get container config: %w", err)
+	}
+	if iopts.CompressionFormat != "" {
+		algo, err := imgCompression.AlgorithmByName(iopts.CompressionFormat)
+		if err != nil {
+			return options, nil, nil, err
+		}
+		compressionFormat = &algo
+		compression = define.Gzip
+		if !c.Flag("force-compression").Changed {
+			forceCompressionFormat = true
+		}
+	} else if defaultContainerConfig.Engine.CompressionFormat != "" && defaultContainerConfig.Engine.CompressionFormat != "gzip" {
+		algo, err := imgCompression.AlgorithmByName(defaultContainerConfig.Engine.CompressionFormat)
+		if err != nil {
+			return options, nil, nil, fmt.Errorf("parsing compression_format from containers.conf: %w", err)
+		}
+		compressionFormat = &algo
+		compression = define.Gzip
+		if !c.Flag("force-compression").Changed {
+			forceCompressionFormat = true
+		}
+	}
+	var compressionLevel *int
+	if c.Flag("compression-level").Changed {
+		compressionLevel = &iopts.CompressionLevel
+	} else {
+		compressionLevel = defaultContainerConfig.Engine.CompressionLevel
 	}
 
 	if c.Flag("disable-content-trust").Changed {
@@ -260,18 +319,30 @@ func GenBuildOptions(c *cobra.Command, inputArgs []string, iopts BuildOptions) (
 			return options, nil, nil, err
 		}
 	}
-	var timestamp *time.Time
+	var timestamp, sourceDateEpoch *time.Time
 	if c.Flag("timestamp").Changed {
 		t := time.Unix(iopts.Timestamp, 0).UTC()
 		timestamp = &t
 	}
-	if c.Flag("output").Changed {
-		buildOption, err := parse.GetBuildOutput(iopts.BuildOutput)
+	if iopts.SourceDateEpoch != "" {
+		u, err := strconv.ParseInt(iopts.SourceDateEpoch, 10, 64)
 		if err != nil {
-			return options, nil, nil, err
+			return options, nil, nil, fmt.Errorf("error parsing source-date-epoch offset %q: %w", iopts.SourceDateEpoch, err)
 		}
-		if buildOption.IsStdout {
-			iopts.Quiet = true
+		s := time.Unix(u, 0).UTC()
+		sourceDateEpoch = &s
+	}
+	if c.Flag("output").Changed {
+		for _, buildOutput := range iopts.BuildOutputs {
+			// if any of these go to stdout, we need to avoid
+			// interspersing our random output in with it
+			buildOption, err := output.GetBuildOutput(buildOutput)
+			if err != nil {
+				return options, nil, nil, err
+			}
+			if buildOption.Type == output.BuildOutputStdout {
+				iopts.Quiet = true
+			}
 		}
 	}
 	var confidentialWorkloadOptions define.ConfidentialWorkloadOptions
@@ -317,7 +388,7 @@ func GenBuildOptions(c *cobra.Command, inputArgs []string, iopts BuildOptions) (
 		}
 	}
 
-	if c.Flag("network").Changed && c.Flag("isolation").Changed {
+	if c.Flag("network").Changed {
 		if isolation == define.IsolationChroot {
 			if ns := namespaceOptions.Find(string(specs.NetworkNamespace)); ns != nil {
 				if !ns.Host {
@@ -345,6 +416,23 @@ func GenBuildOptions(c *cobra.Command, inputArgs []string, iopts BuildOptions) (
 		sbomScanOptions = append(sbomScanOptions, *sbomScanOption)
 	}
 
+	var compatVolumes, createdAnnotation, inheritAnnotations, inheritLabels, skipUnusedStages types.OptionalBool
+	if c.Flag("compat-volumes").Changed {
+		compatVolumes = types.NewOptionalBool(iopts.CompatVolumes)
+	}
+	if c.Flag("created-annotation").Changed {
+		createdAnnotation = types.NewOptionalBool(iopts.CreatedAnnotation)
+	}
+	if c.Flag("inherit-annotations").Changed {
+		inheritAnnotations = types.NewOptionalBool(iopts.InheritAnnotations)
+	}
+	if c.Flag("inherit-labels").Changed {
+		inheritLabels = types.NewOptionalBool(iopts.InheritLabels)
+	}
+	if c.Flag("skip-unused-stages").Changed {
+		skipUnusedStages = types.NewOptionalBool(iopts.SkipUnusedStages)
+	}
+
 	options = define.BuildOptions{
 		AddCapabilities:         iopts.CapAdd,
 		AdditionalBuildContexts: additionalBuildContext,
@@ -354,19 +442,22 @@ func GenBuildOptions(c *cobra.Command, inputArgs []string, iopts BuildOptions) (
 		Architecture:            systemContext.ArchitectureChoice,
 		Args:                    args,
 		BlobDirectory:           iopts.BlobCache,
-		BuildOutput:             iopts.BuildOutput,
+		BuildOutputs:            iopts.BuildOutputs,
 		CacheFrom:               cacheFrom,
 		CacheTo:                 cacheTo,
 		CacheTTL:                cacheTTL,
 		CDIConfigDir:            iopts.CDIConfigDir,
-		CNIConfigDir:            iopts.CNIConfigDir,
-		CNIPluginPath:           iopts.CNIPlugInPath,
+		CompatVolumes:           compatVolumes,
 		ConfidentialWorkload:    confidentialWorkloadOptions,
 		CPPFlags:                iopts.CPPFlags,
 		CommonBuildOpts:         commonOpts,
 		Compression:             compression,
+		CompressionFormat:       compressionFormat,
+		CompressionLevel:        compressionLevel,
+		ForceCompressionFormat:  forceCompressionFormat,
 		ConfigureNetwork:        networkPolicy,
 		ContextDirectory:        contextDir,
+		CreatedAnnotation:       createdAnnotation,
 		Devices:                 iopts.Devices,
 		DropCapabilities:        iopts.CapDrop,
 		Err:                     stderr,
@@ -376,8 +467,11 @@ func GenBuildOptions(c *cobra.Command, inputArgs []string, iopts BuildOptions) (
 		GroupAdd:                iopts.GroupAdd,
 		IDMappingOptions:        idmappingOptions,
 		IIDFile:                 iopts.Iidfile,
+		IIDFileRaw:              iopts.IidfileRaw,
 		IgnoreFile:              iopts.IgnoreFile,
 		In:                      stdin,
+		InheritLabels:           inheritLabels,
+		InheritAnnotations:      inheritAnnotations,
 		Isolation:               isolation,
 		Jobs:                    &iopts.Jobs,
 		Labels:                  iopts.Label,
@@ -387,35 +481,45 @@ func GenBuildOptions(c *cobra.Command, inputArgs []string, iopts BuildOptions) (
 		LogRusage:               iopts.LogRusage,
 		LogSplitByPlatform:      iopts.LogSplitByPlatform,
 		Manifest:                iopts.Manifest,
+		MetadataFile:            iopts.MetadataFile,
 		MaxPullPushRetries:      iopts.Retry,
 		NamespaceOptions:        namespaceOptions,
 		NoCache:                 iopts.NoCache,
+		NoCacheFilter:           iopts.NoCacheFilter,
 		OS:                      systemContext.OSChoice,
 		OSFeatures:              iopts.OSFeatures,
 		OSVersion:               iopts.OSVersion,
 		OciDecryptConfig:        decryptConfig,
 		Out:                     stdout,
-		Output:                  output,
+		Output:                  outputSpec,
 		OutputFormat:            format,
 		Platforms:               platforms,
+		Proxy:                   http.ProxyFromEnvironment,
 		PullPolicy:              pullPolicy,
 		Quiet:                   iopts.Quiet,
 		RemoveIntermediateCtrs:  iopts.Rm,
 		ReportWriter:            reporter,
+		RewriteTimestamp:        iopts.RewriteTimestamp,
 		Runtime:                 iopts.Runtime,
 		RuntimeArgs:             runtimeFlags,
 		RusageLogFile:           iopts.RusageLogFile,
+		SaveStages:              iopts.SaveStages,
 		SBOMScanOptions:         sbomScanOptions,
 		SignBy:                  iopts.SignBy,
 		SignaturePolicyPath:     iopts.SignaturePolicy,
-		SkipUnusedStages:        types.NewOptionalBool(iopts.SkipUnusedStages),
+		SourcePolicyFile:        iopts.SourcePolicyFile,
+		SkipUnusedStages:        skipUnusedStages,
+		SourceDateEpoch:         sourceDateEpoch,
 		Squash:                  iopts.Squash,
+		StageLabels:             iopts.StageLabels,
 		SystemContext:           systemContext,
 		Target:                  iopts.Target,
 		Timestamp:               timestamp,
 		TransientMounts:         iopts.Volumes,
+		TransientRunMounts:      iopts.TransientRunMounts,
 		UnsetEnvs:               iopts.UnsetEnvs,
 		UnsetLabels:             iopts.UnsetLabels,
+		UnsetAnnotations:        iopts.UnsetAnnotations,
 	}
 	if iopts.RetryDelay != "" {
 		options.PullPushRetryDelay, err = time.ParseDuration(iopts.RetryDelay)
@@ -426,7 +530,7 @@ func GenBuildOptions(c *cobra.Command, inputArgs []string, iopts BuildOptions) (
 		logrus.Debugf("Setting MaxPullPushRetries to %d and PullPushRetryDelay to %v", iopts.Retry, options.PullPushRetryDelay)
 	}
 
-	if iopts.Quiet {
+	if iopts.Quiet || !logrus.IsLevelEnabled(logrus.WarnLevel) {
 		options.ReportWriter = io.Discard
 	}
 
@@ -440,7 +544,7 @@ func readBuildArgFile(buildargfile string, args map[string]string) error {
 	if err != nil {
 		return err
 	}
-	for _, arg := range strings.Split(string(argfile), "\n") {
+	for arg := range strings.SplitSeq(string(argfile), "\n") {
 		if len(arg) == 0 || arg[0] == '#' {
 			continue
 		}

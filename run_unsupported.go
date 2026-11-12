@@ -1,13 +1,13 @@
 //go:build !linux && !darwin && !freebsd
-// +build !linux,!darwin,!freebsd
 
 package buildah
 
 import (
+	"context"
 	"errors"
 
-	nettypes "github.com/containers/common/libnetwork/types"
-	"github.com/containers/storage"
+	nettypes "go.podman.io/common/libnetwork/types"
+	"go.podman.io/storage"
 )
 
 func setChildProcess() error {
@@ -16,14 +16,21 @@ func setChildProcess() error {
 
 func runUsingRuntimeMain() {}
 
-func (b *Builder) Run(command []string, options RunOptions) error {
+func (b *Builder) RunContext(ctx context.Context, command []string, options RunOptions) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
 	return errors.New("function not supported on non-linux systems")
 }
+
 func DefaultNamespaceOptions() (NamespaceOptions, error) {
 	return NamespaceOptions{}, errors.New("function not supported on non-linux systems")
 }
 
 // getNetworkInterface creates the network interface
-func getNetworkInterface(store storage.Store, cniConfDir, cniPluginPath string) (nettypes.ContainerNetwork, error) {
+func getNetworkInterface(store storage.Store) (nettypes.ContainerNetwork, error) {
 	return nil, errors.New("function not supported on non-linux systems")
 }

@@ -1,5 +1,4 @@
 //go:build !linux
-// +build !linux
 
 package main
 
@@ -7,7 +6,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-func init() {
+func unshareInit() {
 	unshareCommand := cobra.Command{
 		Use:    "unshare",
 		Hidden: true,

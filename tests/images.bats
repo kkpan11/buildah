@@ -27,36 +27,40 @@ load helpers
 
 @test "images all test" {
   _prefetch alpine
-  run_buildah bud $WITH_POLICY_JSON --layers -t test $BUDFILES/use-layers
+  contentdir=${TEST_SCRATCH_DIR}/content
+  mkdir -p ${contentdir}
+  echo legend has it this counts as a README file > ${contentdir}/README.md
+  starthttpd ${contentdir}
+  run_buildah bud $WITH_POLICY_JSON --build-arg=HTTP_SERVER_PORT=${HTTP_SERVER_PORT} --layers -t test $BUDFILES/use-layers
   run_buildah images
   expect_line_count 3
 
   run_buildah images -a
-  expect_line_count 8
+  expect_line_count 9
 
   # create a no name image which should show up when doing buildah images without the --all flag
-  run_buildah bud $WITH_POLICY_JSON $BUDFILES/use-layers
+  run_buildah bud $WITH_POLICY_JSON --build-arg=HTTP_SERVER_PORT=${HTTP_SERVER_PORT} $BUDFILES/use-layers
   run_buildah images
   expect_line_count 4
 }
 
 @test "images filter test" {
-  _prefetch registry.k8s.io/pause busybox
-  run_buildah from --quiet --pull=false $WITH_POLICY_JSON registry.k8s.io/pause
+  _prefetch quay.io/libpod/k8s-pause:3.5-nowin busybox
+  run_buildah from --quiet --pull=false $WITH_POLICY_JSON quay.io/libpod/k8s-pause:3.5-nowin
   cid1=$output
   run_buildah from --quiet --pull=false $WITH_POLICY_JSON busybox
   cid2=$output
 
-  run_buildah 125 images --noheading --filter since registry.k8s.io/pause
+  run_buildah 125 images --noheading --filter since quay.io/libpod/k8s-pause:3.5-nowin
   expect_output 'Error: invalid image filter "since": must be in the format "filter=value or filter!=value"'
 
 
-  run_buildah images --noheading --filter since=registry.k8s.io/pause
+  run_buildah images --noheading --filter since=busybox
   expect_line_count 1
 
   # pause* and u* should only give us pause image not busybox since its a AND between
   # two filters
-  run_buildah images --noheading --filter "reference=pause*" --filter "reference=u*"
+  run_buildah images --noheading --filter "reference=k8s-pause*" --filter "reference=u*"
   expect_line_count 1
 }
 
@@ -107,14 +111,17 @@ load helpers
   run_buildah from --quiet --pull=false $WITH_POLICY_JSON busybox
 
   for img in '' alpine busybox; do
-      # e.g. [ { "id": "xx", ... },{ "id": "yy", ... } ]
-      # We check for the presence of some keys, but not (yet) their values.
-      # FIXME: once we can rely on 'jq' tool being present, improve this test!
       run_buildah images --json $img
-      expect_output --from="${lines[0]}" "[" "first line of JSON output: array"
-      for key in id names digest createdat size readonly history; do
-          expect_output --substring "\"$key\": "
-      done
+      run jq -re 'length > 0 and
+        all(.[]; has("id")
+             and has("names")
+             and has("digest")
+             and has("createdat")
+             and has("size")
+             and has("readonly")
+             and has("history"))' <<<"$output"
+      expect_output "true"
+      assert "$status" -eq 0 "status from jq for $img"
   done
 }
 
@@ -269,4 +276,20 @@ EOF
   run_buildah inspect ${configdigest}
   # List images.  We shouldn't crash.
   run_buildah images
+}
+
+
+@test "Test two image names" {
+  _prefetch alpine busybox
+  run_buildah from --quiet --pull=false $WITH_POLICY_JSON alpine
+  run_buildah from --quiet --pull=false $WITH_POLICY_JSON busybox
+
+  run_buildah 125 images --filter dangling=true alpine busybox
+  expect_output "Error: 'buildah images' requires at most 1 argument"
+
+  run_buildah 125 images alpine busybox
+  expect_output "Error: 'buildah images' requires at most 1 argument"
+
+  run_buildah 125 images --noheading alpine busybox
+  expect_output "Error: 'buildah images' requires at most 1 argument"
 }

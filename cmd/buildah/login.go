@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/containers/buildah/pkg/parse"
-	"github.com/containers/common/pkg/auth"
 	"github.com/spf13/cobra"
+	"go.podman.io/buildah/pkg/parse"
+	"go.podman.io/common/pkg/auth"
 )
 
 type loginReply struct {
@@ -16,7 +16,7 @@ type loginReply struct {
 	tlsVerify bool
 }
 
-func init() {
+func loginInit() {
 	var (
 		opts = loginReply{
 			loginOpts: auth.LoginOptions{
@@ -35,6 +35,7 @@ func init() {
 			return loginCmd(cmd, args, &opts)
 		},
 		Example: `buildah login quay.io`,
+		GroupID: groupRegistries,
 	}
 	loginCommand.SetUsageTemplate(UsageTemplate())
 

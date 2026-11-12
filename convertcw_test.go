@@ -2,7 +2,6 @@ package buildah
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,12 +13,11 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/containers/buildah/internal/mkcw"
-	mkcwtypes "github.com/containers/buildah/internal/mkcw/types"
-	"github.com/containers/image/v5/types"
-	"github.com/containers/storage"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.podman.io/buildah/internal/mkcw"
+	mkcwtypes "go.podman.io/buildah/internal/mkcw/types"
+	"go.podman.io/storage"
 )
 
 // dummyAttestationHandler replies with a fixed response code to requests to
@@ -67,8 +65,13 @@ func (d *dummyAttestationHandler) ServeHTTP(rw http.ResponseWriter, req *http.Re
 }
 
 func TestCWConvertImage(t *testing.T) {
-	ctx := context.TODO()
-	systemContext := &types.SystemContext{}
+	// This test cannot be parallelized as this uses NewBuilder()
+	// which eventually and indirectly accesses a global variable
+	// defined in `go-selinux`, this must be fixed at `go-selinux`
+	// or builder must enable sometime of locking mechanism i.e if
+	// routine is creating Builder other's must wait for it.
+	// Tracked here: https://github.com/containers/buildah/issues/5967
+	ctx := t.Context()
 	for _, status := range []int{http.StatusOK, http.StatusInternalServerError} {
 		for _, ignoreChainRetrievalErrors := range []bool{false, true} {
 			for _, ignoreAttestationErrors := range []bool{false, true} {
@@ -110,8 +113,9 @@ func TestCWConvertImage(t *testing.T) {
 						AttestationURL:          "http://" + addr.String(),
 						IgnoreAttestationErrors: ignoreAttestationErrors,
 						Slop:                    "16MB",
+						SignaturePolicyPath:     testSystemContext.SignaturePolicyPath,
 					}
-					id, _, _, err := CWConvertImage(ctx, systemContext, store, options)
+					id, _, _, err := CWConvertImage(ctx, &testSystemContext, store, options)
 					if status != http.StatusOK && !ignoreAttestationErrors {
 						assert.Error(t, err)
 						return

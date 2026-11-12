@@ -16,7 +16,7 @@ func testNewKeySource() (*Source, error) {
 		return nil, err
 	}
 	return &Source{
-		Keys: []interface{}{k},
+		Keys: []any{k},
 	}, nil
 }
 
@@ -31,10 +31,10 @@ func testClient(path string) ([]*agent.Key, error) {
 		return nil, err
 	}
 	return keys, nil
-
 }
 
 func TestAgentServer(t *testing.T) {
+	t.Parallel()
 	src, err := testNewKeySource()
 	require.NoError(t, err)
 	ag, err := NewAgentServer(src)

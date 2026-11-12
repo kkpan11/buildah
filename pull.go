@@ -6,12 +6,12 @@ import (
 	"io"
 	"time"
 
-	"github.com/containers/buildah/define"
-	"github.com/containers/common/libimage"
-	"github.com/containers/common/pkg/config"
-	"github.com/containers/image/v5/types"
 	encconfig "github.com/containers/ocicrypt/config"
-	"github.com/containers/storage"
+	"go.podman.io/buildah/define"
+	"go.podman.io/common/libimage"
+	"go.podman.io/common/pkg/config"
+	"go.podman.io/image/v5/types"
+	"go.podman.io/storage"
 )
 
 // PullOptions can be used to alter how an image is copied in from somewhere.
@@ -33,6 +33,8 @@ type PullOptions struct {
 	// BlobDirectory is the name of a directory in which we'll attempt to
 	// store copies of layer blobs that we pull down, if any.  It should
 	// already exist.
+	//
+	// Not applicable if DestinationLookupReferenceFunc is set.
 	BlobDirectory string
 	// AllTags is a boolean value that determines if all tagged images
 	// will be downloaded from the repository. The default is false.
@@ -50,11 +52,23 @@ type PullOptions struct {
 	OciDecryptConfig *encconfig.DecryptConfig
 	// PullPolicy takes the value PullIfMissing, PullAlways, PullIfNewer, or PullNever.
 	PullPolicy define.PullPolicy
+	// SourceLookupReference provides a function to look up source
+	// references.
+	SourceLookupReferenceFunc libimage.LookupReferenceFunc
+	// DestinationLookupReference provides a function to look up destination
+	// references. Overrides BlobDirectory, if set.
+	DestinationLookupReferenceFunc libimage.LookupReferenceFunc
 }
 
 // Pull copies the contents of the image from somewhere else to local storage.  Returns the
 // ID of the local image or an error.
 func Pull(ctx context.Context, imageName string, options PullOptions) (imageID string, err error) {
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	default:
+	}
+
 	libimageOptions := &libimage.PullOptions{}
 	libimageOptions.SignaturePolicyPath = options.SignaturePolicyPath
 	libimageOptions.Writer = options.ReportWriter
@@ -62,7 +76,12 @@ func Pull(ctx context.Context, imageName string, options PullOptions) (imageID s
 	libimageOptions.OciDecryptConfig = options.OciDecryptConfig
 	libimageOptions.AllTags = options.AllTags
 	libimageOptions.RetryDelay = &options.RetryDelay
-	libimageOptions.DestinationLookupReferenceFunc = cacheLookupReferenceFunc(options.BlobDirectory, types.PreserveOriginal)
+	libimageOptions.SourceLookupReferenceFunc = options.SourceLookupReferenceFunc
+	if options.DestinationLookupReferenceFunc != nil {
+		libimageOptions.DestinationLookupReferenceFunc = options.DestinationLookupReferenceFunc
+	} else {
+		libimageOptions.DestinationLookupReferenceFunc = cacheLookupReferenceFunc(options.BlobDirectory, types.PreserveOriginal)
+	}
 
 	if options.MaxRetries > 0 {
 		retries := uint(options.MaxRetries)
@@ -74,20 +93,12 @@ func Pull(ctx context.Context, imageName string, options PullOptions) (imageID s
 		return "", err
 	}
 
-	// Note: It is important to do this before we pull any images/create containers.
-	// The default backend detection logic needs an empty store to correctly detect
-	// that we can use netavark, if the store was not empty it will use CNI to not break existing installs.
-	_, err = getNetworkInterface(options.Store, "", "")
-	if err != nil {
-		return "", err
-	}
-
 	runtime, err := libimage.RuntimeFromStore(options.Store, &libimage.RuntimeOptions{SystemContext: options.SystemContext})
 	if err != nil {
 		return "", err
 	}
 
-	pulledImages, err := runtime.Pull(context.Background(), imageName, pullPolicy, libimageOptions)
+	pulledImages, err := runtime.Pull(ctx, imageName, pullPolicy, libimageOptions)
 	if err != nil {
 		return "", err
 	}

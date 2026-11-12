@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -8,12 +9,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/containers/buildah"
-	"github.com/containers/buildah/pkg/cli"
-	"github.com/containers/buildah/pkg/parse"
-	"github.com/containers/common/pkg/auth"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+	"go.podman.io/buildah"
+	"go.podman.io/buildah/pkg/cli"
+	"go.podman.io/buildah/pkg/parse"
+	"go.podman.io/common/pkg/auth"
+	"go.podman.io/image/v5/types"
 )
 
 type fromReply struct {
@@ -36,7 +38,7 @@ type fromReply struct {
 
 var suffix string
 
-func init() {
+func fromInit() {
 	var (
 		fromDescription = "\n  Creates a new working container, either from scratch or using a specified\n  image as a starting point."
 		opts            fromReply
@@ -58,6 +60,7 @@ func init() {
 		Example: `buildah from --pull imagename
   buildah from docker-daemon:imagename:imagetag
   buildah from --name "myimagename" myregistry/myrepository/imagename:imagetag`,
+		GroupID: groupContainers,
 	}
 	fromCommand.SetUsageTemplate(UsageTemplate())
 
@@ -69,8 +72,13 @@ func init() {
 	flags.StringVar(&opts.creds, "creds", "", "use `[username[:password]]` for accessing the registry")
 	flags.StringVarP(&opts.format, "format", "f", defaultFormat(), "`format` of the image manifest and metadata")
 	flags.StringVar(&opts.name, "name", "", "`name` for the working container")
-	flags.StringVar(&opts.pull, "pull", "true", "pull images from the registry if newer or not present in store, if false, only pull images if not present, if always, pull images even if the named images are present in store, if never, only use images present in store if available")
-	flags.Lookup("pull").NoOptDefVal = "true" //allow `--pull ` to be set to `true` as expected.
+	flags.StringVar(&opts.pull, "pull", "missing", `pull images from the registry values:
+always: pull images even if the named images are present in store,
+missing: pull images if the named images are not present in store,
+never: only use images present in store if available,
+newer: only pull images when newer images exist on the registry than those in the store.`)
+
+	flags.Lookup("pull").NoOptDefVal = "always" // treat a --pull with no argument like --pull=always
 
 	flags.BoolVar(&opts.pullAlways, "pull-always", false, "pull the image even if the named image is present in store")
 	if err := flags.MarkHidden("pull-always"); err != nil {
@@ -104,7 +112,22 @@ func init() {
 	rootCmd.AddCommand(fromCommand)
 }
 
-func onBuild(builder *buildah.Builder, quiet bool) error {
+// parseBoolFlag parses a flag "--name" or "--name=<bool>"
+func parseBoolFlag(flag, name string) (bool, error) {
+	val, found := strings.CutPrefix(flag, name+"=")
+	if !found {
+		return true, nil
+	}
+	switch val {
+	case "true":
+		return true, nil
+	case "false":
+		return false, nil
+	}
+	return false, fmt.Errorf("invalid value for %s in onbuild command: %q (must be true or false)", name, val)
+}
+
+func onBuild(ctx context.Context, builder *buildah.Builder, quiet bool) error {
 	ctr := 0
 	for _, onBuildSpec := range builder.OnBuild() {
 		ctr = ctr + 1
@@ -115,15 +138,45 @@ func onBuild(builder *buildah.Builder, quiet bool) error {
 			fmt.Fprintf(os.Stderr, "STEP %d: %s\n", ctr, onBuildSpec)
 		}
 		switch command {
-		case "ADD":
-		case "COPY":
+		case "ADD", "COPY":
 			dest := ""
 			size := len(args)
 			if size > 1 {
 				dest = args[size-1]
 				args = args[:size-1]
 			}
-			if err := builder.Add(dest, command == "ADD", buildah.AddAndCopyOptions{}, args...); err != nil {
+
+			var options buildah.AddAndCopyOptions
+			var err error
+			for len(args) > 0 && strings.HasPrefix(args[0], "--") {
+				flag := args[0]
+				switch {
+				case strings.HasPrefix(flag, "--chown="):
+					options.Chown = strings.TrimPrefix(flag, "--chown=")
+				case strings.HasPrefix(flag, "--chmod="):
+					options.Chmod = strings.TrimPrefix(flag, "--chmod=")
+				case command == "ADD" && strings.HasPrefix(flag, "--checksum="):
+					options.Checksum = strings.TrimPrefix(flag, "--checksum=")
+				case flag == "--link" || strings.HasPrefix(flag, "--link="):
+					if options.Link, err = parseBoolFlag(flag, "--link"); err != nil {
+						return err
+					}
+				case command == "ADD" && (flag == "--keep-git-dir" || strings.HasPrefix(flag, "--keep-git-dir=")):
+					if options.KeepGitDir, err = parseBoolFlag(flag, "--keep-git-dir"); err != nil {
+						return err
+					}
+				case command == "ADD" && strings.HasPrefix(flag, "--unpack="):
+					var unpack bool
+					if unpack, err = parseBoolFlag(flag, "--unpack"); err != nil {
+						return err
+					}
+					options.Unpack = types.NewOptionalBool(unpack)
+				default:
+					return fmt.Errorf("unrecognized flag %q in onbuild command", flag)
+				}
+				args = args[1:]
+			}
+			if err := builder.AddContext(ctx, dest, command == "ADD", options, args...); err != nil {
 				return err
 			}
 		case "ANNOTATION":
@@ -164,7 +217,7 @@ func onBuild(builder *buildah.Builder, quiet bool) error {
 			if quiet {
 				stdout = io.Discard
 			}
-			if err := builder.Run(args, buildah.RunOptions{Stdout: stdout}); err != nil {
+			if err := builder.RunContext(ctx, args, buildah.RunOptions{Stdout: stdout}); err != nil {
 				return err
 			}
 		case "SHELL":
@@ -272,8 +325,6 @@ func fromCmd(c *cobra.Command, args []string, iopts fromReply) error {
 		Isolation:             isolation,
 		NamespaceOptions:      namespaceOptions,
 		ConfigureNetwork:      networkPolicy,
-		CNIPluginPath:         iopts.CNIPlugInPath,
-		CNIConfigDir:          iopts.CNIConfigDir,
 		IDMappingOptions:      idmappingOptions,
 		Capabilities:          capabilities,
 		CommonBuildOpts:       commonOpts,
@@ -301,13 +352,13 @@ func fromCmd(c *cobra.Command, args []string, iopts fromReply) error {
 		return err
 	}
 
-	if err := onBuild(builder, iopts.quiet); err != nil {
+	if err := onBuild(getContext(), builder, iopts.quiet); err != nil {
 		return err
 	}
 
 	if iopts.cidfile != "" {
 		filePath := iopts.cidfile
-		if err := os.WriteFile(filePath, []byte(builder.ContainerID), 0644); err != nil {
+		if err := os.WriteFile(filePath, []byte(builder.ContainerID), 0o644); err != nil {
 			return fmt.Errorf("failed to write container ID file %q: %w", filePath, err)
 		}
 	}

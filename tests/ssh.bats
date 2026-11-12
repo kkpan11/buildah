@@ -14,7 +14,9 @@ function teardown(){
 }
 
 @test "bud with ssh key" {
-  _prefetch alpine
+  # quay.io/hummingbird/git is only available on these arches:
+  skip_unless_arch amd64 arm64
+  _prefetch quay.io/hummingbird/git
 
   mytmpdir=${TEST_SCRATCH_DIR}/my-dir1
   mkdir -p ${mytmpdir}
@@ -26,12 +28,14 @@ function teardown(){
 
   run_buildah from sshimg
   run_buildah 1 run sshimg-working-container cat /run/buildkit/ssh_agent.0
-  expect_output --substring "cat: can't open '/run/buildkit/ssh_agent.0': No such file or directory"
+  expect_output --substring "cat: /run/buildkit/ssh_agent.0: No such file or directory"
   run_buildah rm -a
 }
 
 @test "bud with ssh key secret accessed on second RUN" {
- _prefetch alpine
+  # quay.io/hummingbird/git is only available on these arches:
+  skip_unless_arch amd64 arm64
+  _prefetch quay.io/hummingbird/git
 
   mytmpdir=${TEST_SCRATCH_DIR}/my-dir1
   mkdir -p ${mytmpdir}
@@ -43,7 +47,9 @@ function teardown(){
 }
 
 @test "bud with containerfile ssh options" {
-  _prefetch alpine
+  # quay.io/hummingbird/git is only available on these arches:
+  skip_unless_arch amd64 arm64
+  _prefetch quay.io/hummingbird/git
 
   mytmpdir=${TEST_SCRATCH_DIR}/my-dir1
   mkdir -p ${mytmpdir}
@@ -57,7 +63,9 @@ function teardown(){
 }
 
 @test "bud with ssh sock" {
-  _prefetch alpine
+  # quay.io/hummingbird/git is only available on these arches:
+  skip_unless_arch amd64 arm64
+  _prefetch quay.io/hummingbird/git
 
   mytmpdir=${TEST_SCRATCH_DIR}/my-dir1
   mkdir -p ${mytmpdir}
@@ -71,7 +79,7 @@ function teardown(){
 
   run_buildah from sshimg
   run_buildah 1 run sshimg-working-container cat /run/buildkit/ssh_agent.0
-  expect_output --substring "cat: can't open '/run/buildkit/ssh_agent.0': No such file or directory"
+  expect_output --substring "cat: /run/buildkit/ssh_agent.0: No such file or directory"
   run_buildah rm -a
 }
 

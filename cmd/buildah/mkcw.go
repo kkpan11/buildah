@@ -5,9 +5,9 @@ import (
 	"os"
 	"strings"
 
-	"github.com/containers/buildah"
-	"github.com/containers/buildah/pkg/parse"
 	"github.com/spf13/cobra"
+	"go.podman.io/buildah"
+	"go.podman.io/buildah/pkg/parse"
 )
 
 func mkcwCmd(c *cobra.Command, args []string, options buildah.CWConvertImageOptions) error {
@@ -37,7 +37,7 @@ func mkcwCmd(c *cobra.Command, args []string, options buildah.CWConvertImageOpti
 	return err
 }
 
-func init() {
+func mkcwInit() {
 	var teeType string
 	var addFile []string
 	var options buildah.CWConvertImageOptions
@@ -69,6 +69,7 @@ func init() {
 		},
 		Example: `buildah mkcw localhost/repository:typical localhost/repository:cw`,
 		Args:    cobra.ExactArgs(2),
+		GroupID: groupImages,
 	}
 	mkcwCommand.SetUsageTemplate(UsageTemplate())
 	rootCmd.AddCommand(mkcwCommand)

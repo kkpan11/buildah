@@ -3,6 +3,7 @@ package mkcw
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,9 +15,9 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/containers/buildah/internal/mkcw/types"
-	"github.com/containers/storage/pkg/fileutils"
 	"github.com/sirupsen/logrus"
+	types "go.podman.io/buildah/internal/mkcw/types"
+	"go.podman.io/storage/pkg/fileutils"
 )
 
 type (
@@ -34,12 +35,20 @@ func (m measurementError) Error() string {
 	return fmt.Sprintf("generating measurement for attestation: %v", m.err)
 }
 
+func (m measurementError) Unwrap() error {
+	return m.err
+}
+
 type attestationError struct {
 	err error
 }
 
 func (a attestationError) Error() string {
 	return fmt.Sprintf("registering workload: %v", a.err)
+}
+
+func (a attestationError) Unwrap() error {
+	return a.err
 }
 
 type httpError struct {
@@ -55,16 +64,22 @@ func (h httpError) Error() string {
 
 // SendRegistrationRequest registers a workload with the specified decryption
 // passphrase with the service whose location is part of the WorkloadConfig.
-func SendRegistrationRequest(workloadConfig WorkloadConfig, diskEncryptionPassphrase, firmwareLibrary string, ignoreAttestationErrors bool, logger *logrus.Logger) error {
+func SendRegistrationRequest(ctx context.Context, workloadConfig WorkloadConfig, diskEncryptionPassphrase, firmwareLibrary string, ignoreAttestationErrors bool, logger *logrus.Logger) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
 	if workloadConfig.AttestationURL == "" {
 		return errors.New("attestation URL not provided")
 	}
 
 	// Measure the execution environment.
-	measurement, err := GenerateMeasurement(workloadConfig, firmwareLibrary)
+	measurement, err := GenerateMeasurement(ctx, workloadConfig, firmwareLibrary)
 	if err != nil {
 		if !ignoreAttestationErrors {
-			return &measurementError{err}
+			return measurementError{err}
 		}
 		logger.Warnf("generating measurement for attestation: %v", err)
 	}
@@ -130,14 +145,16 @@ func SendRegistrationRequest(workloadConfig WorkloadConfig, diskEncryptionPassph
 		return err
 	}
 	parsedURL.Path = path.Join(parsedURL.Path, "/kbs/v0/register_workload")
-	if err != nil {
-		return err
-	}
 	url := parsedURL.String()
 	requestContentType := "application/json"
 	requestBody := bytes.NewReader(registrationRequestBytes)
 	defer http.DefaultClient.CloseIdleConnections()
-	resp, err := http.Post(url, requestContentType, requestBody)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, requestBody)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", requestContentType)
+	resp, err := http.DefaultClient.Do(req)
 	if resp != nil {
 		if resp.Body != nil {
 			resp.Body.Close()
@@ -145,16 +162,16 @@ func SendRegistrationRequest(workloadConfig WorkloadConfig, diskEncryptionPassph
 		switch resp.StatusCode {
 		default:
 			if !ignoreAttestationErrors {
-				return &attestationError{&httpError{resp.StatusCode}}
+				return attestationError{httpError{resp.StatusCode}}
 			}
-			logger.Warn(attestationError{&httpError{resp.StatusCode}}.Error())
+			logger.Warn(attestationError{httpError{resp.StatusCode}}.Error())
 		case http.StatusOK, http.StatusAccepted:
 			// great!
 		}
 	}
 	if err != nil {
 		if !ignoreAttestationErrors {
-			return &attestationError{err}
+			return attestationError{err}
 		}
 		logger.Warn(attestationError{err}.Error())
 	}
@@ -169,7 +186,13 @@ func SendRegistrationRequest(workloadConfig WorkloadConfig, diskEncryptionPassph
 // of directories.
 // If firmwareLibrary is empty, both the filename and the directory it is in
 // will be taken from a hard-coded set of candidates.
-func GenerateMeasurement(workloadConfig WorkloadConfig, firmwareLibrary string) (string, error) {
+func GenerateMeasurement(ctx context.Context, workloadConfig WorkloadConfig, firmwareLibrary string) (string, error) {
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	default:
+	}
+
 	cpuString := fmt.Sprintf("%d", workloadConfig.CPUs)
 	memoryString := fmt.Sprintf("%d", workloadConfig.Memory)
 	var prefix string
@@ -195,21 +218,20 @@ func GenerateMeasurement(workloadConfig WorkloadConfig, firmwareLibrary string) 
 	if llp, ok := os.LookupEnv("LD_LIBRARY_PATH"); ok {
 		sharedLibraryDirs = append(sharedLibraryDirs, strings.Split(llp, ":")...)
 	}
-	libkrunfwNames := []string{
-		"libkrunfw-sev.so.4",
-		"libkrunfw-sev.so.3",
-		"libkrunfw-sev.so",
-	}
 	var pathsToCheck []string
 	if firmwareLibrary == "" {
 		for _, sharedLibraryDir := range sharedLibraryDirs {
 			if sharedLibraryDir == "" {
 				continue
 			}
-			for _, libkrunfw := range libkrunfwNames {
-				candidate := filepath.Join(sharedLibraryDir, libkrunfw)
-				pathsToCheck = append(pathsToCheck, candidate)
+			unversionedFirmware := filepath.Join(sharedLibraryDir, "libkrunfw-sev.so")
+			pathsToCheck = append(pathsToCheck, unversionedFirmware)
+			pattern := filepath.Join(sharedLibraryDir, "libkrunfw-sev.so.*")
+			versionedFirmwares, err := filepath.Glob(pattern)
+			if err != nil {
+				return "", fmt.Errorf("krunfw_measurement: %s: %w", pattern, err)
 			}
+			pathsToCheck = append(pathsToCheck, versionedFirmwares...)
 		}
 	} else {
 		if filepath.IsAbs(firmwareLibrary) {
@@ -228,7 +250,7 @@ func GenerateMeasurement(workloadConfig WorkloadConfig, firmwareLibrary string) 
 		if err := fileutils.Lexists(candidate); err == nil {
 			var stdout, stderr bytes.Buffer
 			logrus.Debugf("krunfw_measurement -c %s -m %s %s", cpuString, memoryString, candidate)
-			cmd := exec.Command("krunfw_measurement", "-c", cpuString, "-m", memoryString, candidate)
+			cmd := exec.CommandContext(ctx, "krunfw_measurement", "-c", cpuString, "-m", memoryString, candidate)
 			cmd.Stdout = &stdout
 			cmd.Stderr = &stderr
 			if err := cmd.Run(); err != nil {
@@ -240,8 +262,8 @@ func GenerateMeasurement(workloadConfig WorkloadConfig, firmwareLibrary string) 
 			scanner := bufio.NewScanner(&stdout)
 			for scanner.Scan() {
 				line := scanner.Text()
-				if strings.HasPrefix(line, prefix+":") {
-					return strings.TrimSpace(strings.TrimPrefix(line, prefix+":")), nil
+				if after, ok := strings.CutPrefix(line, prefix+":"); ok {
+					return strings.TrimSpace(after), nil
 				}
 			}
 			return "", fmt.Errorf("generating measurement: no line starting with %q found in output from krunfw_measurement", prefix+":")

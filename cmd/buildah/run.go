@@ -4,41 +4,47 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
-	"github.com/containers/buildah"
-	"github.com/containers/buildah/internal/volumes"
-	buildahcli "github.com/containers/buildah/pkg/cli"
-	"github.com/containers/buildah/pkg/parse"
-	"github.com/containers/buildah/util"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+	"go.podman.io/buildah"
+	"go.podman.io/buildah/internal/tmpdir"
+	"go.podman.io/buildah/internal/volumes"
+	buildahcli "go.podman.io/buildah/pkg/cli"
+	"go.podman.io/buildah/pkg/overlay"
+	"go.podman.io/buildah/pkg/parse"
+	"go.podman.io/buildah/util"
+	"go.podman.io/storage/pkg/mount"
 )
 
 type runInputOptions struct {
-	addHistory   bool
-	capAdd       []string
-	capDrop      []string
-	cdiConfigDir string
-	contextDir   string
-	devices      []string
-	env          []string
-	hostname     string
-	isolation    string
-	mounts       []string
-	runtime      string
-	runtimeFlag  []string
-	noHostname   bool
-	noHosts      bool
-	noPivot      bool
-	terminal     bool
-	volumes      []string
-	workingDir   string
+	addHistory     bool
+	capAdd         []string
+	capDrop        []string
+	cdiConfigDir   string
+	contextDir     string
+	devices        []string
+	env            []string
+	hostname       string
+	isolation      string
+	mounts         []string
+	runtime        string
+	runtimeFlag    []string
+	noHostname     bool
+	noHosts        bool
+	noPivot        bool
+	terminal       bool
+	umask          string
+	validExitCodes []int32
+	volumes        []string
+	workingDir     string
 	*buildahcli.NameSpaceResults
 }
 
-func init() {
+func runInit() {
 	var (
 		runDescription = "\n  Runs a specified command using the container's root filesystem as a root\n  filesystem, using configuration settings inherited from the container's\n  image or as specified using previous calls to the config command."
 		opts           runInputOptions
@@ -48,16 +54,16 @@ func init() {
 
 	runCommand := &cobra.Command{
 		Use:   "run",
-		Short: "Run a command inside of the container",
+		Short: "Run a command inside of a working container",
 		Long:  runDescription,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			opts.NameSpaceResults = &namespaceResults
 			return runCmd(cmd, args, opts)
-
 		},
 		Example: `buildah run containerID -- ps -auxw
   buildah run --terminal containerID /bin/bash
   buildah run --volume /path/on/host:/path/in/container:ro,z containerID /bin/sh`,
+		GroupID: groupContainers,
 	}
 	runCommand.SetUsageTemplate(UsageTemplate())
 
@@ -67,7 +73,9 @@ func init() {
 	flags.StringSliceVar(&opts.capAdd, "cap-add", []string{}, "add the specified capability (default [])")
 	flags.StringSliceVar(&opts.capDrop, "cap-drop", []string{}, "drop the specified capability (default [])")
 	flags.StringVar(&opts.cdiConfigDir, "cdi-config-dir", "", "`directory` of CDI configuration files")
-	_ = flags.MarkHidden("cdi-config-dir")
+	if err := flags.MarkHidden("cdi-config-dir"); err != nil {
+		panic(fmt.Sprintf("error marking cdi-config-dir as hidden: %v", err))
+	}
 	flags.StringVar(&opts.contextDir, "contextdir", "", "context directory path")
 	flags.StringArrayVar(&opts.devices, "device", []string{}, "additional devices to provide")
 	flags.StringArrayVarP(&opts.env, "env", "e", []string{}, "add environment variable to be set temporarily when running command (default [])")
@@ -80,6 +88,8 @@ func init() {
 	flags.BoolVar(&opts.noHosts, "no-hosts", false, "do not override the /etc/hosts file within the container")
 	flags.BoolVar(&opts.noPivot, "no-pivot", false, "do not use pivot root to jail process inside rootfs")
 	flags.BoolVarP(&opts.terminal, "terminal", "t", false, "allocate a pseudo-TTY in the container")
+	flags.StringVar(&opts.umask, "umask", "", "set umask for command")
+	flags.Int32SliceVar(&opts.validExitCodes, "valid-exit-codes", []int32{0}, "list of exit codes to consider successful (default [0])")
 	flags.StringArrayVarP(&opts.volumes, "volume", "v", []string{}, "bind mount a host location into the container while running the command")
 	flags.StringArrayVar(&opts.mounts, "mount", []string{}, "attach a filesystem mount to the container (default [])")
 	flags.StringVar(&opts.workingDir, "workingdir", "", "temporarily set working directory for command (default to container's workingdir)")
@@ -108,6 +118,16 @@ func runCmd(c *cobra.Command, args []string, iopts runInputOptions) error {
 		return errors.New("command must be specified")
 	}
 
+	tmpDir, err := os.MkdirTemp(tmpdir.GetTempDir(), "buildahvolume")
+	if err != nil {
+		return fmt.Errorf("creating temporary directory: %w", err)
+	}
+	defer func() {
+		if err := os.Remove(tmpDir); err != nil {
+			logrus.Debugf("removing should-be-empty temporary directory %q: %v", tmpDir, err)
+		}
+	}()
+
 	store, err := getStore(c)
 	if err != nil {
 		return err
@@ -116,6 +136,14 @@ func runCmd(c *cobra.Command, args []string, iopts runInputOptions) error {
 	builder, err := openBuilder(getContext(), store, name)
 	if err != nil {
 		return fmt.Errorf("reading build container %q: %w", name, err)
+	}
+
+	cdir, err := store.ContainerDirectory(builder.ContainerID)
+	if err != nil {
+		return fmt.Errorf("finding build container state directory for %q: %w", name, err)
+	}
+	if err := flagServingSFTP(cdir); err != nil {
+		return fmt.Errorf(`unable to use "buildah run" while container appears to be busy: %v`, err)
 	}
 
 	isolation, err := parse.IsolationOption(c.Flag("isolation").Value.String())
@@ -144,6 +172,19 @@ func runCmd(c *cobra.Command, args []string, iopts runInputOptions) error {
 		}
 	}
 
+	var umask *uint32
+	if c.Flag("umask").Changed {
+		parsed, err := strconv.ParseUint(iopts.umask, 8, 32)
+		if err != nil {
+			return fmt.Errorf("parsing umask value %q: %w", iopts.umask, err)
+		}
+		truncated := uint32(parsed & 0o777)
+		if uint64(truncated) != parsed {
+			return fmt.Errorf("umask value %#o is out of range", parsed)
+		}
+		umask = &truncated
+	}
+
 	options := buildah.RunOptions{
 		Hostname:         iopts.hostname,
 		Runtime:          iopts.runtime,
@@ -156,13 +197,13 @@ func runCmd(c *cobra.Command, args []string, iopts runInputOptions) error {
 		NamespaceOptions: namespaceOptions,
 		ConfigureNetwork: networkPolicy,
 		ContextDir:       iopts.contextDir,
-		CNIPluginPath:    iopts.CNIPlugInPath,
-		CNIConfigDir:     iopts.CNIConfigDir,
 		AddCapabilities:  iopts.capAdd,
 		DropCapabilities: iopts.capDrop,
 		WorkingDir:       iopts.workingDir,
 		DeviceSpecs:      iopts.devices,
 		CDIConfigDir:     iopts.cdiConfigDir,
+		ValidExitCodes:   iopts.validExitCodes,
+		Umask:            umask,
 	}
 
 	if c.Flag("terminal").Changed {
@@ -179,17 +220,33 @@ func runCmd(c *cobra.Command, args []string, iopts runInputOptions) error {
 	if err != nil {
 		return fmt.Errorf("building system context: %w", err)
 	}
-	mounts, mountedImages, targetLocks, err := volumes.GetVolumes(systemContext, store, iopts.volumes, iopts.mounts, iopts.contextDir, iopts.workingDir)
+	mounts, mountedImages, intermediateMounts, _, targetLocks, err := volumes.GetVolumes(getContext(), systemContext, store, builder.MountLabel, iopts.volumes, iopts.mounts, iopts.contextDir, builder.IDMappingOptions, iopts.workingDir, tmpDir)
 	if err != nil {
 		return err
 	}
-	defer volumes.UnlockLockArray(targetLocks)
+	defer func() {
+		if err := overlay.CleanupContent(tmpDir); err != nil {
+			logrus.Debugf("unmounting overlay mounts under %q: %v", tmpDir, err)
+		}
+		for _, intermediateMount := range intermediateMounts {
+			if err := mount.Unmount(intermediateMount); err != nil {
+				logrus.Debugf("unmounting mount %q: %v", intermediateMount, err)
+			}
+			if err := os.Remove(intermediateMount); err != nil {
+				logrus.Debugf("removing should-be-empty mount directory %q: %v", intermediateMount, err)
+			}
+		}
+		for _, mountedImage := range mountedImages {
+			if _, err := store.UnmountImage(mountedImage, false); err != nil {
+				logrus.Debugf("unmounting image %q: %v", mountedImage, err)
+			}
+		}
+		volumes.UnlockLockArray(targetLocks)
+	}()
 	options.Mounts = mounts
-	// Run() will automatically clean them up.
-	options.ExternalImageMounts = mountedImages
 	options.CgroupManager = globalFlagResults.CgroupManager
 
-	runerr := builder.Run(args, options)
+	runerr := builder.RunContext(getContext(), args, options)
 
 	if runerr != nil {
 		logrus.Debugf("error running %v in container %q: %v", args, builder.Container, runerr)

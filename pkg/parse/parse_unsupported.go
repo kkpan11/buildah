@@ -1,12 +1,11 @@
 //go:build !linux && !darwin
-// +build !linux,!darwin
 
-package parse
+package parse //nolint:revive,nolintlint
 
 import (
 	"errors"
 
-	"github.com/containers/buildah/define"
+	"go.podman.io/buildah/define"
 )
 
 func getDefaultProcessLimits() []string {

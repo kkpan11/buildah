@@ -4,15 +4,20 @@ import (
 	"archive/tar"
 	"bufio"
 	"bytes"
+	"compress/gzip"
+	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -21,11 +26,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/containers/storage/pkg/idtools"
-	"github.com/containers/storage/pkg/reexec"
+	securejoin "github.com/cyphar/filepath-securejoin"
 	"github.com/sirupsen/logrus"
+	lslog "github.com/sirupsen/logrus/hooks/slog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	mode "github.com/tonistiigi/dchapes-mode"
+	"go.podman.io/image/v5/types"
+	"go.podman.io/storage/pkg/idtools"
+	"go.podman.io/storage/pkg/reexec"
 )
 
 func TestMain(m *testing.M) {
@@ -33,8 +42,11 @@ func TestMain(m *testing.M) {
 		return
 	}
 	flag.Parse()
+	logrus.SetOutput(io.Discard)
+	logrus.AddHook(lslog.NewHook(slog.Default(), nil))
 	if testing.Verbose() {
 		logrus.SetLevel(logrus.DebugLevel)
+		slog.SetLogLoggerLevel(slog.LevelDebug)
 	}
 	os.Exit(m.Run())
 }
@@ -48,7 +60,7 @@ func makeContents(length int64) io.ReadCloser {
 		for count < length {
 			if _, err := buffered.Write([]byte{"0123456789abcdef"[count%16]}); err != nil {
 				buffered.Flush()
-				pipeWriter.CloseWithError(err) // nolint:errcheck
+				pipeWriter.CloseWithError(err)
 				return
 			}
 			count++
@@ -108,10 +120,12 @@ func makeArchive(headers []tar.Header, contents map[string][]byte) io.ReadCloser
 				}
 			}
 		}
-		tw.Close()
+		if err == nil {
+			err = tw.Close()
+		}
 		buffered.Flush()
 		if err != nil {
-			pipeWriter.CloseWithError(err) // nolint:errcheck
+			pipeWriter.CloseWithError(err)
 		} else {
 			pipeWriter.Close()
 		}
@@ -126,12 +140,12 @@ func makeContextFromArchive(t *testing.T, archive io.ReadCloser, subdir string) 
 	tmp := t.TempDir()
 	uidMap := []idtools.IDMap{{HostID: os.Getuid(), ContainerID: 0, Size: 1}}
 	gidMap := []idtools.IDMap{{HostID: os.Getgid(), ContainerID: 0, Size: 1}}
-	err := Put(tmp, path.Join(tmp, subdir), PutOptions{UIDMap: uidMap, GIDMap: gidMap}, archive)
+	err := PutContext(t.Context(), tmp, path.Join(tmp, subdir), PutOptions{UIDMap: uidMap, GIDMap: gidMap}, archive)
 	archive.Close()
 	if err != nil {
 		return "", err
 	}
-	return tmp, err
+	return tmp, nil
 }
 
 // enumerateFiles walks a directory, returning the items it contains as a slice
@@ -176,14 +190,15 @@ type enumeratedFile struct {
 }
 
 var (
-	testDate = time.Unix(1485449953, 0)
+	testDate       = time.Unix(1485449953, 0)
+	secondTestDate = time.Unix(1485449953*2, 0)
 
 	uid = os.Getuid()
 
 	testArchiveSlice = makeArchiveSlice([]tar.Header{
-		{Name: "item-0", Typeflag: tar.TypeReg, Size: 123, Mode: 0600, ModTime: testDate},
-		{Name: "item-1", Typeflag: tar.TypeReg, Size: 456, Mode: 0600, ModTime: testDate},
-		{Name: "item-2", Typeflag: tar.TypeReg, Size: 789, Mode: 0600, ModTime: testDate},
+		{Name: "item-0", Typeflag: tar.TypeReg, Size: 123, Mode: 0o600, ModTime: testDate},
+		{Name: "item-1", Typeflag: tar.TypeReg, Size: 456, Mode: 0o600, ModTime: testDate},
+		{Name: "item-2", Typeflag: tar.TypeReg, Size: 789, Mode: 0o600, ModTime: testDate},
 	})
 
 	testArchives = []struct {
@@ -204,38 +219,38 @@ var (
 			name:     "regular",
 			rootOnly: false,
 			headers: []tar.Header{
-				{Name: "file-0", Typeflag: tar.TypeReg, Size: 123456789, Mode: 0600, ModTime: testDate},
-				{Name: "file-a", Typeflag: tar.TypeReg, Size: 23, Mode: 0600, ModTime: testDate},
-				{Name: "file-b", Typeflag: tar.TypeReg, Size: 23, Mode: 0600, ModTime: testDate},
-				{Name: "file-c", Typeflag: tar.TypeLink, Linkname: "file-a", Mode: 0600, ModTime: testDate},
-				{Name: "file-u", Typeflag: tar.TypeReg, Size: 23, Mode: cISUID | 0755, ModTime: testDate},
-				{Name: "file-g", Typeflag: tar.TypeReg, Size: 23, Mode: cISGID | 0755, ModTime: testDate},
-				{Name: "file-t", Typeflag: tar.TypeReg, Size: 23, Mode: cISVTX | 0755, ModTime: testDate},
-				{Name: "link-0", Typeflag: tar.TypeSymlink, Linkname: "../file-0", Size: 123456789, Mode: 0777, ModTime: testDate},
-				{Name: "link-a", Typeflag: tar.TypeSymlink, Linkname: "file-a", Size: 23, Mode: 0777, ModTime: testDate},
-				{Name: "link-b", Typeflag: tar.TypeSymlink, Linkname: "../file-a", Size: 23, Mode: 0777, ModTime: testDate},
-				{Name: "hlink-0", Typeflag: tar.TypeLink, Linkname: "file-0", Size: 123456789, Mode: 0600, ModTime: testDate},
-				{Name: "hlink-a", Typeflag: tar.TypeLink, Linkname: "/file-a", Size: 23, Mode: 0600, ModTime: testDate},
-				{Name: "hlink-b", Typeflag: tar.TypeLink, Linkname: "../file-b", Size: 23, Mode: 0600, ModTime: testDate},
-				{Name: "subdir-a", Typeflag: tar.TypeDir, Mode: 0700, ModTime: testDate},
-				{Name: "subdir-a/file-n", Typeflag: tar.TypeReg, Size: 108, Mode: 0660, ModTime: testDate},
-				{Name: "subdir-a/file-o", Typeflag: tar.TypeReg, Size: 34, Mode: 0660, ModTime: testDate},
-				{Name: "subdir-a/file-a", Typeflag: tar.TypeSymlink, Linkname: "../file-a", Size: 23, Mode: 0777, ModTime: testDate},
-				{Name: "subdir-a/file-b", Typeflag: tar.TypeSymlink, Linkname: "../../file-b", Size: 23, Mode: 0777, ModTime: testDate},
-				{Name: "subdir-a/file-c", Typeflag: tar.TypeSymlink, Linkname: "/file-c", Size: 23, Mode: 0777, ModTime: testDate},
-				{Name: "subdir-b", Typeflag: tar.TypeDir, Mode: 0700, ModTime: testDate},
-				{Name: "subdir-b/file-n", Typeflag: tar.TypeReg, Size: 216, Mode: 0660, ModTime: testDate},
-				{Name: "subdir-b/file-o", Typeflag: tar.TypeReg, Size: 45, Mode: 0660, ModTime: testDate},
-				{Name: "subdir-c", Typeflag: tar.TypeDir, Mode: 0700, ModTime: testDate},
-				{Name: "subdir-c/file-n", Typeflag: tar.TypeReg, Size: 432, Mode: 0666, ModTime: testDate},
-				{Name: "subdir-c/file-o", Typeflag: tar.TypeReg, Size: 56, Mode: 0666, ModTime: testDate},
-				{Name: "subdir-d", Typeflag: tar.TypeDir, Mode: 0700, ModTime: testDate},
-				{Name: "subdir-d/hlink-0", Typeflag: tar.TypeLink, Linkname: "../file-0", Size: 123456789, Mode: 0600, ModTime: testDate},
-				{Name: "subdir-d/hlink-a", Typeflag: tar.TypeLink, Linkname: "/file-a", Size: 23, Mode: 0600, ModTime: testDate},
-				{Name: "subdir-d/hlink-b", Typeflag: tar.TypeLink, Linkname: "../../file-b", Size: 23, Mode: 0600, ModTime: testDate},
-				{Name: "archive-a", Typeflag: tar.TypeReg, Size: 0, Mode: 0600, ModTime: testDate},
-				{Name: "subdir-e", Typeflag: tar.TypeDir, Mode: 0500, ModTime: testDate},
-				{Name: "subdir-e/file-p", Typeflag: tar.TypeReg, Size: 890, Mode: 0600, ModTime: testDate},
+				{Name: "file-0", Typeflag: tar.TypeReg, Size: 65537, Mode: 0o600, ModTime: testDate},
+				{Name: "file-a", Typeflag: tar.TypeReg, Size: 23, Mode: 0o600, ModTime: testDate},
+				{Name: "file-b", Typeflag: tar.TypeReg, Size: 23, Mode: 0o600, ModTime: testDate},
+				{Name: "file-c", Typeflag: tar.TypeLink, Linkname: "file-a", Mode: 0o600, ModTime: testDate},
+				{Name: "file-u", Typeflag: tar.TypeReg, Size: 23, Mode: cISUID | 0o755, ModTime: testDate},
+				{Name: "file-g", Typeflag: tar.TypeReg, Size: 23, Mode: cISGID | 0o755, ModTime: testDate},
+				{Name: "file-t", Typeflag: tar.TypeReg, Size: 23, Mode: cISVTX | 0o755, ModTime: testDate},
+				{Name: "link-0", Typeflag: tar.TypeSymlink, Linkname: "../file-0", Size: 65537, Mode: 0o777, ModTime: testDate},
+				{Name: "link-a", Typeflag: tar.TypeSymlink, Linkname: "file-a", Size: 23, Mode: 0o777, ModTime: testDate},
+				{Name: "link-b", Typeflag: tar.TypeSymlink, Linkname: "../file-a", Size: 23, Mode: 0o777, ModTime: testDate},
+				{Name: "hlink-0", Typeflag: tar.TypeLink, Linkname: "file-0", Size: 65537, Mode: 0o600, ModTime: testDate},
+				{Name: "hlink-a", Typeflag: tar.TypeLink, Linkname: "/file-a", Size: 23, Mode: 0o600, ModTime: testDate},
+				{Name: "hlink-b", Typeflag: tar.TypeLink, Linkname: "../file-b", Size: 23, Mode: 0o600, ModTime: testDate},
+				{Name: "subdir-a", Typeflag: tar.TypeDir, Mode: 0o700, ModTime: testDate},
+				{Name: "subdir-a/file-n", Typeflag: tar.TypeReg, Size: 108, Mode: 0o660, ModTime: testDate},
+				{Name: "subdir-a/file-o", Typeflag: tar.TypeReg, Size: 34, Mode: 0o660, ModTime: testDate},
+				{Name: "subdir-a/file-a", Typeflag: tar.TypeSymlink, Linkname: "../file-a", Size: 23, Mode: 0o777, ModTime: testDate},
+				{Name: "subdir-a/file-b", Typeflag: tar.TypeSymlink, Linkname: "../../file-b", Size: 23, Mode: 0o777, ModTime: testDate},
+				{Name: "subdir-a/file-c", Typeflag: tar.TypeSymlink, Linkname: "/file-c", Size: 23, Mode: 0o777, ModTime: testDate},
+				{Name: "subdir-b", Typeflag: tar.TypeDir, Mode: 0o700, ModTime: testDate},
+				{Name: "subdir-b/file-n", Typeflag: tar.TypeReg, Size: 216, Mode: 0o660, ModTime: testDate},
+				{Name: "subdir-b/file-o", Typeflag: tar.TypeReg, Size: 45, Mode: 0o660, ModTime: testDate},
+				{Name: "subdir-c", Typeflag: tar.TypeDir, Mode: 0o700, ModTime: testDate},
+				{Name: "subdir-c/file-n", Typeflag: tar.TypeReg, Size: 432, Mode: 0o666, ModTime: testDate},
+				{Name: "subdir-c/file-o", Typeflag: tar.TypeReg, Size: 56, Mode: 0o666, ModTime: testDate},
+				{Name: "subdir-d", Typeflag: tar.TypeDir, Mode: 0o700, ModTime: testDate},
+				{Name: "subdir-d/hlink-0", Typeflag: tar.TypeLink, Linkname: "../file-0", Size: 65537, Mode: 0o600, ModTime: testDate},
+				{Name: "subdir-d/hlink-a", Typeflag: tar.TypeLink, Linkname: "/file-a", Size: 23, Mode: 0o600, ModTime: testDate},
+				{Name: "subdir-d/hlink-b", Typeflag: tar.TypeLink, Linkname: "../../file-b", Size: 23, Mode: 0o600, ModTime: testDate},
+				{Name: "archive-a", Typeflag: tar.TypeReg, Size: 0, Mode: 0o600, ModTime: testDate},
+				{Name: "subdir-e", Typeflag: tar.TypeDir, Mode: 0o500, ModTime: testDate},
+				{Name: "subdir-e/file-p", Typeflag: tar.TypeReg, Size: 890, Mode: 0o600, ModTime: testDate},
 			},
 			contents: map[string][]byte{
 				"archive-a": testArchiveSlice,
@@ -412,21 +427,31 @@ var (
 			name:     "devices",
 			rootOnly: true,
 			headers: []tar.Header{
-				{Name: "char-dev", Typeflag: tar.TypeChar, Devmajor: 0, Devminor: 0, Mode: 0600, ModTime: testDate},
-				{Name: "blk-dev", Typeflag: tar.TypeBlock, Devmajor: 0, Devminor: 0, Mode: 0600, ModTime: testDate},
+				{Name: "char-dev", Typeflag: tar.TypeChar, Devmajor: 0, Devminor: 0, Mode: 0o600, ModTime: testDate},
+				{Name: "blk-dev", Typeflag: tar.TypeBlock, Devmajor: 0, Devminor: 0, Mode: 0o600, ModTime: testDate},
 			},
 		},
 	}
 )
 
-func TestPutNoChroot(t *testing.T) {
+func TestPutNoChrootNoCancel(t *testing.T) {
 	couldChroot := canChroot
 	canChroot = false
-	testPut(t)
+	testPut(t.Context(), t, nil)
 	canChroot = couldChroot
 }
 
-func testPut(t *testing.T) {
+func TestPutNoChrootCancel(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 1*time.Nanosecond)
+	defer cancel()
+	time.Sleep(1 * time.Millisecond)
+	couldChroot := canChroot
+	canChroot = false
+	testPut(ctx, t, context.DeadlineExceeded)
+	canChroot = couldChroot
+}
+
+func testPut(ctx context.Context, t *testing.T, expectedError error) {
 	uidMap := []idtools.IDMap{{HostID: os.Getuid(), ContainerID: 0, Size: 1}}
 	gidMap := []idtools.IDMap{{HostID: os.Getgid(), ContainerID: 0, Size: 1}}
 
@@ -487,7 +512,7 @@ func testPut(t *testing.T) {
 				if !reflect.DeepEqual(expected, fileList) && reflect.DeepEqual(moddedEnumeratedFiles(expected), moddedEnumeratedFiles(fileList)) {
 					logrus.Warn("chmod() lost some bits and possibly timestamps on symlinks, otherwise we match the source archive")
 				} else {
-					require.Equal(t, expected, fileList, "list of files in context directory for archive %q under topdir %q should match the archived used to populate it", testArchives[i].name, topdir)
+					require.Equalf(t, expected, fileList, "list of files in context directory for archive %q under topdir %q should match the archived used to populate it", testArchives[i].name, topdir)
 				}
 			})
 		}
@@ -501,11 +526,15 @@ func testPut(t *testing.T) {
 				tmp := t.TempDir()
 
 				archive := makeArchive(testArchives[i].headers, testArchives[i].contents)
-				err := Put(tmp, tmp, PutOptions{UIDMap: uidMap, GIDMap: gidMap, Rename: renames.renames}, archive)
+				err := PutContext(ctx, tmp, tmp, PutOptions{UIDMap: uidMap, GIDMap: gidMap, Rename: renames.renames}, archive)
+				if expectedError != nil {
+					require.ErrorContains(t, err, expectedError.Error())
+					return
+				}
 				require.NoErrorf(t, err, "error extracting archive %q to directory %q", testArchives[i].name, tmp)
 
 				var found []string
-				err = filepath.WalkDir(tmp, func(path string, d fs.DirEntry, err error) error {
+				err = filepath.WalkDir(tmp, func(path string, _ fs.DirEntry, err error) error {
 					if err != nil {
 						return err
 					}
@@ -534,16 +563,20 @@ func testPut(t *testing.T) {
 		for _, typeFlag := range []byte{tar.TypeReg, tar.TypeLink, tar.TypeSymlink, tar.TypeChar, tar.TypeBlock, tar.TypeFifo} {
 			t.Run(fmt.Sprintf("overwrite (dir)=%v,type=%c", overwrite, typeFlag), func(t *testing.T) {
 				archive := makeArchiveSlice([]tar.Header{
-					{Name: "target", Typeflag: tar.TypeSymlink, Mode: 0755, Linkname: "target", ModTime: testDate},
-					{Name: "target", Typeflag: tar.TypeDir, Mode: 0755, ModTime: testDate},
-					{Name: "target", Typeflag: tar.TypeSymlink, Mode: 0755, Linkname: "target", ModTime: testDate},
-					{Name: "target", Typeflag: tar.TypeReg, Size: 123, Mode: 0755, ModTime: testDate},
-					{Name: "test", Typeflag: tar.TypeDir, Size: 0, Mode: 0755, ModTime: testDate},
-					{Name: "test/content", Typeflag: tar.TypeReg, Size: 0, Mode: 0755, ModTime: testDate},
-					{Name: "test", Typeflag: typeFlag, Size: 0, Mode: 0755, Linkname: "target", ModTime: testDate},
+					{Name: "target", Typeflag: tar.TypeSymlink, Mode: 0o755, Linkname: "target", ModTime: testDate},
+					{Name: "target", Typeflag: tar.TypeDir, Mode: 0o755, ModTime: testDate},
+					{Name: "target", Typeflag: tar.TypeSymlink, Mode: 0o755, Linkname: "target", ModTime: testDate},
+					{Name: "target", Typeflag: tar.TypeReg, Size: 123, Mode: 0o755, ModTime: testDate},
+					{Name: "test", Typeflag: tar.TypeDir, Size: 0, Mode: 0o755, ModTime: testDate},
+					{Name: "test/content", Typeflag: tar.TypeReg, Size: 0, Mode: 0o755, ModTime: testDate},
+					{Name: "test", Typeflag: typeFlag, Size: 0, Mode: 0o755, Linkname: "target", ModTime: testDate},
 				})
 				tmp := t.TempDir()
-				err := Put(tmp, tmp, PutOptions{UIDMap: uidMap, GIDMap: gidMap, NoOverwriteDirNonDir: !overwrite}, bytes.NewReader(archive))
+				err := PutContext(ctx, tmp, tmp, PutOptions{UIDMap: uidMap, GIDMap: gidMap, NoOverwriteDirNonDir: !overwrite}, bytes.NewReader(archive))
+				if expectedError != nil {
+					require.ErrorContains(t, err, expectedError.Error())
+					return
+				}
 				if overwrite {
 					if !errors.Is(err, syscall.EPERM) {
 						assert.Nilf(t, err, "expected to overwrite directory with type %c: %v", typeFlag, err)
@@ -560,16 +593,20 @@ func testPut(t *testing.T) {
 		for _, typeFlag := range []byte{tar.TypeReg, tar.TypeLink, tar.TypeSymlink, tar.TypeChar, tar.TypeBlock, tar.TypeFifo} {
 			t.Run(fmt.Sprintf("overwrite (non-dir)=%v,type=%c", overwrite, typeFlag), func(t *testing.T) {
 				archive := makeArchiveSlice([]tar.Header{
-					{Name: "target", Typeflag: tar.TypeSymlink, Mode: 0755, Linkname: "target", ModTime: testDate},
-					{Name: "target", Typeflag: tar.TypeReg, Mode: 0755, ModTime: testDate},
-					{Name: "target", Typeflag: tar.TypeSymlink, Mode: 0755, Linkname: "target", ModTime: testDate},
-					{Name: "target", Typeflag: tar.TypeReg, Size: 123, Mode: 0755, ModTime: testDate},
-					{Name: "test", Typeflag: typeFlag, Size: 0, Mode: 0755, Linkname: "target", ModTime: testDate},
-					{Name: "test", Typeflag: tar.TypeDir, Size: 0, Mode: 0755, ModTime: testDate},
-					{Name: "test/content", Typeflag: tar.TypeReg, Size: 0, Mode: 0755, ModTime: testDate},
+					{Name: "target", Typeflag: tar.TypeSymlink, Mode: 0o755, Linkname: "target", ModTime: testDate},
+					{Name: "target", Typeflag: tar.TypeReg, Mode: 0o755, ModTime: testDate},
+					{Name: "target", Typeflag: tar.TypeSymlink, Mode: 0o755, Linkname: "target", ModTime: testDate},
+					{Name: "target", Typeflag: tar.TypeReg, Size: 123, Mode: 0o755, ModTime: testDate},
+					{Name: "test", Typeflag: typeFlag, Size: 0, Mode: 0o755, Linkname: "target", ModTime: testDate},
+					{Name: "test", Typeflag: tar.TypeDir, Size: 0, Mode: 0o755, ModTime: testDate},
+					{Name: "test/content", Typeflag: tar.TypeReg, Size: 0, Mode: 0o755, ModTime: testDate},
 				})
 				tmp := t.TempDir()
-				err := Put(tmp, tmp, PutOptions{UIDMap: uidMap, GIDMap: gidMap, NoOverwriteNonDirDir: !overwrite}, bytes.NewReader(archive))
+				err := PutContext(ctx, tmp, tmp, PutOptions{UIDMap: uidMap, GIDMap: gidMap, NoOverwriteNonDirDir: !overwrite}, bytes.NewReader(archive))
+				if expectedError != nil {
+					require.ErrorContains(t, err, expectedError.Error())
+					return
+				}
 				if overwrite {
 					if !errors.Is(err, syscall.EPERM) {
 						assert.Nilf(t, err, "expected to overwrite file with type %c: %v", typeFlag, err)
@@ -587,12 +624,16 @@ func testPut(t *testing.T) {
 					t.Skip("can only test !IgnoreDevices with root privileges, skipping")
 				}
 				archive := makeArchiveSlice([]tar.Header{
-					{Name: "test", Typeflag: typeFlag, Size: 0, Mode: 0600, ModTime: testDate, Devmajor: 0, Devminor: 0},
-					{Name: "link", Typeflag: tar.TypeLink, Size: 0, Mode: 0600, ModTime: testDate, Linkname: "test"},
-					{Name: "unrelated", Typeflag: tar.TypeReg, Size: 0, Mode: 0600, ModTime: testDate},
+					{Name: "test", Typeflag: typeFlag, Size: 0, Mode: 0o600, ModTime: testDate, Devmajor: 0, Devminor: 0},
+					{Name: "link", Typeflag: tar.TypeLink, Size: 0, Mode: 0o600, ModTime: testDate, Linkname: "test"},
+					{Name: "unrelated", Typeflag: tar.TypeReg, Size: 0, Mode: 0o600, ModTime: testDate},
 				})
 				tmp := t.TempDir()
-				err := Put(tmp, tmp, PutOptions{UIDMap: uidMap, GIDMap: gidMap, IgnoreDevices: ignoreDevices}, bytes.NewReader(archive))
+				err := PutContext(ctx, tmp, tmp, PutOptions{UIDMap: uidMap, GIDMap: gidMap, IgnoreDevices: ignoreDevices}, bytes.NewReader(archive))
+				if expectedError != nil {
+					require.ErrorContains(t, err, expectedError.Error())
+					return
+				}
 				require.Nilf(t, err, "expected to extract content with typeflag %c without an error: %v", typeFlag, err)
 				fileList, err := enumerateFiles(tmp)
 				require.Nilf(t, err, "unexpected error scanning the contents of extraction directory for typeflag %c: %v", typeFlag, err)
@@ -621,16 +662,713 @@ func testPut(t *testing.T) {
 						StripSetgidBit: stripSetgidBit,
 						StripStickyBit: stripStickyBit,
 					}
-					err := Put(tmp, tmp, putOptions, bytes.NewReader(archive))
-					require.Nilf(t, err, "unexpected error writing sample file", err)
+					err := PutContext(ctx, tmp, tmp, putOptions, bytes.NewReader(archive))
+					if expectedError != nil {
+						require.ErrorContains(t, err, expectedError.Error())
+						return
+					}
+					require.Nil(t, err, "unexpected error writing sample file", err)
 					st, err := os.Stat(filepath.Join(tmp, "test"))
-					require.Nilf(t, err, "unexpected error checking permissions of file", err)
-					assert.Equalf(t, stripSetuidBit, st.Mode()&os.ModeSetuid == 0, "setuid bit was not set/stripped correctly")
-					assert.Equalf(t, stripSetgidBit, st.Mode()&os.ModeSetgid == 0, "setgid bit was not set/stripped correctly")
-					assert.Equalf(t, stripStickyBit, st.Mode()&os.ModeSticky == 0, "sticky bit was not set/stripped correctly")
+					require.Nil(t, err, "unexpected error checking permissions of file", err)
+					assert.Equal(t, stripSetuidBit, st.Mode()&os.ModeSetuid == 0, "setuid bit was not set/stripped correctly")
+					assert.Equal(t, stripSetgidBit, st.Mode()&os.ModeSetgid == 0, "setgid bit was not set/stripped correctly")
+					assert.Equal(t, stripStickyBit, st.Mode()&os.ModeSticky == 0, "sticky bit was not set/stripped correctly")
 				})
 			}
 		}
+	}
+
+	// req.Directory creation does not allow escaping symlinks
+	for _, tc := range []struct{ linkRelPath, expectedDir string }{
+		{"a", "VICTIM/b"},
+		{"a/b", "VICTIM"},
+	} {
+		t.Run(fmt.Sprintf("req.Directory symlinks=%q", tc.linkRelPath), func(t *testing.T) {
+			victim := t.TempDir()
+			fi1, err := os.Lstat(victim)
+			require.NoError(t, err)
+
+			tmp := t.TempDir()
+			linkPath := filepath.Join(tmp, tc.linkRelPath)
+			err = os.MkdirAll(filepath.Dir(linkPath), 0o755)
+			require.NoError(t, err)
+			err = os.Symlink(victim, linkPath)
+			require.NoError(t, err)
+
+			archive := makeArchiveSlice([]tar.Header{})
+			err = PutContext(ctx, tmp, "a/b", PutOptions{UIDMap: uidMap, GIDMap: gidMap}, bytes.NewReader(archive))
+			if expectedError != nil {
+				assert.ErrorContains(t, err, expectedError.Error())
+				return
+			}
+			require.NoError(t, err)
+			// The symlink was confined to req.Root
+			expectedDestPath := filepath.Join(tmp, strings.ReplaceAll(tc.expectedDir, "VICTIM", victim))
+			fi, err := os.Lstat(expectedDestPath)
+			require.NoError(t, err)
+			assert.True(t, fi.IsDir())
+			dirs, err := os.ReadDir(expectedDestPath)
+			require.NoError(t, err)
+			assert.Empty(t, dirs)
+
+			// victim was not affected
+			fi2, err := os.Lstat(victim)
+			require.NoError(t, err)
+			assertCtimeMatches(t, fi1, fi2)
+		})
+	}
+
+	// Paths are confined to req.Root
+	type breakoutTest struct {
+		headers    []tar.Header
+		notSymlink string
+	}
+	breakoutTests := []breakoutTest{
+		{ // Direct overwrite
+			headers: []tar.Header{{Typeflag: tar.TypeReg, Name: "../victim/hello", Mode: 0o600}},
+		},
+		{ // Overwrite through an escaping symlink to directory
+			headers: []tar.Header{
+				{Typeflag: tar.TypeSymlink, Name: "symlink", Linkname: "../victim", Mode: 0o755},
+				{Typeflag: tar.TypeReg, Name: "symlink/hello", Mode: 0o600},
+			},
+		},
+		{ // Overwrite through an absolute symlink to directory
+			headers: []tar.Header{
+				{Typeflag: tar.TypeSymlink, Name: "symlink", Linkname: "@TOP@/victim", Mode: 0o644},
+				{Typeflag: tar.TypeReg, Name: "symlink/hello", Mode: 0o600},
+			},
+		},
+		{ // Overwrite through symlink to directory using paths that _look_ innocuous
+			headers: []tar.Header{
+				{Typeflag: tar.TypeSymlink, Name: "a/b/c", Linkname: "../..", Mode: 0o755}, // Points at the root
+				{Typeflag: tar.TypeSymlink, Name: "a/b/c/d", Linkname: "..", Mode: 0o755},  // = root/..
+				{Typeflag: tar.TypeReg, Name: "a/b/c/d/victim/hello", Mode: 0o600},
+			},
+		},
+		{ // Overwrite through an escaping symlink directly to victim
+			headers: []tar.Header{
+				{Typeflag: tar.TypeSymlink, Name: "symlink", Linkname: "../victim/hello", Mode: 0o755},
+				{Typeflag: tar.TypeReg, Name: "symlink", Mode: 0o600},
+			},
+		},
+		{ // Overwrite through an absolute symlink directly to victim
+			headers: []tar.Header{
+				{Typeflag: tar.TypeSymlink, Name: "symlink", Linkname: "@TOP@/victim/hello", Mode: 0o644},
+				{Typeflag: tar.TypeReg, Name: "symlink", Mode: 0o600},
+			},
+		},
+		{ // Overwrite through symlink directly to victim using paths that _look_ innocuous
+			headers: []tar.Header{
+				{Typeflag: tar.TypeSymlink, Name: "a/b/c", Linkname: "../..", Mode: 0o755},                   // Points at the root
+				{Typeflag: tar.TypeSymlink, Name: "a/b/c/symlink", Linkname: "../victim/hello", Mode: 0o755}, // = root/../victim/hello
+				{Typeflag: tar.TypeReg, Name: "a/b/c/symlink", Mode: 0o600},
+			},
+		},
+	}
+	// Writes targeting an escaping symlink replace the symlink.
+	// (This needs to be tested for each file type because the implementations are duplicated that way.)
+	for _, typeFlag := range []byte{tar.TypeReg, tar.TypeLink, tar.TypeSymlink, tar.TypeChar, tar.TypeBlock, tar.TypeDir, tar.TypeFifo} {
+		for _, symlinkTarget := range []string{"../victim/hello", "@TOP@/victim/hello"} {
+			tc := breakoutTest{
+				headers: []tar.Header{ // Overwrite through an escaping symlink directly to victim
+					{Typeflag: tar.TypeSymlink, Name: "symlink", Linkname: symlinkTarget, Mode: 0o755},
+					{Typeflag: tar.TypeReg, Name: "linkTarget", Mode: 0o600}, // linkTarget is necessary only for typeFlag == tar.TypeLink
+					{Typeflag: typeFlag, Name: "symlink", Linkname: "linkTarget", Mode: 0o600},
+				},
+			}
+			if typeFlag != tar.TypeSymlink {
+				tc.notSymlink = "symlink"
+			}
+			breakoutTests = append(breakoutTests, tc)
+		}
+	}
+	setupDestEntries := func(t *testing.T, dest string, entries ...string) {
+		t.Helper()
+		for _, entry := range entries {
+			parts := strings.SplitN(entry, ":", 3)
+			full := filepath.Join(dest, parts[1])
+			switch parts[0] {
+			case "dir":
+				require.NoError(t, os.MkdirAll(full, 0o755))
+			case "symlink":
+				require.NoError(t, os.MkdirAll(filepath.Dir(full), 0o755))
+				require.NoError(t, os.Symlink(parts[2], full))
+			default:
+				t.Fatalf("unknown dest entry %q", entry)
+			}
+		}
+	}
+	for i, tc := range breakoutTests {
+		t.Run(fmt.Sprintf("breakout=%d", i), func(t *testing.T) {
+			topdir := t.TempDir()
+			dest := filepath.Join(topdir, "dest")
+			err := os.Mkdir(dest, 0o755)
+			require.NoError(t, err)
+
+			// Breakout tests: verify victim is not affected.
+			victimDir := filepath.Join(topdir, "victim")
+			err = os.Mkdir(victimDir, 0o755)
+			require.NoError(t, err)
+			victimFile := filepath.Join(victimDir, "hello")
+			err = os.WriteFile(victimFile, []byte("content"), 0o600)
+			require.NoError(t, err)
+			fis := map[string]os.FileInfo{}
+			for _, path := range []string{victimDir, victimFile} {
+				fi, err := os.Lstat(path)
+				require.NoError(t, err)
+				fis[path] = fi
+			}
+
+			headers := slices.Clone(tc.headers)
+			for i := range headers {
+				headers[i].Linkname = strings.ReplaceAll(headers[i].Linkname, "@TOP@", topdir)
+			}
+			archive := makeArchiveSlice(headers)
+			err = PutContext(ctx, dest, dest, PutOptions{UIDMap: uidMap, GIDMap: gidMap}, bytes.NewReader(archive))
+			if expectedError != nil {
+				assert.ErrorContains(t, err, expectedError.Error())
+				return
+			}
+			if err != nil {
+				// os.Root’s errPathEscapes is not exported, so we must use a substring check.
+				assert.True(t, errors.Is(err, fs.ErrNotExist) || strings.Contains(err.Error(), "path escapes from parent"), "%v", err)
+			}
+			if tc.notSymlink != "" {
+				fi, err := os.Lstat(filepath.Join(dest, tc.notSymlink))
+				require.NoError(t, err)
+				assert.False(t, fi.Mode()&fs.ModeSymlink != 0)
+			}
+
+			// The victim paths were not affected
+			for _, path := range []string{victimDir, victimFile} {
+				fi, err := os.Lstat(path)
+				require.NoError(t, err)
+				assertCtimeMatches(t, fi, fis[path])
+			}
+		})
+	}
+
+	const putSymlinkResolutionPayload = "put-symlink-resolution\n"
+	type putSymlinkResolutionTest struct {
+		name         string
+		entries      []string // dir:path or symlink:path:target under dest
+		headers      []tar.Header
+		expectedPath string // relative to dest
+	}
+	putSymlinkResolutionTests := []putSymlinkResolutionTest{}
+	if os.PathSeparator == '/' {
+		putSymlinkResolutionTests = []putSymlinkResolutionTest{
+			{
+				name:    "var/run absolute symlink to /run",
+				entries: []string{"dir:run", "dir:var", "symlink:var/run:/run"},
+				headers: []tar.Header{
+					{Typeflag: tar.TypeReg, Name: "var/run/foo", Mode: 0o600},
+				},
+				expectedPath: "run/foo",
+			},
+			{
+				name:    "dir1/absolute symlink to /dir2",
+				entries: []string{"dir:dir1", "dir:dir2", "symlink:dir1/absolute:/dir2"},
+				headers: []tar.Header{
+					{Typeflag: tar.TypeReg, Name: "dir1/absolute/through-absolute", Mode: 0o600},
+				},
+				expectedPath: "dir2/through-absolute",
+			},
+			{
+				name:    "chained symlinks a -> b -> /run",
+				entries: []string{"dir:run", "symlink:b:/run", "symlink:a:b"},
+				headers: []tar.Header{
+					{Typeflag: tar.TypeReg, Name: "a/data", Mode: 0o600},
+				},
+				expectedPath: "run/data",
+			},
+		}
+	}
+	for _, tc := range putSymlinkResolutionTests {
+		t.Run("symlink-resolution:"+tc.name, func(t *testing.T) {
+			topdir := t.TempDir()
+			dest := filepath.Join(topdir, "dest")
+			require.NoError(t, os.Mkdir(dest, 0o755))
+			setupDestEntries(t, dest, tc.entries...)
+
+			contentMap := map[string][]byte{}
+			for j := range tc.headers {
+				if tc.headers[j].Typeflag == tar.TypeReg {
+					contentMap[tc.headers[j].Name] = []byte(putSymlinkResolutionPayload)
+				}
+			}
+			archive := makeArchive(tc.headers, contentMap)
+			putErr := PutContext(ctx, dest, dest, PutOptions{UIDMap: uidMap, GIDMap: gidMap}, archive)
+			if expectedError != nil {
+				assert.ErrorContains(t, putErr, expectedError.Error())
+				return
+			}
+			require.NoError(t, putErr)
+			got, readErr := os.ReadFile(filepath.Join(dest, tc.expectedPath))
+			require.NoError(t, readErr)
+			assert.Equal(t, putSymlinkResolutionPayload, string(got))
+		})
+	}
+
+	// Put through pre-existing symlinks when extracting archives.  Success paths
+	// are covered by putSymlinkResolutionTests above; rejections and targetDirectory
+	// boundaries are tested here (see also #7129).
+	// A relative ".." symlink is rejected as an escape, matching Docker
+	// behavior. Only absolute symlinks trigger chroot-style resolution.
+	t.Run("put through dotdot symlink rejected", func(t *testing.T) {
+		if os.PathSeparator != '/' {
+			t.Skip("symlink test is Unix-specific")
+		}
+		tmp := t.TempDir()
+
+		archive := makeArchive([]tar.Header{
+			{Name: "escape", Typeflag: tar.TypeSymlink, Linkname: "..", Mode: 0o777, ModTime: testDate},
+			{Name: "escape/etc/passwd", Typeflag: tar.TypeReg, Mode: 0o600, ModTime: testDate},
+		}, map[string][]byte{"escape/etc/passwd": []byte("evil\n")})
+		err := PutContext(ctx, tmp, tmp, PutOptions{UIDMap: uidMap, GIDMap: gidMap}, archive)
+		if expectedError != nil {
+			require.ErrorContains(t, err, expectedError.Error())
+			return
+		}
+		require.Error(t, err, "dotdot symlink should be rejected")
+	})
+
+	// A symlink loop (a -> b, b -> a) must be rejected.
+	t.Run("put through symlink loop", func(t *testing.T) {
+		if os.PathSeparator != '/' {
+			t.Skip("symlink test is Unix-specific")
+		}
+		tmp := t.TempDir()
+		require.NoError(t, os.Symlink("b", filepath.Join(tmp, "a")))
+		require.NoError(t, os.Symlink("a", filepath.Join(tmp, "b")))
+
+		archive := makeArchive([]tar.Header{
+			{Name: "a/file", Typeflag: tar.TypeReg, Mode: 0o600, ModTime: testDate},
+		}, map[string][]byte{"a/file": []byte("loop\n")})
+		err := PutContext(ctx, tmp, tmp, PutOptions{UIDMap: uidMap, GIDMap: gidMap}, archive)
+		if expectedError != nil {
+			require.ErrorContains(t, err, expectedError.Error())
+			return
+		}
+		require.Error(t, err, "symlink loop should be rejected")
+	})
+
+	// Put(root, directory) with directory strictly inside root (e.g. buildah add
+	// archive /dest): validation is scoped to directory, not the whole root.
+	// Tar names are relative to directory, so "link/passwd" is not obviously
+	// hostile.  A pre-existing symlink under dest that points outside directory
+	// must still be rejected — otherwise the archive would write root/etc/passwd
+	// while the caller only intended files under dest.  That is separate from
+	// extract-at-root (root == directory), where in-image links such as
+	// /var/run -> /run are followed because the whole rootfs is the target.
+	t.Run("put subdir: symlink escapes targetDirectory", func(t *testing.T) {
+		if os.PathSeparator != '/' {
+			t.Skip("symlink test is Unix-specific")
+		}
+		tmp := t.TempDir()
+		dest := filepath.Join(tmp, "dest")
+		require.NoError(t, os.MkdirAll(dest, 0o755))
+		require.NoError(t, os.MkdirAll(filepath.Join(tmp, "etc"), 0o755))
+		require.NoError(t, os.Symlink("/etc", filepath.Join(dest, "link")))
+
+		archive := makeArchive([]tar.Header{
+			{Name: "link/passwd", Typeflag: tar.TypeReg, Mode: 0o600, ModTime: testDate},
+		}, map[string][]byte{"link/passwd": []byte("escaped\n")})
+		err := PutContext(ctx, tmp, dest, PutOptions{UIDMap: uidMap, GIDMap: gidMap}, archive)
+		if expectedError != nil {
+			require.ErrorContains(t, err, expectedError.Error())
+			return
+		}
+		require.Error(t, err, "symlink escaping targetDirectory should be rejected")
+	})
+
+	t.Run("put subdir: dotdot symlink escapes targetDirectory", func(t *testing.T) {
+		if os.PathSeparator != '/' {
+			t.Skip("symlink test is Unix-specific")
+		}
+		tmp := t.TempDir()
+		dest := filepath.Join(tmp, "dest")
+		require.NoError(t, os.MkdirAll(dest, 0o755))
+		require.NoError(t, os.Symlink("..", filepath.Join(dest, "up")))
+
+		archive := makeArchive([]tar.Header{
+			{Name: "up/secret", Typeflag: tar.TypeReg, Mode: 0o600, ModTime: testDate},
+		}, map[string][]byte{"up/secret": []byte("escaped\n")})
+		err := PutContext(ctx, tmp, dest, PutOptions{UIDMap: uidMap, GIDMap: gidMap}, archive)
+		if expectedError != nil {
+			require.ErrorContains(t, err, expectedError.Error())
+			return
+		}
+		require.Error(t, err, "dotdot symlink escaping targetDirectory should be rejected")
+	})
+
+	t.Run("put subdir: escaped file must not exist on host", func(t *testing.T) {
+		if os.PathSeparator != '/' {
+			t.Skip("symlink test is Unix-specific")
+		}
+		tmp := t.TempDir()
+		dest := filepath.Join(tmp, "dest")
+		require.NoError(t, os.MkdirAll(dest, 0o755))
+		require.NoError(t, os.MkdirAll(filepath.Join(tmp, "etc"), 0o755))
+		require.NoError(t, os.Symlink("/etc", filepath.Join(dest, "link")))
+
+		archive := makeArchive([]tar.Header{
+			{Name: "link/shadow", Typeflag: tar.TypeReg, Mode: 0o600, ModTime: testDate},
+		}, map[string][]byte{"link/shadow": []byte("root:!\n")})
+		err := PutContext(ctx, tmp, dest, PutOptions{UIDMap: uidMap, GIDMap: gidMap}, archive)
+		if expectedError != nil {
+			require.ErrorContains(t, err, expectedError.Error())
+			return
+		}
+		require.Error(t, err, "escape should be rejected")
+		_, statErr := os.Lstat(filepath.Join(tmp, "etc", "shadow"))
+		assert.True(t, errors.Is(statErr, os.ErrNotExist), "escaped file must not exist at root/etc/shadow")
+	})
+
+	// Hard link targets are constrained to req.Root.
+	for _, c := range []struct {
+		symlinks [][2]string // (name -> target)
+		linkName string
+	}{
+		{symlinks: [][2]string{{"symlink", "unused"}}, linkName: "../victimDir/victim"},
+		{symlinks: [][2]string{{"symlink", "unused"}}, linkName: "TOP/victimDir/victim"},
+		{symlinks: [][2]string{{"symlink", "../victimDir"}}, linkName: "symlink/victim"},
+		{symlinks: [][2]string{{"symlink", "TOP/victimDir"}}, linkName: "symlink/victim"},
+		{symlinks: [][2]string{{"symlink", "../victimDir/victim"}}, linkName: "symlink"},
+		{symlinks: [][2]string{{"symlink", "TOP/victimDir/victim"}}, linkName: "symlink"},
+		{ // symlink targets that do not individually escape, when looking purely at the syntax
+			symlinks: [][2]string{
+				{"a/b/c", "../.."}, // Points at the root
+				{"a/b/c/d", ".."},  // = root/..
+			},
+			linkName: "a/b/c/d/victimDir/victim",
+		},
+	} {
+		t.Run(fmt.Sprintf("hardlink-breakout=%q|%s", c.symlinks, c.linkName), func(t *testing.T) {
+			topDir := t.TempDir()
+
+			victimDir := filepath.Join(topDir, "victimDir")
+			err := os.Mkdir(victimDir, 0o700)
+			require.NoError(t, err)
+			victimPath := filepath.Join(victimDir, "victim")
+			err = os.WriteFile(victimPath, []byte("victim"), 0o600)
+			require.NoError(t, err)
+
+			destDir := filepath.Join(topDir, "destDir")
+			err = os.Mkdir(destDir, 0o700)
+			require.NoError(t, err)
+			for _, symlink := range c.symlinks {
+				symlinkPath := filepath.Join(destDir, symlink[0])
+				target := strings.Replace(symlink[1], "TOP", topDir, 1)
+				err := os.MkdirAll(filepath.Dir(symlinkPath), 0o700)
+				require.NoError(t, err)
+				err = os.Symlink(target, symlinkPath)
+				require.NoError(t, err)
+			}
+			archive := makeArchiveSlice([]tar.Header{
+				{Typeflag: tar.TypeLink, Name: "link", Linkname: strings.Replace(c.linkName, "TOP", topDir, 1), Mode: 0o600},
+			})
+			// Either creating the hard link must fail …
+			err = PutContext(ctx, destDir, destDir, PutOptions{UIDMap: uidMap, GIDMap: gidMap}, bytes.NewReader(archive))
+			if err == nil {
+				// … or it must be a hard link to our symlink, not to the victim.
+				linkInfo, err := os.Lstat(filepath.Join(destDir, "link"))
+				require.NoError(t, err)
+				assert.Equal(t, fs.ModeSymlink, linkInfo.Mode().Type())
+			}
+			if expectedError != nil {
+				assert.ErrorContains(t, err, expectedError.Error())
+			}
+		})
+	}
+
+	// req.Root must not be created/replaced as a non-directory.
+	for _, destSuffix := range []string{"", "/"} {
+		for _, rootName := range []string{".", "/"} {
+			t.Run(fmt.Sprintf("symlink root dest=%s, root=%s", destSuffix, rootName), func(t *testing.T) {
+				victim := t.TempDir()
+				victimFile := filepath.Join(victim, "file")
+				err := os.WriteFile(victimFile, []byte("content"), 0o600)
+				require.NoError(t, err)
+				fis := map[string]os.FileInfo{}
+				for _, path := range []string{victim, victimFile} {
+					fi, err := os.Lstat(path)
+					require.NoError(t, err)
+					fis[path] = fi
+				}
+
+				dest := filepath.Join(t.TempDir(), "dest")
+				err = os.Mkdir(dest, 0o700)
+				require.NoError(t, err)
+
+				archive := makeArchiveSlice([]tar.Header{
+					{Typeflag: tar.TypeSymlink, Name: rootName, Linkname: victim, Mode: 0o700},
+					{Typeflag: tar.TypeReg, Name: filepath.Join(rootName, "file"), Mode: 0o600},
+				})
+				err = PutContext(ctx, dest+destSuffix, dest+destSuffix, PutOptions{UIDMap: uidMap, GIDMap: gidMap}, bytes.NewReader(archive))
+				if expectedError != nil {
+					assert.ErrorContains(t, err, expectedError.Error())
+					return
+				}
+				require.Error(t, err)
+
+				fi, err := os.Lstat(dest)
+				require.NoError(t, err)
+				assert.True(t, fi.IsDir())
+				// The victim paths were not affected
+				for _, path := range []string{victim, victimFile} {
+					fi, err := os.Lstat(path)
+					require.NoError(t, err)
+					assertCtimeMatches(t, fi, fis[path])
+				}
+			})
+
+			// TypeDir entries for req.Root are accepted.
+			t.Run(fmt.Sprintf("dir root dest=%s, dir=%s", destSuffix, rootName), func(t *testing.T) {
+				dest := filepath.Join(t.TempDir(), "dest")
+				err := os.Mkdir(dest, 0o700)
+				require.NoError(t, err)
+
+				archive := makeArchiveSlice([]tar.Header{
+					{Typeflag: tar.TypeDir, Name: rootName, Mode: 0o700},
+					{Typeflag: tar.TypeReg, Name: filepath.Join(rootName, "file"), Mode: 0o600},
+				})
+				err = PutContext(ctx, dest+destSuffix, dest+destSuffix, PutOptions{UIDMap: uidMap, GIDMap: gidMap}, bytes.NewReader(archive))
+				if expectedError != nil {
+					assert.ErrorContains(t, err, expectedError.Error())
+					return
+				}
+				require.NoError(t, err)
+
+				fi, err := os.Lstat(dest)
+				require.NoError(t, err)
+				assert.True(t, fi.IsDir())
+			})
+		}
+	}
+
+	// The directory times and permissions code does not follow symlinks.
+	mtime := time.Unix(1, 0)
+	atime := time.Unix(2, 0)
+	t.Run("late directory attributes on symlink", func(t *testing.T) {
+		victim := t.TempDir()
+		fi1, err := os.Lstat(victim)
+		require.NoError(t, err)
+
+		dest := t.TempDir()
+		// An explicit FormatPAX is necessary, otherwise archive/tar prefers to use a simpler header which does not encode AccessTime,
+		archive := makeArchiveSlice([]tar.Header{
+			{Typeflag: tar.TypeDir, Name: "dir", Mode: 0o700, ModTime: mtime, AccessTime: atime},
+			{Typeflag: tar.TypeSymlink, Name: "dir", Linkname: victim, Mode: 0o700},
+		})
+		reader := bytes.NewReader(archive)
+		err = PutContext(ctx, dest, dest, PutOptions{UIDMap: uidMap, GIDMap: gidMap}, reader)
+		if expectedError != nil {
+			assert.ErrorContains(t, err, expectedError.Error())
+			return
+		}
+		assert.NoError(t, err)
+		fi, err := os.Lstat(filepath.Join(dest, "dir"))
+		require.NoError(t, err)
+		assert.Equal(t, fs.ModeSymlink, fi.Mode().Type())
+
+		fi2, err := os.Lstat(victim)
+		require.NoError(t, err)
+		assertCtimeMatches(t, fi2, fi1)
+	})
+}
+
+func TestPathHasAbsoluteSymlink(t *testing.T) {
+	if os.PathSeparator != '/' {
+		t.Skip("symlink layout tests are Unix-specific")
+	}
+
+	t.Run("relative chain stays confined to osRoot", func(t *testing.T) {
+		top, err := filepath.EvalSymlinks(t.TempDir())
+		require.NoError(t, err)
+		require.NoError(t, os.MkdirAll(filepath.Join(top, "intermediate", "terminal"), 0o755))
+		require.NoError(t, os.Symlink("../../../../../../../../..", filepath.Join(top, "escaping")))
+		require.NoError(t, os.Symlink("escaping/intermediate", filepath.Join(top, "escaping2")))
+
+		osRoot, err := os.OpenRoot(top)
+		require.NoError(t, err)
+		defer osRoot.Close()
+
+		var readlinkCalls []string
+		res := pathHasAbsoluteSymlink("escaping2/terminal", func(name string) (string, error) {
+			require.False(t, filepath.IsAbs(name), "readlink must use paths relative to root, not %q", name)
+			require.True(t, filepath.IsLocal(name), "readlink must not be called on escaped paths, got %q", name)
+			readlinkCalls = append(readlinkCalls, name)
+			return osRoot.Readlink(name)
+		})
+		assert.False(t, res, "no absolute symlink in purely relative chain")
+		assert.Equal(t, []string{"escaping2", "escaping"}, readlinkCalls,
+			"stop before readlink once next path step leaves the root")
+	})
+
+	t.Run("absolute symlink found through relative indirection", func(t *testing.T) {
+		top := t.TempDir()
+		require.NoError(t, os.MkdirAll(filepath.Join(top, "run"), 0o755))
+		// absolute -> /. (absolute symlink target)
+		require.NoError(t, os.Symlink("/.", filepath.Join(top, "absolute")))
+		// via-absolute -> absolute/nonexistent (relative, but first
+		// component is itself a symlink with an absolute target)
+		require.NoError(t, os.Symlink("absolute/nonexistent", filepath.Join(top, "via-absolute")))
+
+		osRoot, err := os.OpenRoot(top)
+		require.NoError(t, err)
+		defer osRoot.Close()
+
+		res := pathHasAbsoluteSymlink("via-absolute", osRoot.Readlink)
+		assert.True(t, res, "should detect absolute symlink reached through relative indirection")
+	})
+}
+
+func TestCheckArchivePathEscape(t *testing.T) {
+	if os.PathSeparator != '/' {
+		t.Skip("symlink layout tests are Unix-specific")
+	}
+
+	// setup creates a temp directory with the given structure and returns
+	// the root path.  Each entry is "type:path:target":
+	//   "dir:path"              - directory
+	//   "symlink:path:target"   - symbolic link
+	//   "file:path"             - regular file
+	setup := func(t *testing.T, entries ...string) string {
+		t.Helper()
+		root := t.TempDir()
+		for _, entry := range entries {
+			parts := strings.SplitN(entry, ":", 3)
+			full := filepath.Join(root, parts[1])
+			switch parts[0] {
+			case "dir":
+				require.NoError(t, os.MkdirAll(full, 0o755))
+			case "symlink":
+				require.NoError(t, os.MkdirAll(filepath.Dir(full), 0o755))
+				require.NoError(t, os.Symlink(parts[2], full))
+			case "file":
+				require.NoError(t, os.MkdirAll(filepath.Dir(full), 0o755))
+				require.NoError(t, os.WriteFile(full, []byte("x"), 0o644))
+			}
+		}
+		return root
+	}
+
+	for _, tc := range []struct {
+		name    string
+		entries []string // filesystem layout
+		subdir  string   // if set, use this subdirectory as targetDirectory
+		path    string   // tar entry path to check
+		wantErr bool
+	}{
+		// --- paths that should be accepted ---
+		{
+			name:    "plain directory path",
+			entries: []string{"dir:var/run"},
+			path:    "var/run/foo",
+		},
+		{
+			name:    "nonexistent path with no symlinks",
+			entries: []string{},
+			path:    "some/new/file",
+		},
+		{
+			name:    "absolute symlink inside root /var/run -> /run",
+			entries: []string{"dir:run", "symlink:var/run:/run"},
+			path:    "var/run/foo",
+		},
+		{
+			name:    "absolute symlink to nested dir /opt -> /usr/local",
+			entries: []string{"dir:usr/local", "symlink:opt:/usr/local"},
+			path:    "opt/bin/tool",
+		},
+		{
+			name:    "chain of symlinks a -> b, b -> /run",
+			entries: []string{"dir:run", "symlink:b:/run", "symlink:a:b"},
+			path:    "a/foo",
+		},
+		{
+			name:    "plain file at root level",
+			entries: []string{},
+			path:    "single-file",
+		},
+		{
+			name:    "path is root itself",
+			entries: []string{},
+			path:    ".",
+		},
+		{
+			name:    "relative symlink staying inside root",
+			entries: []string{"dir:real", "symlink:link:real"},
+			path:    "link/file",
+		},
+		{
+			name:    "deeply nested absolute symlink /a/b/c -> /x/y",
+			entries: []string{"dir:x/y", "dir:a/b", "symlink:a/b/c:/x/y"},
+			path:    "a/b/c/file",
+		},
+		{
+			name:    "subdir: absolute symlink stays inside targetDirectory",
+			entries: []string{"dir:dest/run", "symlink:dest/var/run:/dest/run"},
+			subdir:  "dest",
+			path:    "var/run/foo",
+		},
+		// --- paths that should be rejected ---
+		{
+			name:    "relative symlink overshooting root /bin -> ../../../../../usr/bin",
+			entries: []string{"dir:usr/bin", "symlink:bin:../../../../../usr/bin"},
+			path:    "bin/ls",
+			wantErr: true,
+		},
+		{
+			name:    "dotdot symlink at root level rejected",
+			entries: []string{"symlink:escape:.."},
+			path:    "escape/etc/passwd",
+			wantErr: true,
+		},
+		// Scoped to dest/: "link/passwd" is under dest in the tar, but dest/link
+		// -> /etc resolves outside targetDirectory (see put subdir tests above).
+		{
+			name:    "subdir: absolute symlink escapes to root level",
+			entries: []string{"dir:dest", "dir:etc", "symlink:dest/link:/etc"},
+			subdir:  "dest",
+			path:    "link/passwd",
+			wantErr: true,
+		},
+		{
+			name:    "subdir: dotdot symlink escapes targetDirectory",
+			entries: []string{"dir:dest", "symlink:dest/up:.."},
+			subdir:  "dest",
+			path:    "up/etc/passwd",
+			wantErr: true,
+		},
+		{
+			name:    "symlink loop causes resolvePath ELOOP failure",
+			entries: []string{"symlink:a:b", "symlink:b:a"},
+			path:    "a/file",
+			wantErr: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := setup(t, tc.entries...)
+			// Simulate ADD foobar.tar /subdir: scope osRoot and
+			// targetDirectory to the subdirectory while root
+			// stays the container rootfs.
+			targetDir := root
+			if tc.subdir != "" {
+				targetDir = filepath.Join(root, tc.subdir)
+			}
+			osRoot, err := os.OpenRoot(targetDir)
+			require.NoError(t, err)
+			defer osRoot.Close()
+			err = checkArchivePathEscape(osRoot, root, targetDir, targetDir, tc.path)
+			if tc.wantErr {
+				assert.Error(t, err, "expected checkArchivePathEscape to reject %q", tc.path)
+			} else {
+				assert.NoError(t, err, "expected checkArchivePathEscape to accept %q", tc.path)
+			}
+		})
 	}
 }
 
@@ -653,7 +1391,7 @@ func isExpectedError(err error, inSubdir bool, name string, expectedErrors []exp
 	return false
 }
 
-func TestStatNoChroot(t *testing.T) {
+func TestStatNoChrootNoCancel(t *testing.T) {
 	couldChroot := canChroot
 	canChroot = false
 	testStat(t)
@@ -689,7 +1427,7 @@ func testStat(t *testing.T) {
 							CheckForArchives: false,
 							Excludes:         excludes,
 						}
-						stats, err := Stat(root, topdir, options, []string{name})
+						stats, err := StatContext(t.Context(), root, topdir, options, []string{name})
 						require.NoErrorf(t, err, "error statting %q: %v", name, err)
 						for _, st := range stats {
 							// should not have gotten an error
@@ -699,8 +1437,8 @@ func testStat(t *testing.T) {
 							matches := 0
 							for _, glob := range st.Globbed {
 								matches++
-								require.Equal(t, st.Glob, glob, "expected entry for %q", st.Glob)
-								require.NotNil(t, st.Results[glob], "%q globbed %q, but there are no results for it", st.Glob, glob)
+								require.Equalf(t, st.Glob, glob, "expected entry for %q", st.Glob)
+								require.NotNilf(t, st.Results[glob], "%q globbed %q, but there are no results for it", st.Glob, glob)
 								toStat := glob
 								if !absolute {
 									toStat = filepath.Join(root, topdir, name)
@@ -714,24 +1452,25 @@ func testStat(t *testing.T) {
 									if actualContent, ok := testArchive.contents[testItem.Name]; ok {
 										testItem.Size = int64(len(actualContent))
 									}
-									require.Equal(t, testItem.Size, result.Size, "unexpected size difference for %q", name)
-									require.True(t, result.IsRegular, "expected %q.IsRegular to be true", glob)
-									require.False(t, result.IsDir, "expected %q.IsDir to be false", glob)
-									require.False(t, result.IsSymlink, "expected %q.IsSymlink to be false", glob)
+									checkStatInfoOwnership(t, result)
+									require.Equalf(t, testItem.Size, result.Size, "unexpected size difference for %q", name)
+									require.Truef(t, result.IsRegular, "expected %q.IsRegular to be true", glob)
+									require.Falsef(t, result.IsDir, "expected %q.IsDir to be false", glob)
+									require.Falsef(t, result.IsSymlink, "expected %q.IsSymlink to be false", glob)
 								case tar.TypeDir:
-									require.False(t, result.IsRegular, "expected %q.IsRegular to be false", glob)
-									require.True(t, result.IsDir, "expected %q.IsDir to be true", glob)
-									require.False(t, result.IsSymlink, "expected %q.IsSymlink to be false", glob)
+									require.Falsef(t, result.IsRegular, "expected %q.IsRegular to be false", glob)
+									require.Truef(t, result.IsDir, "expected %q.IsDir to be true", glob)
+									require.Falsef(t, result.IsSymlink, "expected %q.IsSymlink to be false", glob)
 								case tar.TypeSymlink:
-									require.True(t, result.IsSymlink, "%q is supposed to be a symbolic link, but is not", name)
-									require.Equal(t, filepath.FromSlash(testItem.Linkname), result.ImmediateTarget, "%q is supposed to point to %q, but points to %q", glob, testItem.Linkname, result.ImmediateTarget)
+									require.Truef(t, result.IsSymlink, "%q is supposed to be a symbolic link, but is not", name)
+									require.Equalf(t, filepath.FromSlash(testItem.Linkname), result.ImmediateTarget, "%q is supposed to point to %q, but points to %q", glob, testItem.Linkname, result.ImmediateTarget)
 								case tar.TypeBlock, tar.TypeChar:
-									require.False(t, result.IsRegular, "%q is a regular file, but is not supposed to be", name)
-									require.False(t, result.IsDir, "%q is a directory, but is not supposed to be", name)
-									require.False(t, result.IsSymlink, "%q is not supposed to be a symbolic link, but appears to be one", name)
+									require.Falsef(t, result.IsRegular, "%q is a regular file, but is not supposed to be", name)
+									require.Falsef(t, result.IsDir, "%q is a directory, but is not supposed to be", name)
+									require.Falsef(t, result.IsSymlink, "%q is not supposed to be a symbolic link, but appears to be one", name)
 								}
 							}
-							require.Equal(t, 1, matches, "non-glob %q matched %d items, not exactly one", name, matches)
+							require.Equalf(t, 1, matches, "non-glob %q matched %d items, not exactly one", name, matches)
 						}
 					})
 				}
@@ -740,14 +1479,24 @@ func testStat(t *testing.T) {
 	}
 }
 
-func TestGetSingleNoChroot(t *testing.T) {
+func TestGetSingleNoChrootNoCancel(t *testing.T) {
 	couldChroot := canChroot
 	canChroot = false
-	testGetSingle(t)
+	testGetSingle(t.Context(), t, nil)
 	canChroot = couldChroot
 }
 
-func testGetSingle(t *testing.T) {
+func TestGetSingleNoChrootCancel(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 1*time.Nanosecond)
+	defer cancel()
+	time.Sleep(1 * time.Millisecond)
+	couldChroot := canChroot
+	canChroot = false
+	testGetSingle(ctx, t, context.DeadlineExceeded)
+	canChroot = couldChroot
+}
+
+func testGetSingle(ctx context.Context, t *testing.T, expectedError error) {
 	for _, absolute := range []bool{false, true} {
 		for _, topdir := range []string{"", ".", "top"} {
 			for _, testArchive := range testArchives {
@@ -778,7 +1527,11 @@ func testGetSingle(t *testing.T) {
 					}
 					t.Run(fmt.Sprintf("absolute=%t,topdir=%s,archive=%s,item=%s", absolute, topdir, testArchive.name, name), func(t *testing.T) {
 						// check if we can get this one item
-						err := Get(root, topdir, getOptions, []string{name}, io.Discard)
+						err := GetContext(ctx, root, topdir, getOptions, []string{name}, io.Discard)
+						if expectedError != nil {
+							require.ErrorContains(t, err, expectedError.Error())
+							return
+						}
 						// if we couldn't read that content, check if it's one of the expected failures
 						if err != nil && isExpectedError(err, topdir != "" && topdir != ".", testItem.Name, testArchive.expectedGetErrors) {
 							return
@@ -792,19 +1545,20 @@ func testGetSingle(t *testing.T) {
 						pipeReader, pipeWriter := io.Pipe()
 						var getErr error
 						var wg sync.WaitGroup
-						wg.Add(1)
-						go func() {
-							getErr = Get(root, topdir, getOptions, []string{name}, pipeWriter)
+						wg.Go(func() {
+							getErr = GetContext(ctx, root, topdir, getOptions, []string{name}, pipeWriter)
 							pipeWriter.Close()
-							wg.Done()
-						}()
+						})
 						tr := tar.NewReader(pipeReader)
 						hdr, err := tr.Next()
-						for err == nil {
-							assert.Equal(t, filepath.Base(name), filepath.FromSlash(hdr.Name), "expected item named %q, got %q", filepath.Base(name), filepath.FromSlash(hdr.Name))
+						for hdr != nil {
+							assert.Equalf(t, filepath.Base(name), filepath.FromSlash(hdr.Name), "expected item named %q, got %q", filepath.Base(name), filepath.FromSlash(hdr.Name))
+							if err != nil {
+								break
+							}
 							hdr, err = tr.Next()
 						}
-						assert.Equal(t, io.EOF.Error(), err.Error(), "expected EOF at end of archive, got %q", err.Error())
+						assert.ErrorIs(t, err, io.EOF, "expected EOF at end of archive")
 						if !t.Failed() && testItem.Typeflag == tar.TypeReg && testItem.Mode&(cISUID|cISGID|cISVTX) != 0 {
 							for _, stripSetuidBit := range []bool{false, true} {
 								for _, stripSetgidBit := range []bool{false, true} {
@@ -817,15 +1571,13 @@ func testGetSingle(t *testing.T) {
 											getOptions.StripSetgidBit = stripSetgidBit
 											getOptions.StripStickyBit = stripStickyBit
 											pipeReader, pipeWriter := io.Pipe()
-											wg.Add(1)
-											go func() {
-												getErr = Get(root, topdir, getOptions, []string{name}, pipeWriter)
+											wg.Go(func() {
+												getErr = GetContext(ctx, root, topdir, getOptions, []string{name}, pipeWriter)
 												pipeWriter.Close()
-												wg.Done()
-											}()
+											})
 											tr := tar.NewReader(pipeReader)
 											hdr, err := tr.Next()
-											for err == nil {
+											for hdr != nil {
 												expectedMode := testItem.Mode
 												modifier := ""
 												if stripSetuidBit {
@@ -843,11 +1595,14 @@ func testGetSingle(t *testing.T) {
 												if expectedMode != hdr.Mode && expectedMode&testModeMask == hdr.Mode&testModeMask {
 													logrus.Warnf("chmod() lost some bits: expected 0%o, got 0%o", expectedMode, hdr.Mode)
 												} else {
-													assert.Equal(t, expectedMode, hdr.Mode, "expected item named %q %sto have mode 0%o, got 0%o", hdr.Name, modifier, expectedMode, hdr.Mode)
+													assert.Equalf(t, expectedMode, hdr.Mode, "expected item named %q %sto have mode 0%o, got 0%o", hdr.Name, modifier, expectedMode, hdr.Mode)
+												}
+												if err != nil {
+													break
 												}
 												hdr, err = tr.Next()
 											}
-											assert.Equal(t, io.EOF.Error(), err.Error(), "expected EOF at end of archive, got %q", err.Error())
+											assert.ErrorIs(t, err, io.EOF, "expected EOF at end of archive")
 											wg.Wait()
 											assert.NoErrorf(t, getErr, "unexpected error from Get(%q): %v", name, getErr)
 											pipeReader.Close()
@@ -867,14 +1622,24 @@ func testGetSingle(t *testing.T) {
 	}
 }
 
-func TestGetMultipleNoChroot(t *testing.T) {
+func TestGetMultipleNoChrootNoCancel(t *testing.T) {
 	couldChroot := canChroot
 	canChroot = false
-	testGetMultiple(t)
+	testGetMultiple(t.Context(), t, nil)
 	canChroot = couldChroot
 }
 
-func testGetMultiple(t *testing.T) {
+func TestGetMultipleNoChrootCancel(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 1*time.Nanosecond)
+	defer cancel()
+	time.Sleep(1 * time.Millisecond)
+	couldChroot := canChroot
+	canChroot = false
+	testGetMultiple(ctx, t, context.DeadlineExceeded)
+	canChroot = couldChroot
+}
+
+func testGetMultiple(ctx context.Context, t *testing.T, expectedGetError error) {
 	type getTestArchiveCase struct {
 		name               string
 		pattern            string
@@ -888,8 +1653,11 @@ func testGetMultiple(t *testing.T) {
 		keepDirectoryNames bool
 		renames            map[string]string
 		noDerefSymlinks    bool
+		parents            bool
+		timestamp          *time.Time
+		expectedSymlinks   map[string]string
 	}
-	var getTestArchives = []struct {
+	getTestArchives := []struct {
 		name              string
 		headers           []tar.Header
 		contents          map[string][]byte
@@ -899,40 +1667,40 @@ func testGetMultiple(t *testing.T) {
 		{
 			name: "regular",
 			headers: []tar.Header{
-				{Name: "file-0", Typeflag: tar.TypeReg, Size: 123456789, Mode: 0600},
-				{Name: "file-a", Typeflag: tar.TypeReg, Size: 23, Mode: 0600},
-				{Name: "file-b", Typeflag: tar.TypeReg, Size: 23, Mode: 0600},
-				{Name: "link-a", Typeflag: tar.TypeSymlink, Linkname: "file-a", Size: 23, Mode: 0600},
-				{Name: "link-c", Typeflag: tar.TypeSymlink, Linkname: "subdir-c", Mode: 0700, ModTime: testDate},
-				{Name: "archive-a", Typeflag: tar.TypeReg, Size: 0, Mode: 0600},
-				{Name: "non-archive-a", Typeflag: tar.TypeReg, Size: 1199, Mode: 0600},
-				{Name: "hlink-0", Typeflag: tar.TypeLink, Linkname: "file-0", Size: 123456789, Mode: 0600},
-				{Name: "something-a", Typeflag: tar.TypeReg, Size: 34, Mode: 0600},
-				{Name: "subdir-a", Typeflag: tar.TypeDir, Mode: 0700},
-				{Name: "subdir-a/file-n", Typeflag: tar.TypeReg, Size: 108, Mode: 0660},
-				{Name: "subdir-a/file-o", Typeflag: tar.TypeReg, Size: 45, Mode: 0660},
-				{Name: "subdir-a/file-a", Typeflag: tar.TypeSymlink, Linkname: "../file-a", Size: 23, Mode: 0600},
-				{Name: "subdir-a/file-b", Typeflag: tar.TypeSymlink, Linkname: "../../file-b", Size: 23, Mode: 0600},
-				{Name: "subdir-a/file-c", Typeflag: tar.TypeReg, Size: 56, Mode: 0600},
-				{Name: "subdir-b", Typeflag: tar.TypeDir, Mode: 0700},
-				{Name: "subdir-b/file-n", Typeflag: tar.TypeReg, Size: 216, Mode: 0660},
-				{Name: "subdir-b/file-o", Typeflag: tar.TypeReg, Size: 67, Mode: 0660},
-				{Name: "subdir-c", Typeflag: tar.TypeDir, Mode: 0700},
-				{Name: "subdir-c/file-p", Typeflag: tar.TypeReg, Size: 432, Mode: 0666},
-				{Name: "subdir-c/file-q", Typeflag: tar.TypeReg, Size: 78, Mode: 0666},
-				{Name: "subdir-d", Typeflag: tar.TypeDir, Mode: 0700},
-				{Name: "subdir-d/hlink-0", Typeflag: tar.TypeLink, Linkname: "../file-0", Size: 123456789, Mode: 0600},
-				{Name: "subdir-e", Typeflag: tar.TypeDir, Mode: 0700},
-				{Name: "subdir-e/subdir-f", Typeflag: tar.TypeDir, Mode: 0700},
-				{Name: "subdir-e/subdir-f/hlink-b", Typeflag: tar.TypeLink, Linkname: "../../file-b", Size: 23, Mode: 0600},
+				{Name: "file-0", Typeflag: tar.TypeReg, Size: 65537, Mode: 0o600},
+				{Name: "file-a", Typeflag: tar.TypeReg, Size: 23, Mode: 0o600},
+				{Name: "file-b", Typeflag: tar.TypeReg, Size: 23, Mode: 0o600},
+				{Name: "link-a", Typeflag: tar.TypeSymlink, Linkname: "file-a", Size: 23, Mode: 0o600},
+				{Name: "link-c", Typeflag: tar.TypeSymlink, Linkname: "subdir-c", Mode: 0o700, ModTime: testDate},
+				{Name: "archive-a", Typeflag: tar.TypeReg, Size: 0, Mode: 0o600},
+				{Name: "non-archive-a", Typeflag: tar.TypeReg, Size: 1199, Mode: 0o600},
+				{Name: "hlink-0", Typeflag: tar.TypeLink, Linkname: "file-0", Size: 65537, Mode: 0o600},
+				{Name: "something-a", Typeflag: tar.TypeReg, Size: 34, Mode: 0o600},
+				{Name: "subdir-a/", Typeflag: tar.TypeDir, Mode: 0o700},
+				{Name: "subdir-a/file-n", Typeflag: tar.TypeReg, Size: 108, Mode: 0o660},
+				{Name: "subdir-a/file-o", Typeflag: tar.TypeReg, Size: 45, Mode: 0o660},
+				{Name: "subdir-a/file-a", Typeflag: tar.TypeSymlink, Linkname: "../file-a", Size: 23, Mode: 0o600},
+				{Name: "subdir-a/file-b", Typeflag: tar.TypeSymlink, Linkname: "../../file-b", Size: 23, Mode: 0o600},
+				{Name: "subdir-a/file-c", Typeflag: tar.TypeReg, Size: 56, Mode: 0o600},
+				{Name: "subdir-b/", Typeflag: tar.TypeDir, Mode: 0o700},
+				{Name: "subdir-b/file-n", Typeflag: tar.TypeReg, Size: 216, Mode: 0o660},
+				{Name: "subdir-b/file-o", Typeflag: tar.TypeReg, Size: 67, Mode: 0o660},
+				{Name: "subdir-c/", Typeflag: tar.TypeDir, Mode: 0o700},
+				{Name: "subdir-c/file-p", Typeflag: tar.TypeReg, Size: 432, Mode: 0o666},
+				{Name: "subdir-c/file-q", Typeflag: tar.TypeReg, Size: 78, Mode: 0o666},
+				{Name: "subdir-d/", Typeflag: tar.TypeDir, Mode: 0o700},
+				{Name: "subdir-d/hlink-0", Typeflag: tar.TypeLink, Linkname: "../file-0", Size: 65537, Mode: 0o600},
+				{Name: "subdir-e/", Typeflag: tar.TypeDir, Mode: 0o700},
+				{Name: "subdir-e/subdir-f/", Typeflag: tar.TypeDir, Mode: 0o700},
+				{Name: "subdir-e/subdir-f/hlink-b", Typeflag: tar.TypeLink, Linkname: "../../file-b", Size: 23, Mode: 0o600},
 			},
 			contents: map[string][]byte{
 				"archive-a": testArchiveSlice,
 			},
 			expectedGetErrors: []expectedError{
 				{inSubdir: true, name: ".", err: syscall.ENOENT},
-				{inSubdir: true, name: "/subdir-b/*", err: syscall.ENOENT},
-				{inSubdir: true, name: "../../subdir-b/*", err: syscall.ENOENT},
+				{inSubdir: true, name: "/subdir-b/*", err: fmt.Errorf("matched nothing")},
+				{inSubdir: true, name: "../../subdir-b/*", err: fmt.Errorf("matched nothing")},
 			},
 			cases: []getTestArchiveCase{
 				{
@@ -948,23 +1716,29 @@ func testGetMultiple(t *testing.T) {
 						"something-a",
 						"archive-a",
 						"non-archive-a",
-						"subdir-a",
+						"subdir-a/",
 						"subdir-a/file-n",
 						"subdir-a/file-o",
 						"subdir-a/file-a",
 						"subdir-a/file-b",
 						"subdir-a/file-c",
-						"subdir-b",
+						"subdir-b/",
 						"subdir-b/file-n",
 						"subdir-b/file-o",
-						"subdir-c",
+						"subdir-c/",
 						"subdir-c/file-p",
 						"subdir-c/file-q",
-						"subdir-d",
+						"subdir-d/",
 						"subdir-d/hlink-0",
-						"subdir-e",
-						"subdir-e/subdir-f",
+						"subdir-e/",
+						"subdir-e/subdir-f/",
 						"subdir-e/subdir-f/hlink-b",
+					},
+					expectedSymlinks: map[string]string{
+						"link-a":          "file-a",
+						"link-c":          "subdir-c",
+						"subdir-a/file-a": "../file-a",
+						"subdir-a/file-b": "../../file-b",
 					},
 				},
 				{
@@ -991,9 +1765,23 @@ func testGetMultiple(t *testing.T) {
 						"file-q",           // from subdir-c
 						"file-q",           // from link-c -> subdir-c
 						"hlink-0",          // from subdir-d
-						"subdir-f",         // from subdir-e
+						"subdir-f/",        // from subdir-e
 						"subdir-f/hlink-b", // from subdir-e
 					},
+					expectedSymlinks: map[string]string{
+						"file-a": "../file-a",
+						"file-b": "../../file-b",
+					},
+				},
+				{
+					name:    "timestamped",
+					pattern: "file*",
+					items: []string{
+						"file-0",
+						"file-a",
+						"file-b",
+					},
+					timestamp: &secondTestDate,
 				},
 				{
 					name:    "dot-with-wildcard-includes-and-excludes",
@@ -1005,17 +1793,20 @@ func testGetMultiple(t *testing.T) {
 						"link-c",
 						"hlink-0",
 						// "subdir-a/file-c", // strings.HasPrefix("**/*-c", "subdir-a/") is false
-						"subdir-b",
+						"subdir-b/",
 						"subdir-b/file-n",
 						"subdir-b/file-o",
-						"subdir-c",
+						"subdir-c/",
 						"subdir-c/file-p",
 						"subdir-c/file-q",
-						"subdir-d",
+						"subdir-d/",
 						"subdir-d/hlink-0",
-						"subdir-e",
-						"subdir-e/subdir-f",
+						"subdir-e/",
+						"subdir-e/subdir-f/",
 						"subdir-e/subdir-f/hlink-b",
+					},
+					expectedSymlinks: map[string]string{
+						"link-c": "subdir-c",
 					},
 				},
 				{
@@ -1034,7 +1825,7 @@ func testGetMultiple(t *testing.T) {
 						"file-q", // from link-c -> subdir-c
 						"hlink-0",
 						"hlink-0",
-						"subdir-f",
+						"subdir-f/",
 						"subdir-f/hlink-b",
 					},
 				},
@@ -1052,23 +1843,29 @@ func testGetMultiple(t *testing.T) {
 						"something-a",
 						"archive-a",
 						"non-archive-a",
-						"subdir-a",
+						"subdir-a/",
 						"subdir-a/file-a",
 						"subdir-a/file-b",
 						"subdir-a/file-c",
 						"subdir-a/file-n",
 						"subdir-a/file-o",
-						"subdir-b",
+						"subdir-b/",
 						"subdir-b/file-n",
 						"subdir-b/file-o",
-						"subdir-c",
+						"subdir-c/",
 						"subdir-c/file-p",
 						"subdir-c/file-q",
-						"subdir-d",
+						"subdir-d/",
 						"subdir-d/hlink-0",
-						"subdir-e",
-						"subdir-e/subdir-f",
+						"subdir-e/",
+						"subdir-e/subdir-f/",
 						"subdir-e/subdir-f/hlink-b",
+					},
+					expectedSymlinks: map[string]string{
+						"link-a":          "file-a",
+						"link-c":          "subdir-c",
+						"subdir-a/file-a": "../file-a",
+						"subdir-a/file-b": "../../file-b",
 					},
 				},
 				{
@@ -1096,8 +1893,12 @@ func testGetMultiple(t *testing.T) {
 						"something-a",
 						"archive-a",
 						"non-archive-a",
-						"subdir-f",
+						"subdir-f/",
 						"subdir-f/hlink-b",
+					},
+					expectedSymlinks: map[string]string{
+						"file-a": "../file-a",
+						"file-b": "../../file-b",
 					},
 				},
 				{
@@ -1119,9 +1920,12 @@ func testGetMultiple(t *testing.T) {
 					items: []string{
 						// "subdir-a/file-c", // strings.HasPrefix("**/*-c", "subdir-a/") is false
 						"link-c",
-						"subdir-c",
+						"subdir-c/",
 						"subdir-c/file-p",
 						"subdir-c/file-q",
+					},
+					expectedSymlinks: map[string]string{
+						"link-c": "subdir-c",
 					},
 				},
 				{
@@ -1147,6 +1951,10 @@ func testGetMultiple(t *testing.T) {
 						"file-a", // from subdir-a
 						"file-b", // from subdir-a
 						"file-c", // from subdir-a
+					},
+					expectedSymlinks: map[string]string{
+						"file-a": "../file-a",
+						"file-b": "../../file-b",
 					},
 				},
 				{
@@ -1227,7 +2035,7 @@ func testGetMultiple(t *testing.T) {
 					name:    "subdirectory",
 					pattern: "subdir-e",
 					items: []string{
-						"subdir-f",
+						"subdir-f/",
 						"subdir-f/hlink-b",
 					},
 				},
@@ -1261,7 +2069,7 @@ func testGetMultiple(t *testing.T) {
 					name:    "subdir-without-name",
 					pattern: "subdir-e",
 					items: []string{
-						"subdir-f",
+						"subdir-f/",
 						"subdir-f/hlink-b",
 					},
 				},
@@ -1270,8 +2078,8 @@ func testGetMultiple(t *testing.T) {
 					pattern:            "subdir-e",
 					keepDirectoryNames: true,
 					items: []string{
-						"subdir-e",
-						"subdir-e/subdir-f",
+						"subdir-e/",
+						"subdir-e/subdir-f/",
 						"subdir-e/subdir-f/hlink-b",
 					},
 				},
@@ -1310,6 +2118,10 @@ func testGetMultiple(t *testing.T) {
 						"file-b",  // from subdir-a
 						"file-c",  // from subdir-a
 					},
+					expectedSymlinks: map[string]string{
+						"file-b":  "../../file-b",
+						"renamed": "../file-a",
+					},
 				},
 				{
 					name:               "wildcard-with-rename-keep",
@@ -1322,12 +2134,16 @@ func testGetMultiple(t *testing.T) {
 						"archive-a",
 						"non-archive-a",
 						"something-a",
-						"subdir-b",
+						"subdir-b/",
 						"subdir-b/file-n",
 						"subdir-b/file-o",
 						"subdir-b/file-a",
 						"subdir-b/file-b",
 						"subdir-b/file-c",
+					},
+					expectedSymlinks: map[string]string{
+						"subdir-b/file-a": "../file-a",
+						"subdir-b/file-b": "../../file-b",
 					},
 				},
 				{
@@ -1346,6 +2162,11 @@ func testGetMultiple(t *testing.T) {
 						"file-b", // from subdir-a
 						"file-c", // from subdir-a
 					},
+					expectedSymlinks: map[string]string{
+						"file-a": "../file-a",
+						"file-b": "../../file-b",
+						"link-a": "file-a",
+					},
 				},
 				{
 					name:            "no-deref-symlinks-directory",
@@ -1353,6 +2174,9 @@ func testGetMultiple(t *testing.T) {
 					noDerefSymlinks: true,
 					items: []string{
 						"link-c",
+					},
+					expectedSymlinks: map[string]string{
+						"link-c": "subdir-c",
 					},
 				},
 				{
@@ -1362,6 +2186,132 @@ func testGetMultiple(t *testing.T) {
 					items: []string{
 						"file-p", // from link-c -> subdir-c
 						"file-q", // from link-c -> subdir-c
+					},
+				},
+				{
+					name:    "wildcard and parents",
+					pattern: "*",
+					parents: true,
+					items: []string{
+						"file-0",
+						"file-a",
+						"file-b",
+						"link-a",
+						"hlink-0",
+						"something-a",
+						"archive-a",
+						"non-archive-a",
+						"subdir-a/",
+						"subdir-b/",
+						"subdir-c/",
+						"subdir-d/",
+						"subdir-e/",
+						"subdir-a/file-n",
+						"subdir-a/file-o",
+						"subdir-a/file-a",
+						"subdir-a/file-b",
+						"subdir-a/file-c",
+						"subdir-b/file-n",
+						"subdir-b/file-o",
+						"subdir-c/file-p",
+						"subdir-c/file-p",
+						"subdir-c/file-q",
+						"subdir-c/file-q",
+						"subdir-d/hlink-0",
+						"subdir-e/subdir-f/",
+						"subdir-e/subdir-f/hlink-b",
+					},
+					expectedSymlinks: map[string]string{
+						"subdir-a/file-a": "../file-a",
+						"subdir-a/file-b": "../../file-b",
+					},
+				},
+				{
+					name:    "everything-with-wildcard-includes-and-excludes-parents",
+					pattern: "*",
+					parents: true,
+					exclude: []string{"**/*-a", "!**/*-c"},
+					items: []string{
+						"file-0",
+						"file-b",
+						"subdir-a/",
+						"subdir-b/",
+						"subdir-c/",
+						"subdir-d/",
+						"subdir-e/",
+						"subdir-a/file-c",
+						"subdir-b/file-n",
+						"subdir-b/file-o",
+						"subdir-c/file-p",
+						"subdir-c/file-p",
+						"subdir-c/file-q",
+						"subdir-c/file-q",
+						"hlink-0",
+						"subdir-d/hlink-0",
+						"subdir-e/subdir-f/",
+						"subdir-e/subdir-f/hlink-b",
+					},
+				},
+				{
+					name:    "file-and-dir-wildcard-parents",
+					pattern: "*-a",
+					parents: true,
+					items: []string{
+						"file-a",
+						"link-a",
+						"something-a",
+						"archive-a",
+						"non-archive-a",
+						"subdir-a/",
+						"subdir-a/file-n",
+						"subdir-a/file-o",
+						"subdir-a/file-a",
+						"subdir-a/file-b",
+						"subdir-a/file-c",
+					},
+					expectedSymlinks: map[string]string{
+						"subdir-a/file-a": "../file-a",
+						"subdir-a/file-b": "../../file-b",
+					},
+				},
+				{
+					name:    "root-wildcard-parents",
+					pattern: "/subdir-b/*",
+					parents: true,
+					items: []string{
+						"subdir-b/",
+						"subdir-b/file-n",
+						"subdir-b/file-o",
+					},
+				},
+				{
+					name:    "dotdot-wildcard-parents",
+					pattern: "../../subdir-b/*",
+					parents: true,
+					items: []string{
+						"subdir-b/",
+						"subdir-b/file-n",
+						"subdir-b/file-o",
+					},
+				},
+				{
+					name:    "dir-with-parents",
+					pattern: "subdir-e/subdir-f/",
+					parents: true,
+					items: []string{
+						"subdir-e/",
+						"subdir-e/subdir-f/",
+						"subdir-e/subdir-f/hlink-b",
+					},
+				},
+				{
+					name:    "hlink-with-parents",
+					pattern: "subdir-e/subdir-f/hlink-b",
+					parents: true,
+					items: []string{
+						"subdir-e/",
+						"subdir-e/subdir-f/",
+						"subdir-e/subdir-f/hlink-b",
 					},
 				},
 			},
@@ -1399,12 +2349,18 @@ func testGetMultiple(t *testing.T) {
 					KeepDirectoryNames: testCase.keepDirectoryNames,
 					Rename:             testCase.renames,
 					NoDerefSymlinks:    testCase.noDerefSymlinks,
+					Parents:            testCase.parents,
+					Timestamp:          testCase.timestamp,
 				}
 
 				t.Run(fmt.Sprintf("topdir=%s,archive=%s,case=%s,pattern=%s", topdir, testArchive.name, testCase.name, testCase.pattern), func(t *testing.T) {
 					// ensure that we can get stuff using this spec
-					err := Get(root, topdir, getOptions, []string{testCase.pattern}, io.Discard)
+					err := GetContext(ctx, root, topdir, getOptions, []string{testCase.pattern}, io.Discard)
 					if err != nil && isExpectedError(err, topdir != "" && topdir != ".", testCase.pattern, testArchive.expectedGetErrors) {
+						return
+					}
+					if expectedGetError != nil {
+						require.ErrorContains(t, err, expectedGetError.Error())
 						return
 					}
 					require.NoErrorf(t, err, "error getting %q under %q", testCase.pattern, filepath.Join(root, topdir))
@@ -1412,20 +2368,39 @@ func testGetMultiple(t *testing.T) {
 					pipeReader, pipeWriter := io.Pipe()
 					var getErr error
 					var wg sync.WaitGroup
-					wg.Add(1)
-					go func() {
-						getErr = Get(root, topdir, getOptions, []string{testCase.pattern}, pipeWriter)
+					wg.Go(func() {
+						getErr = GetContext(ctx, root, topdir, getOptions, []string{testCase.pattern}, pipeWriter)
 						pipeWriter.Close()
-						wg.Done()
-					}()
+					})
 					tr := tar.NewReader(pipeReader)
 					hdr, err := tr.Next()
 					actualContents := []string{}
-					for err == nil {
+					foundSymlinks := make(map[string]string)
+
+					for hdr != nil {
 						actualContents = append(actualContents, filepath.FromSlash(hdr.Name))
+						assert.Equal(t, "", hdr.Uname, "expected user name field to be cleared")
+						assert.Equal(t, "", hdr.Gname, "expected group name field to be cleared")
+						if testCase.timestamp != nil {
+							assert.Truef(t, testCase.timestamp.Equal(hdr.ModTime), "timestamp was supposed to be forced for %q", hdr.Name)
+						}
+
+						if hdr.Typeflag == byte(tar.TypeSymlink) {
+							foundSymlinks[hdr.Name] = hdr.Linkname
+						}
+
+						if err != nil {
+							break
+						}
 						hdr, err = tr.Next()
 					}
 					pipeReader.Close()
+					wg.Wait()
+					if expectedGetError != nil {
+						require.ErrorContains(t, getErr, expectedGetError.Error())
+						require.ErrorIs(t, err, io.ErrUnexpectedEOF)
+						return
+					}
 					sort.Strings(actualContents)
 					// compare it to what we were supposed to get
 					expectedContents := make([]string, 0, len(testCase.items))
@@ -1433,17 +2408,22 @@ func testGetMultiple(t *testing.T) {
 						expectedContents = append(expectedContents, filepath.FromSlash(item))
 					}
 					sort.Strings(expectedContents)
-					assert.Equal(t, io.EOF.Error(), err.Error(), "expected EOF at end of archive, got %q", err.Error())
-					wg.Wait()
+					assert.ErrorIs(t, err, io.EOF, "expected EOF at end of archive")
 					assert.NoErrorf(t, getErr, "unexpected error from Get(%q)", testCase.pattern)
-					assert.Equal(t, expectedContents, actualContents, "Get(%q,excludes=%v) didn't produce the right set of items", testCase.pattern, excludes)
+					assert.Equalf(t, expectedContents, actualContents, "Get(%q,excludes=%v) didn't produce the right set of items", testCase.pattern, excludes)
+
+					expectedSymlinks := testCase.expectedSymlinks
+					if expectedSymlinks == nil {
+						expectedSymlinks = make(map[string]string)
+					}
+					assert.Equal(t, expectedSymlinks, foundSymlinks)
 				})
 			}
 		}
 	}
 }
 
-func TestEvalNoChroot(t *testing.T) {
+func TestEvalNoChrootNoCancel(t *testing.T) {
 	couldChroot := canChroot
 	canChroot = false
 	testEval(t)
@@ -1490,14 +2470,14 @@ func testEval(t *testing.T) {
 				err = os.Symlink(vector.linkTarget, linkname)
 			}
 			require.NoErrorf(t, err, "error creating link from %q to %q", linkname, vector.linkTarget)
-			evaluated, err := Eval(tmp, filepath.Join(tmp, vector.inputPath), options)
+			evaluated, err := EvalContext(t.Context(), tmp, filepath.Join(tmp, vector.inputPath), options)
 			require.NoErrorf(t, err, "error evaluating %q: %v", vector.inputPath, err)
 			require.Equalf(t, filepath.Join(tmp, vector.evaluatedPath), evaluated, "evaluation of %q with %q pointing to %q failed", vector.inputPath, linkname, vector.linkTarget)
 		})
 	}
 }
 
-func TestMkdirNoChroot(t *testing.T) {
+func TestMkdirNoChrootNoCancel(t *testing.T) {
 	couldChroot := canChroot
 	canChroot = false
 	testMkdir(t)
@@ -1506,9 +2486,11 @@ func TestMkdirNoChroot(t *testing.T) {
 
 func testMkdir(t *testing.T) {
 	type testCase struct {
-		name   string
-		create string
-		expect []string
+		name        string
+		create      string
+		makeParents types.OptionalBool
+		fail        bool
+		expect      []string
 	}
 	testArchives := []struct {
 		name      string
@@ -1518,9 +2500,9 @@ func testMkdir(t *testing.T) {
 		{
 			name: "regular",
 			headers: []tar.Header{
-				{Name: "subdir-a", Typeflag: tar.TypeDir, Mode: 0755, ModTime: testDate},
-				{Name: "subdir-a/subdir-b", Typeflag: tar.TypeDir, Mode: 0755, ModTime: testDate},
-				{Name: "subdir-a/subdir-b/subdir-c", Typeflag: tar.TypeDir, Mode: 0755, ModTime: testDate},
+				{Name: "subdir-a", Typeflag: tar.TypeDir, Mode: 0o755, ModTime: testDate},
+				{Name: "subdir-a/subdir-b", Typeflag: tar.TypeDir, Mode: 0o755, ModTime: testDate},
+				{Name: "subdir-a/subdir-b/subdir-c", Typeflag: tar.TypeDir, Mode: 0o755, ModTime: testDate},
 				{Name: "subdir-a/subdir-b/dangle1", Typeflag: tar.TypeSymlink, Linkname: "dangle1-target", ModTime: testDate},
 				{Name: "subdir-a/subdir-b/dangle2", Typeflag: tar.TypeSymlink, Linkname: "../dangle2-target", ModTime: testDate},
 				{Name: "subdir-a/subdir-b/dangle3", Typeflag: tar.TypeSymlink, Linkname: "../../dangle3-target", ModTime: testDate},
@@ -1595,6 +2577,35 @@ func testMkdir(t *testing.T) {
 					create: "/../intermediate/../final",
 					expect: []string{"final"},
 				},
+				{
+					name:        "basic-no-make-parents",
+					create:      "subdir-d",
+					makeParents: types.OptionalBoolFalse,
+					expect:      []string{"subdir-d"},
+				},
+				{
+					name:        "subdir-no-make-parents",
+					create:      "subdir-d/subdir-e/subdir-f",
+					makeParents: types.OptionalBoolFalse,
+					fail:        true,
+				},
+				{
+					name:        "subdir-make-parents-true",
+					create:      "subdir-d/subdir-e/subdir-f",
+					makeParents: types.OptionalBoolTrue,
+					expect:      []string{"subdir-d", "subdir-d/subdir-e", "subdir-d/subdir-e/subdir-f"},
+				},
+				{
+					name:        "nested-no-make-parents-parents-exist",
+					create:      "subdir-a/subdir-b/subdir-d",
+					makeParents: types.OptionalBoolFalse,
+					expect:      []string{"subdir-a/subdir-b/subdir-d"},
+				},
+				{
+					name:        "existing-no-make-parents",
+					create:      "subdir-a",
+					makeParents: types.OptionalBoolFalse,
+				},
 			},
 		},
 	}
@@ -1605,9 +2616,12 @@ func testMkdir(t *testing.T) {
 					dir, err := makeContextFromArchive(t, makeArchive(testArchives[i].headers, nil), "")
 					require.NoErrorf(t, err, "error creating context from archive %q, topdir=%q", testArchives[i].name, "")
 					root := dir
-					options := MkdirOptions{ChownNew: &idtools.IDPair{UID: os.Getuid(), GID: os.Getgid()}}
+					options := MkdirOptions{
+						ChownNew:    &idtools.IDPair{UID: os.Getuid(), GID: os.Getgid()},
+						MakeParents: testCase.makeParents,
+					}
 					var beforeNames, afterNames []string
-					err = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+					err = filepath.WalkDir(dir, func(path string, _ fs.DirEntry, err error) error {
 						if err != nil {
 							return err
 						}
@@ -1619,9 +2633,13 @@ func testMkdir(t *testing.T) {
 						return nil
 					})
 					require.NoErrorf(t, err, "error walking directory to catalog pre-Mkdir contents: %v", err)
-					err = Mkdir(root, testCase.create, options)
+					err = MkdirContext(t.Context(), root, testCase.create, options)
+					if testCase.fail {
+						require.Errorf(t, err, "expected error creating directory %q under %q with Mkdir", testCase.create, root)
+						return
+					}
 					require.NoErrorf(t, err, "error creating directory %q under %q with Mkdir: %v", testCase.create, root, err)
-					err = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+					err = filepath.WalkDir(dir, func(path string, _ fs.DirEntry, err error) error {
 						if err != nil {
 							return err
 						}
@@ -1633,7 +2651,7 @@ func testMkdir(t *testing.T) {
 						return nil
 					})
 					require.NoErrorf(t, err, "error walking directory to catalog post-Mkdir contents: %v", err)
-					expected := append([]string{}, beforeNames...)
+					expected := slices.Clone(beforeNames)
 					for _, expect := range testCase.expect {
 						expected = append(expected, filepath.FromSlash(expect))
 					}
@@ -1646,7 +2664,124 @@ func testMkdir(t *testing.T) {
 	}
 }
 
-func TestCleanerSubdirectory(t *testing.T) {
+func TestMkfileNoChrootNoCancel(t *testing.T) {
+	couldChroot := canChroot
+	canChroot = false
+	testMkfile(t)
+	canChroot = couldChroot
+}
+
+func testMkfile(t *testing.T) {
+	currentOwner := &idtools.IDPair{UID: os.Getuid(), GID: os.Getgid()}
+	mkfileOpts := func(chmod *os.FileMode, modTime *time.Time) MkfileOptions {
+		return MkfileOptions{
+			ModTimeNew: modTime,
+			ChownNew:   currentOwner,
+			ChmodNew:   chmod,
+		}
+	}
+
+	t.Run("basic", func(t *testing.T) {
+		root := t.TempDir()
+		content := []byte("hello world")
+		err := Mkfile(root, "newfile", mkfileOpts(nil, nil), content)
+		require.NoError(t, err)
+
+		got, err := os.ReadFile(filepath.Join(root, "newfile"))
+		require.NoError(t, err)
+		assert.Equal(t, content, got)
+
+		info, err := os.Stat(filepath.Join(root, "newfile"))
+		require.NoError(t, err)
+		assert.Equal(t, os.FileMode(0o644), info.Mode().Perm(), "default permissions should be 0644")
+	})
+
+	t.Run("empty-content", func(t *testing.T) {
+		root := t.TempDir()
+		err := Mkfile(root, "emptyfile", mkfileOpts(nil, nil), []byte{})
+		require.NoError(t, err)
+
+		got, err := os.ReadFile(filepath.Join(root, "emptyfile"))
+		require.NoError(t, err)
+		assert.Empty(t, got)
+	})
+
+	t.Run("with-permissions", func(t *testing.T) {
+		root := t.TempDir()
+		mode := os.FileMode(0o600)
+		err := Mkfile(root, "secret", mkfileOpts(&mode, nil), []byte("secret"))
+		require.NoError(t, err)
+
+		info, err := os.Stat(filepath.Join(root, "secret"))
+		require.NoError(t, err)
+		assert.Equal(t, mode, info.Mode().Perm())
+	})
+
+	t.Run("with-timestamp", func(t *testing.T) {
+		root := t.TempDir()
+		err := Mkfile(root, "dated", mkfileOpts(nil, &testDate), []byte("dated"))
+		require.NoError(t, err)
+
+		info, err := os.Stat(filepath.Join(root, "dated"))
+		require.NoError(t, err)
+		assert.Equal(t, testDate.Unix(), info.ModTime().Unix())
+	})
+
+	t.Run("nested-path", func(t *testing.T) {
+		archive := makeArchive([]tar.Header{
+			{Name: "subdir-a", Typeflag: tar.TypeDir, Mode: 0o755, ModTime: testDate},
+			{Name: "subdir-a/subdir-b", Typeflag: tar.TypeDir, Mode: 0o755, ModTime: testDate},
+		}, nil)
+		root, err := makeContextFromArchive(t, archive, "")
+		require.NoError(t, err)
+
+		content := []byte("very deep content")
+		err = Mkfile(root, "subdir-a/subdir-b/deepfile", mkfileOpts(nil, nil), content)
+		require.NoError(t, err)
+
+		got, err := os.ReadFile(filepath.Join(root, "subdir-a", "subdir-b", "deepfile"))
+		require.NoError(t, err)
+		assert.Equal(t, content, got)
+	})
+
+	t.Run("path-traversal", func(t *testing.T) {
+		root := t.TempDir()
+		content := []byte("should be contained")
+		err := Mkfile(root, "../../escaped", mkfileOpts(nil, nil), content)
+		require.NoError(t, err)
+
+		got, err := os.ReadFile(filepath.Join(root, "escaped"))
+		require.NoError(t, err)
+		assert.Equal(t, content, got)
+	})
+
+	t.Run("absolute-path", func(t *testing.T) {
+		root := t.TempDir()
+		content := []byte("absolute")
+		err := Mkfile(root, "/absolutefile", mkfileOpts(nil, nil), content)
+		require.NoError(t, err)
+
+		got, err := os.ReadFile(filepath.Join(root, "absolutefile"))
+		require.NoError(t, err)
+		assert.Equal(t, content, got)
+	})
+
+	t.Run("overwrite", func(t *testing.T) {
+		root := t.TempDir()
+		err := Mkfile(root, "target", mkfileOpts(nil, nil), []byte("original"))
+		require.NoError(t, err)
+
+		replacement := []byte("replacement")
+		err = Mkfile(root, "target", mkfileOpts(nil, nil), replacement)
+		require.NoError(t, err)
+
+		got, err := os.ReadFile(filepath.Join(root, "target"))
+		require.NoError(t, err)
+		assert.Equal(t, replacement, got)
+	})
+}
+
+func TestCleanerReldirectory(t *testing.T) {
 	testCases := [][2]string{
 		{".", "."},
 		{"..", "."},
@@ -1661,9 +2796,164 @@ func TestCleanerSubdirectory(t *testing.T) {
 	for _, testCase := range testCases {
 		t.Run(testCase[0], func(t *testing.T) {
 			cleaner := cleanerReldirectory(filepath.FromSlash(testCase[0]))
-			assert.Equal(t, testCase[1], filepath.ToSlash(cleaner), "expected to get %q, got %q", testCase[1], cleaner)
+			assert.Equalf(t, testCase[1], filepath.ToSlash(cleaner), "expected to get %q, got %q", testCase[1], cleaner)
 		})
 	}
+}
+
+func TestConvertToRelSubdirectory(t *testing.T) {
+	testCases := []struct{ dir, expected string }{
+		{"/root", "."},
+		{"/root/.", "."},
+		{"/root/sub", "sub"},
+		{"/root/sub/..", "."},
+		// Attempts to escape are silently clamped to root-relative paths
+		{"/", "."},
+		{"/root/..", "."},
+		{"/root/sub/../..", "."},
+		{"/no-root", "no-root"},
+		{"/no-root/sub", "no-root/sub"},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.dir, func(t *testing.T) {
+			rel, err := convertToRelSubdirectory("/root", testCase.dir)
+			require.NoError(t, err)
+			assert.Equal(t, testCase.expected, rel)
+		})
+	}
+}
+
+func TestResolvePath(t *testing.T) {
+	type c struct {
+		in       string
+		final    *bool
+		expected string
+	}
+	falseV := false // Replace this with Go 1.26’s new(false) / new(true)
+	trueV := true
+	for _, tc := range []struct {
+		dirs     []string
+		symlinks map[string]string
+		regular  []string
+		cases    []c
+	}{
+		{
+			dirs:     []string{"a"},
+			symlinks: map[string]string{},
+			regular:  []string{"a/b"},
+			cases: []c{
+				{"a/b", nil, "/a/b"},             // Ordinary existing file
+				{"a/missing", nil, "/a/missing"}, // Ordinary missing file
+				{"a/b", nil, "/a/b"},             // Ordinary existing file
+				{"a/missing", nil, "/a/missing"}, // Ordinary missing file
+			},
+		},
+		{ // "", "." and "..""
+			dirs: []string{"dir"},
+			cases: []c{
+				{"", nil, ""},
+				{"dir/", nil, "/dir"},
+				{"./dir", nil, "/dir"},
+				{"dir/.", nil, "/dir"},
+				{"dir/./missing", nil, "/dir/missing"},
+				{"dir/missing/.", nil, "/dir/missing"},
+				{"dir/..", nil, ""},
+				{"dir/../missing", nil, "/missing"},
+				{"dir/missing/..", nil, "/dir"},
+			},
+		},
+		{ // Escapes without symlinks
+			dirs: []string{"dir"},
+			cases: []c{
+				{"..", nil, ""},
+				{"dir/../..", nil, ""},
+				{"missing/../..", nil, ""},
+				{"../a", nil, "/a"},
+				{"dir/../../a", nil, "/a"},
+				{"missing/../../a", nil, "/a"},
+			},
+		},
+		{ // Non-final symlink
+			dirs: []string{"dir"},
+			symlinks: map[string]string{
+				"root-relative": "../..",
+				"root-absolute": "/etc",
+				"dir/relative":  "../..",
+				"dir/absolute":  "/etc",
+			},
+			cases: []c{
+				{"root-relative/a", nil, "/a"},
+				{"root-absolute/a", nil, "/etc/a"},
+				{"dir/relative/a", nil, "/a"},
+				{"dir/absolute/a", nil, "/etc/a"},
+			},
+		},
+		{ // Final symlink
+			dirs: []string{"dir"},
+			symlinks: map[string]string{
+				"root-relative": "../..",
+				"root-absolute": "/etc",
+				"dir/relative":  "../..",
+				"dir/absolute":  "/etc",
+			},
+			cases: []c{
+				{"root-relative", &falseV, "/root-relative"},
+				{"root-relative", &trueV, ""},
+				{"root-absolute", &falseV, "/root-absolute"},
+				{"root-absolute", &trueV, "/etc"},
+				{"dir/relative", &falseV, "/dir/relative"},
+				{"dir/relative", &trueV, ""},
+				{"dir/absolute", &falseV, "/dir/absolute"},
+				{"dir/absolute", &trueV, "/etc"},
+			},
+		},
+	} {
+		t.Run("", func(t *testing.T) {
+			root := t.TempDir()
+			for _, dir := range tc.dirs {
+				err := os.Mkdir(filepath.Join(root, filepath.FromSlash(dir)), 0o755)
+				require.NoError(t, err)
+			}
+			for link, target := range tc.symlinks {
+				err := os.Symlink(filepath.FromSlash(target), filepath.Join(root, filepath.FromSlash(link)))
+				require.NoError(t, err)
+			}
+			for _, file := range tc.regular {
+				err := os.WriteFile(filepath.Join(root, filepath.FromSlash(file)), []byte("content"), 0o644)
+				require.NoError(t, err)
+			}
+			for _, c := range tc.cases {
+				var finals []bool
+				if c.final != nil {
+					finals = []bool{*c.final}
+				} else {
+					finals = []bool{false, true}
+				}
+				for _, final := range finals {
+					// Not filepath.Join(root, filepath.FromSlash(c.in)) because that does filepath.Clean() and we want to test inputs with ".."
+					input := root + string(os.PathSeparator) + filepath.FromSlash(c.in)
+					res, err := resolvePath(root, input, final)
+					require.NoError(t, err)
+					assert.Equal(t, root+filepath.FromSlash(c.expected), res, fmt.Sprintf("input=%q, final=%v", input, final))
+				}
+			}
+		})
+	}
+
+	// The condition for refusing workingPath becoming root/.. also handles non-canonical root inputs
+	t.Run("noncanonical-root", func(t *testing.T) {
+		root := t.TempDir()
+		// We can’t use just resolvePath(root/, root/..), because convertToRelSubdirectory() turns the ".." into "." before starting to
+		// really process the input.
+		// A symlink allows avoiding that.
+		err := os.Symlink("/../../..", filepath.Join(root, "link"))
+		require.NoError(t, err)
+		for _, suffix := range []string{"/", "/.", "/./"} {
+			res, err := resolvePath(root+filepath.FromSlash(suffix), filepath.Join(root, "link"), true)
+			require.NoError(t, err)
+			assert.Equal(t, root, filepath.Clean(res))
+		}
+	})
 }
 
 func TestHandleRename(t *testing.T) {
@@ -1685,12 +2975,12 @@ func TestHandleRename(t *testing.T) {
 	for i, testCase := range testCases {
 		t.Run(strconv.Itoa(i), func(t *testing.T) {
 			renamed := handleRename(renames, testCase[0])
-			assert.Equal(t, testCase[1], renamed, "expected to get %q, got %q", testCase[1], renamed)
+			assert.Equalf(t, testCase[1], renamed, "expected to get %q, got %q", testCase[1], renamed)
 		})
 	}
 }
 
-func TestRemoveNoChroot(t *testing.T) {
+func TestRemoveNoChrootNoCancel(t *testing.T) {
 	couldChroot := canChroot
 	canChroot = false
 	testRemove(t)
@@ -1699,11 +2989,13 @@ func TestRemoveNoChroot(t *testing.T) {
 
 func testRemove(t *testing.T) {
 	type testCase struct {
-		name    string
-		remove  string
-		all     bool
-		fail    bool
-		removed []string
+		name          string
+		remove        string
+		all           bool
+		allowNotFound bool
+		allowWildcard bool
+		fail          bool
+		removed       []string
 	}
 	testArchives := []struct {
 		name      string
@@ -1713,17 +3005,17 @@ func testRemove(t *testing.T) {
 		{
 			name: "regular",
 			headers: []tar.Header{
-				{Name: "subdir-a", Typeflag: tar.TypeDir, Mode: 0755, ModTime: testDate},
-				{Name: "subdir-a/file-a", Typeflag: tar.TypeReg, Mode: 0755, ModTime: testDate},
-				{Name: "subdir-a/file-b", Typeflag: tar.TypeReg, Mode: 0755, ModTime: testDate},
-				{Name: "subdir-a/subdir-b", Typeflag: tar.TypeDir, Mode: 0755, ModTime: testDate},
-				{Name: "subdir-a/subdir-b/subdir-c", Typeflag: tar.TypeDir, Mode: 0755, ModTime: testDate},
+				{Name: "subdir-a", Typeflag: tar.TypeDir, Mode: 0o755, ModTime: testDate},
+				{Name: "subdir-a/file-a", Typeflag: tar.TypeReg, Mode: 0o755, ModTime: testDate},
+				{Name: "subdir-a/file-b", Typeflag: tar.TypeReg, Mode: 0o755, ModTime: testDate},
+				{Name: "subdir-a/subdir-b", Typeflag: tar.TypeDir, Mode: 0o755, ModTime: testDate},
+				{Name: "subdir-a/subdir-b/subdir-c", Typeflag: tar.TypeDir, Mode: 0o755, ModTime: testDate},
 				{Name: "subdir-a/subdir-b/subdir-c/parent", Typeflag: tar.TypeSymlink, Linkname: "..", ModTime: testDate},
 				{Name: "subdir-a/subdir-b/subdir-c/link-b", Typeflag: tar.TypeSymlink, Linkname: "../../file-b", ModTime: testDate},
 				{Name: "subdir-a/subdir-b/subdir-c/root", Typeflag: tar.TypeSymlink, Linkname: "/", ModTime: testDate},
-				{Name: "subdir-a/subdir-d", Typeflag: tar.TypeDir, Mode: 0755, ModTime: testDate},
-				{Name: "subdir-a/subdir-e", Typeflag: tar.TypeDir, Mode: 0755, ModTime: testDate},
-				{Name: "subdir-a/subdir-e/subdir-f", Typeflag: tar.TypeDir, Mode: 0755, ModTime: testDate},
+				{Name: "subdir-a/subdir-d", Typeflag: tar.TypeDir, Mode: 0o755, ModTime: testDate},
+				{Name: "subdir-a/subdir-e", Typeflag: tar.TypeDir, Mode: 0o755, ModTime: testDate},
+				{Name: "subdir-a/subdir-e/subdir-f", Typeflag: tar.TypeDir, Mode: 0o755, ModTime: testDate},
 			},
 			testCases: []testCase{
 				{
@@ -1732,16 +3024,49 @@ func testRemove(t *testing.T) {
 					removed: []string{"subdir-a/file-a"},
 				},
 				{
+					name:          "file-allow-not-found",
+					remove:        "subdir-a/file-a",
+					allowNotFound: true,
+					removed:       []string{"subdir-a/file-a"},
+				},
+				{
 					name:    "file-all",
 					remove:  "subdir-a/file-a",
 					all:     true,
 					removed: []string{"subdir-a/file-a"},
 				},
 				{
+					name:   "missing-file",
+					remove: "subdir-a/file-missing",
+					fail:   true,
+				},
+				{
+					name:          "missing-file-allow-not-found",
+					remove:        "subdir-a/file-missing",
+					allowNotFound: true,
+				},
+				{
+					name:   "missing-file-all",
+					remove: "subdir-a/file-missing",
+					all:    true,
+				},
+				{
+					name:          "missing-directory-allow-not-found",
+					remove:        "subdir-a/subdir-missing",
+					allowNotFound: true,
+				},
+				{
 					name:   "subdir",
 					remove: "subdir-a/subdir-b",
 					all:    false,
 					fail:   true,
+				},
+				{
+					name:          "subdir-allow-not-found",
+					remove:        "subdir-a/subdir-b",
+					allowNotFound: true,
+					all:           false,
+					fail:          true,
 				},
 				{
 					name:   "subdir-all",
@@ -1810,6 +3135,73 @@ func testRemove(t *testing.T) {
 					all:     true,
 					removed: []string{"subdir-a/subdir-e", "subdir-a/subdir-e/subdir-f"},
 				},
+				{
+					name:          "wildcard-files",
+					remove:        "subdir-a/file-*",
+					allowWildcard: true,
+					removed:       []string{"subdir-a/file-a", "subdir-a/file-b"},
+				},
+				{
+					name:          "wildcard-all-in-dir",
+					remove:        "subdir-a/subdir-b/*",
+					allowWildcard: true,
+					all:           true,
+					removed: []string{
+						"subdir-a/subdir-b/subdir-c",
+						"subdir-a/subdir-b/subdir-c/parent",
+						"subdir-a/subdir-b/subdir-c/link-b",
+						"subdir-a/subdir-b/subdir-c/root",
+					},
+				},
+				{
+					name:          "wildcard-no-match",
+					remove:        "subdir-a/nonexistent-*",
+					allowWildcard: true,
+				},
+				{
+					name:          "wildcard-allow-not-found",
+					remove:        "subdir-a/file-*",
+					allowWildcard: true,
+					allowNotFound: true,
+					removed:       []string{"subdir-a/file-a", "subdir-a/file-b"},
+				},
+				{
+					name:          "wildcard-dir-without-all",
+					remove:        "subdir-a/subdir-*",
+					allowWildcard: true,
+					all:           false,
+					fail:          true,
+				},
+				{
+					name:          "wildcard-empty-dir",
+					remove:        "subdir-a/subdir-d",
+					allowWildcard: true,
+					all:           false,
+					removed:       []string{"subdir-a/subdir-d"},
+				},
+				{
+					name:          "wildcard-literal-path",
+					remove:        "subdir-a/file-a",
+					allowWildcard: true,
+					removed:       []string{"subdir-a/file-a"},
+				},
+				{
+					name:          "wildcard-literal-missing",
+					remove:        "subdir-a/file-nonexistent",
+					allowWildcard: true,
+				},
+				{
+					name:          "wildcard-char-class",
+					remove:        "subdir-a/file-[ab]",
+					allowWildcard: true,
+					removed:       []string{"subdir-a/file-a", "subdir-a/file-b"},
+				},
+				{
+					name:          "wildcard-question-mark",
+					remove:        "subdir-a/file-?",
+					allowWildcard: true,
+					removed:       []string{"subdir-a/file-a", "subdir-a/file-b"},
+				},
 			},
 		},
 	}
@@ -1820,9 +3212,9 @@ func testRemove(t *testing.T) {
 					dir, err := makeContextFromArchive(t, makeArchive(testArchives[i].headers, nil), "")
 					require.NoErrorf(t, err, "error creating context from archive %q, topdir=%q", testArchives[i].name, "")
 					root := dir
-					options := RemoveOptions{All: testCase.all}
+					options := RemoveOptions{All: testCase.all, AllowNotFound: testCase.allowNotFound, AllowWildcard: testCase.allowWildcard}
 					beforeNames := make(map[string]struct{})
-					err = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+					err = filepath.WalkDir(dir, func(path string, _ fs.DirEntry, err error) error {
 						if err != nil {
 							return err
 						}
@@ -1834,14 +3226,14 @@ func testRemove(t *testing.T) {
 						return nil
 					})
 					require.NoErrorf(t, err, "error walking directory to catalog pre-Remove contents: %v", err)
-					err = Remove(root, testCase.remove, options)
+					err = RemoveContext(t.Context(), root, testCase.remove, options)
 					if testCase.fail {
 						require.Errorf(t, err, "did not expect to succeed removing item %q under %q with Remove", testCase.remove, root)
 						return
 					}
 					require.NoErrorf(t, err, "error removing item %q under %q with Remove: %v", testCase.remove, root, err)
 					afterNames := make(map[string]struct{})
-					err = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+					err = filepath.WalkDir(dir, func(path string, _ fs.DirEntry, err error) error {
 						if err != nil {
 							return err
 						}
@@ -1870,4 +3262,1338 @@ func testRemove(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestExtendedGlob(t *testing.T) {
+	tmpdir := t.TempDir()
+	buf := []byte("buffer")
+	var expected1, expected2 []string
+	require.NoError(t, os.Mkdir(filepath.Join(tmpdir, "a"), 0o700))
+	require.NoError(t, os.Mkdir(filepath.Join(tmpdir, "a", "b"), 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(tmpdir, "a", "b", "a.dat"), buf, 0o600))
+	expected1 = append(expected1, filepath.Join(tmpdir, "a", "b", "a.dat"))
+	require.NoError(t, os.Mkdir(filepath.Join(tmpdir, "b"), 0o700))
+	require.NoError(t, os.Mkdir(filepath.Join(tmpdir, "b", "c"), 0o700))
+	require.NoError(t, os.Mkdir(filepath.Join(tmpdir, "c"), 0o700))
+	require.NoError(t, os.Mkdir(filepath.Join(tmpdir, "c", "d"), 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(tmpdir, "c", "d", "c.dat"), buf, 0o600))
+	expected1 = append(expected1, filepath.Join(tmpdir, "c", "d", "c.dat"))
+	expected2 = append(expected2, filepath.Join(tmpdir, "c", "d", "c.dat"))
+	require.NoError(t, os.Mkdir(filepath.Join(tmpdir, "d"), 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(tmpdir, "d", "d.dat"), buf, 0o600))
+	expected1 = append(expected1, filepath.Join(tmpdir, "d", "d.dat"))
+	expected2 = append(expected2, filepath.Join(tmpdir, "d", "d.dat"))
+	matched, err := extendedGlob(filepath.Join(tmpdir, "**", "*.dat"))
+	require.NoError(t, err, "globbing")
+	require.ElementsMatch(t, expected1, matched, "**/*.dat")
+	matched, err = extendedGlob(filepath.Join(tmpdir, "**", "d", "*.dat"))
+	require.NoError(t, err, "globbing")
+	require.ElementsMatch(t, expected2, matched, "**/d/*.dat")
+	matched, err = extendedGlob(filepath.Join(tmpdir, "**", "**", "d", "*.dat"))
+	require.NoError(t, err, "globbing")
+	require.ElementsMatch(t, expected2, matched, "**/**/d/*.dat")
+	matched, err = extendedGlob(filepath.Join(tmpdir, "**", "d", "**", "*.dat"))
+	require.NoError(t, err, "globbing")
+	require.ElementsMatch(t, expected2, matched, "**/d/**/*.dat")
+}
+
+func testEnsure(t *testing.T) {
+	zero := time.Unix(0, 0)
+	worldReadable := os.FileMode(0o644)
+	ugReadable := os.FileMode(0o750)
+
+	testCases := []struct {
+		description           string
+		subdir                string
+		mkdirs                []string
+		symlinks              map[string]string
+		options               EnsureOptions
+		expectCreated         []string
+		expectNoted           []EnsureParentPath
+		expectPhysicallyExist []string // paths don't contain symlinks
+	}{
+		{
+			description: "base",
+			subdir:      "subdir",
+			options: EnsureOptions{
+				Paths: []EnsurePath{
+					{
+						Path:     filepath.Join(string(os.PathSeparator), "a", "b", "a"),
+						Typeflag: tar.TypeReg,
+						Chmod:    &worldReadable,
+					},
+					{
+						Path:     filepath.Join("a", "b", "b"),
+						Typeflag: tar.TypeReg,
+						ModTime:  &zero,
+					},
+					{
+						Path:     filepath.Join(string(os.PathSeparator), "a", "b", "c"),
+						Typeflag: tar.TypeDir,
+						ModTime:  &zero,
+					},
+					{
+						Path:     filepath.Join("a", "b", "d"),
+						Typeflag: tar.TypeDir,
+					},
+				},
+			},
+			expectCreated: []string{
+				"subdir",
+				"subdir/a",
+				"subdir/a/b",
+				"subdir/a/b/a",
+				"subdir/a/b/b",
+				"subdir/a/b/c",
+				"subdir/a/b/d",
+			},
+			expectNoted: []EnsureParentPath{},
+		},
+		{
+			description: "nosubdir",
+			options: EnsureOptions{
+				Paths: []EnsurePath{
+					{
+						Path:     filepath.Join(string(os.PathSeparator), "a", "b", "c"),
+						Typeflag: tar.TypeDir,
+						ModTime:  &zero,
+					},
+					{
+						Path:     filepath.Join("a", "b", "d"),
+						Typeflag: tar.TypeDir,
+					},
+				},
+			},
+			expectCreated: []string{
+				"a",
+				"a/b",
+				"a/b/c",
+				"a/b/d",
+			},
+			expectNoted: []EnsureParentPath{},
+		},
+		{
+			description: "mkdir-first",
+			subdir:      "dir/subdir",
+			mkdirs:      []string{"dir", "dir/subdir"},
+			options: EnsureOptions{
+				Paths: []EnsurePath{
+					{
+						Path:     filepath.Join(string(os.PathSeparator), "a", "b", "a"),
+						Typeflag: tar.TypeReg,
+						Chmod:    &worldReadable,
+					},
+					{
+						Path:     filepath.Join("a", "b", "b"),
+						Typeflag: tar.TypeReg,
+						ModTime:  &zero,
+					},
+					{
+						Path:     filepath.Join(string(os.PathSeparator), "a", "b", "c"),
+						Typeflag: tar.TypeDir,
+						ModTime:  &zero,
+					},
+					{
+						Path:     filepath.Join("a", "b", "d"),
+						Typeflag: tar.TypeDir,
+					},
+				},
+			},
+			expectCreated: []string{
+				"dir/subdir/a",
+				"dir/subdir/a/b",
+				"dir/subdir/a/b/a",
+				"dir/subdir/a/b/b",
+				"dir/subdir/a/b/c",
+				"dir/subdir/a/b/d",
+			},
+			expectNoted: []EnsureParentPath{
+				{
+					Path:  "dir",
+					Mode:  &ugReadable,
+					Owner: &idtools.IDPair{UID: 1, GID: 1},
+					// ModTime gets updated when we create dir/subdir, can't check it
+				},
+				{
+					Path:    "dir/subdir",
+					Mode:    &ugReadable,
+					Owner:   &idtools.IDPair{UID: 1, GID: 1},
+					ModTime: &zero,
+				},
+			},
+		},
+		{
+			description: "symlink-in-parent",
+			mkdirs:      []string{"a"},
+			symlinks:    map[string]string{"a/symlink": "../../../../target"},
+			options: EnsureOptions{
+				Paths: []EnsurePath{
+					{
+						Path:     "/a/symlink/b/c",
+						Typeflag: tar.TypeReg,
+					},
+				},
+			},
+			expectCreated: []string{
+				"target",
+				"target/b",
+				"target/b/c",
+			},
+			expectNoted: []EnsureParentPath{},
+			expectPhysicallyExist: []string{
+				"target",
+				"target/b",
+				"target/b/c",
+			},
+		},
+		{
+			description: "symlink-target-regular",
+			mkdirs:      []string{"a"},
+			symlinks:    map[string]string{"a/symlink": "../../../../target"},
+			options: EnsureOptions{
+				Paths: []EnsurePath{
+					{
+						Path:     "/a/symlink",
+						Typeflag: tar.TypeReg,
+						ModTime:  &zero,
+					},
+				},
+			},
+			expectCreated: []string{"target"},
+			expectNoted:   []EnsureParentPath{},
+			expectPhysicallyExist: []string{
+				"target",
+			},
+		},
+		{
+			description: "symlink-target-dir",
+			mkdirs:      []string{"a"},
+			symlinks:    map[string]string{"a/symlink": "../../../../target"},
+			options: EnsureOptions{
+				Paths: []EnsurePath{
+					{
+						Path:     "/a/symlink",
+						Typeflag: tar.TypeDir,
+						ModTime:  &zero,
+					},
+				},
+			},
+			expectCreated:         []string{"target"},
+			expectNoted:           []EnsureParentPath{},
+			expectPhysicallyExist: []string{"target"},
+		},
+	}
+	for i := range testCases {
+		t.Run(testCases[i].description, func(t *testing.T) {
+			testStarted := time.Now()
+			tmpdir := t.TempDir()
+			for _, mkdir := range testCases[i].mkdirs {
+				err := MkdirContext(t.Context(), tmpdir, mkdir, MkdirOptions{
+					ModTimeNew: &zero,
+					ChmodNew:   &ugReadable,
+					ChownNew:   &idtools.IDPair{UID: 1, GID: 1},
+				})
+				require.NoError(t, err, "unexpected error ensuring")
+			}
+			for linkPath, linkContents := range testCases[i].symlinks {
+				require.NoError(t, os.Symlink(linkContents, filepath.Join(tmpdir, testCases[i].subdir, linkPath)))
+			}
+			created, noted, err := EnsureContext(t.Context(), tmpdir, testCases[i].subdir, testCases[i].options)
+			require.NoError(t, err, "unexpected error ensuring")
+			require.EqualValues(t, testCases[i].expectCreated, created, "did not expect to create these")
+			require.Equal(t, len(testCases[i].expectNoted), len(noted), "noticed the wrong number of things")
+			for n := range noted {
+				require.Equalf(t, testCases[i].expectNoted[n].Path, noted[n].Path, "noticed item %d path", n)
+				if testCases[i].expectNoted[n].Mode != nil {
+					require.Equalf(t, testCases[i].expectNoted[n].Mode.Perm(), noted[n].Mode.Perm(), "noticed item %q mode", noted[n].Path)
+				}
+				if testCases[i].expectNoted[n].Owner != nil {
+					require.Equalf(t, *testCases[i].expectNoted[n].Owner, *noted[n].Owner, "noticed item %q owner", noted[n].Path)
+				}
+				if testCases[i].expectNoted[n].ModTime != nil {
+					require.Equalf(t, testCases[i].expectNoted[n].ModTime.UnixNano(), noted[n].ModTime.UnixNano(), "noticed item %q mtime", noted[n].Path)
+				}
+			}
+			for _, item := range testCases[i].options.Paths {
+				target, err := securejoin.SecureJoin(tmpdir, filepath.Join(testCases[i].subdir, item.Path))
+				require.NoError(t, err)
+				st, err := os.Lstat(target)
+				require.NoErrorf(t, err, "we supposedly created %q", item.Path)
+				if item.Chmod != nil {
+					assert.Equalf(t, *item.Chmod, st.Mode().Perm(), "permissions look wrong on %q", item.Path)
+				}
+				if item.Chown != nil {
+					uid, gid, err := owner(st)
+					require.NoErrorf(t, err, "expected to be able to read uid:gid for %q", item.Path)
+					assert.Equalf(t, item.Chown.UID, uid, "user looks wrong on %q", item.Path)
+					assert.Equalf(t, item.Chown.GID, gid, "group looks wrong on %q", item.Path)
+				}
+				if item.ModTime != nil {
+					assert.Equalf(t, item.ModTime.Unix(), st.ModTime().Unix(), "datestamp looks wrong on %q", item.Path)
+				} else {
+					assert.Truef(t, !testStarted.After(st.ModTime()), "datestamp is too old on %q: %v < %v", target, st.ModTime(), testStarted)
+				}
+			}
+			for _, item := range testCases[i].expectPhysicallyExist {
+				resolved, err := securejoin.SecureJoin(tmpdir, item)
+				require.NoError(t, err)
+				assert.Equal(t, filepath.Join(tmpdir, item), resolved) // no symlinks within resolved
+				_, err = os.Lstat(resolved)
+				require.NoError(t, err, "we supposedly created %q", item)
+			}
+		})
+	}
+}
+
+func TestStatDisallowWildcardNoChroot(t *testing.T) {
+	couldChroot := canChroot
+	canChroot = false
+	testStatDisallowWildcard(t)
+	canChroot = couldChroot
+}
+
+func testStatDisallowWildcard(t *testing.T) {
+	headers := []tar.Header{
+		{Name: "file-a", Typeflag: tar.TypeReg, Size: 23, Mode: 0o644, ModTime: testDate},
+		{Name: "file-b", Typeflag: tar.TypeReg, Size: 45, Mode: 0o644, ModTime: testDate},
+		{Name: "subdir", Typeflag: tar.TypeDir, Mode: 0o755, ModTime: testDate},
+		{Name: "subdir/file-c", Typeflag: tar.TypeReg, Size: 67, Mode: 0o644, ModTime: testDate},
+	}
+	dir, err := makeContextFromArchive(t, makeArchive(headers, nil), "")
+	require.NoError(t, err)
+
+	t.Run("wildcard-allowed-glob-matches", func(t *testing.T) {
+		stats, err := StatContext(t.Context(), dir, dir, StatOptions{}, []string{"file-*"})
+		require.NoError(t, err)
+		require.Len(t, stats, 1)
+		require.Empty(t, stats[0].Error)
+		require.Len(t, stats[0].Globbed, 2)
+	})
+
+	t.Run("disallow-wildcard-literal", func(t *testing.T) {
+		stats, err := StatContext(t.Context(), dir, dir, StatOptions{DisallowWildcard: true}, []string{"file-a"})
+		require.NoError(t, err)
+		require.Len(t, stats, 1)
+		require.Empty(t, stats[0].Error)
+		require.Len(t, stats[0].Globbed, 1)
+	})
+
+	t.Run("disallow-wildcard-glob-chars-rejected", func(t *testing.T) {
+		stats, err := StatContext(t.Context(), dir, dir, StatOptions{DisallowWildcard: true}, []string{"file-*"})
+		require.NoError(t, err)
+		require.Len(t, stats, 1)
+		require.NotEmpty(t, stats[0].Error, "file-* should be rejected when DisallowWildcard is true")
+		require.Contains(t, stats[0].Error, "wildcards are not allowed")
+	})
+}
+
+func TestStatAllowEmptyWildcardNoChrootNoCancel(t *testing.T) {
+	couldChroot := canChroot
+	canChroot = false
+	testStatAllowEmptyWildcard(t)
+	canChroot = couldChroot
+}
+
+func testStatAllowEmptyWildcard(t *testing.T) {
+	headers := []tar.Header{
+		{Name: "file-a", Typeflag: tar.TypeReg, Size: 23, Mode: 0o644, ModTime: testDate},
+	}
+	dir, err := makeContextFromArchive(t, makeArchive(headers, nil), "")
+	require.NoError(t, err)
+
+	t.Run("empty-wildcard-true-no-error", func(t *testing.T) {
+		stats, err := StatContext(t.Context(), dir, dir, StatOptions{AllowEmptyWildcard: true}, []string{"nonexistent-*"})
+		require.NoError(t, err)
+		require.Empty(t, stats)
+	})
+
+	t.Run("empty-wildcard-false-error", func(t *testing.T) {
+		stats, err := StatContext(t.Context(), dir, dir, StatOptions{}, []string{"nonexistent-*"})
+		require.NoError(t, err)
+		require.Len(t, stats, 1)
+		require.Contains(t, stats[0].Error, "matched nothing")
+	})
+
+	t.Run("empty-wildcard-true-with-existing", func(t *testing.T) {
+		stats, err := StatContext(t.Context(), dir, dir, StatOptions{AllowEmptyWildcard: true}, []string{"file-*"})
+		require.NoError(t, err)
+		require.Len(t, stats, 1)
+		require.Empty(t, stats[0].Error)
+		require.Len(t, stats[0].Globbed, 1)
+	})
+
+	t.Run("empty-wildcard-true-literal-missing", func(t *testing.T) {
+		stats, err := StatContext(t.Context(), dir, dir, StatOptions{AllowEmptyWildcard: true}, []string{"nonexistent-file"})
+		require.NoError(t, err)
+		require.Len(t, stats, 1)
+		require.Contains(t, stats[0].Error, "no such file or directory")
+	})
+}
+
+func TestGetDisallowWildcardNoChrootNoCancel(t *testing.T) {
+	couldChroot := canChroot
+	canChroot = false
+	testGetDisallowWildcard(t)
+	canChroot = couldChroot
+}
+
+func testGetDisallowWildcard(t *testing.T) {
+	headers := []tar.Header{
+		{Name: "file-a", Typeflag: tar.TypeReg, Size: 23, Mode: 0o644, ModTime: testDate},
+		{Name: "file-b", Typeflag: tar.TypeReg, Size: 45, Mode: 0o644, ModTime: testDate},
+	}
+	dir, err := makeContextFromArchive(t, makeArchive(headers, nil), "")
+	require.NoError(t, err)
+
+	t.Run("wildcard-allowed-glob-matches", func(t *testing.T) {
+		err := GetContext(t.Context(), dir, dir, GetOptions{}, []string{"file-*"}, io.Discard)
+		require.NoError(t, err)
+	})
+
+	t.Run("disallow-wildcard-literal", func(t *testing.T) {
+		err := GetContext(t.Context(), dir, dir, GetOptions{DisallowWildcard: true}, []string{"file-a"}, io.Discard)
+		require.NoError(t, err)
+	})
+
+	t.Run("disallow-wildcard-glob-chars-rejected", func(t *testing.T) {
+		err := GetContext(t.Context(), dir, dir, GetOptions{DisallowWildcard: true}, []string{"file-*"}, io.Discard)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "wildcards are not allowed")
+	})
+}
+
+func TestGetAllowEmptyWildcardNoChroot(t *testing.T) {
+	couldChroot := canChroot
+	canChroot = false
+	testGetAllowEmptyWildcard(t)
+	canChroot = couldChroot
+}
+
+func testGetAllowEmptyWildcard(t *testing.T) {
+	headers := []tar.Header{
+		{Name: "file-a", Typeflag: tar.TypeReg, Size: 23, Mode: 0o644, ModTime: testDate},
+	}
+	dir, err := makeContextFromArchive(t, makeArchive(headers, nil), "")
+	require.NoError(t, err)
+
+	t.Run("empty-wildcard-true-no-error", func(t *testing.T) {
+		err := GetContext(t.Context(), dir, dir, GetOptions{AllowEmptyWildcard: true}, []string{"nonexistent-*"}, io.Discard)
+		require.NoError(t, err)
+	})
+
+	t.Run("empty-wildcard-false-error", func(t *testing.T) {
+		err := GetContext(t.Context(), dir, dir, GetOptions{}, []string{"nonexistent-*"}, io.Discard)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "matched nothing")
+	})
+
+	t.Run("empty-wildcard-true-literal-missing", func(t *testing.T) {
+		err := GetContext(t.Context(), dir, dir, GetOptions{AllowEmptyWildcard: true}, []string{"nonexistent-file"}, io.Discard)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "no such file or directory")
+	})
+
+	t.Run("empty-wildcard-true-with-existing", func(t *testing.T) {
+		err := GetContext(t.Context(), dir, dir, GetOptions{AllowEmptyWildcard: true}, []string{"file-*"}, io.Discard)
+		require.NoError(t, err)
+	})
+}
+
+func TestEnsureNoChrootNoCancel(t *testing.T) {
+	couldChroot := canChroot
+	canChroot = false
+	testEnsure(t)
+	canChroot = couldChroot
+}
+
+func testConditionalRemove(t *testing.T) {
+	mode, mismatchedMode := os.FileMode(0o751), os.FileMode(0o755)
+	now := time.Now()
+	then := time.Unix(now.Unix()/2, 0)
+	type create struct {
+		path     string
+		typeFlag byte
+		mtime    *time.Time
+		mode     *os.FileMode
+	}
+	testCases := []struct {
+		description     string
+		subdir          string
+		create          []create
+		symlinks        map[string]string
+		remove          ConditionalRemoveOptions
+		expectedRemoved []string
+		expectedRemain  []string
+	}{
+		{
+			description: "withoutsubdir",
+			create: []create{
+				{path: "/a", typeFlag: tar.TypeDir},
+				{path: "b", typeFlag: tar.TypeReg},
+				{path: "c/d", typeFlag: tar.TypeReg},
+				{path: "c/e", typeFlag: tar.TypeReg},
+			},
+			remove: ConditionalRemoveOptions{
+				Paths: []ConditionalRemovePath{
+					{Path: "a"},
+					{Path: "b"},
+					{Path: "c"},
+					{Path: "c/e"},
+				},
+			},
+			expectedRemoved: []string{"a", "b", "c/e"},
+			expectedRemain:  []string{"c/d", "c"},
+		},
+		{
+			description: "withsubdir",
+			subdir:      "subdir",
+			create: []create{
+				{path: "/a", typeFlag: tar.TypeDir},
+				{path: "b", typeFlag: tar.TypeReg},
+				{path: "c/d", typeFlag: tar.TypeReg},
+				{path: "c/e", typeFlag: tar.TypeReg},
+			},
+			remove: ConditionalRemoveOptions{
+				Paths: []ConditionalRemovePath{
+					{Path: "a"},
+					{Path: "b"},
+					{Path: "c"},
+					{Path: "c/e"},
+				},
+			},
+			expectedRemoved: []string{"a", "b", "c/e"},
+			expectedRemain:  []string{"c/d", "c"},
+		},
+		{
+			description: "withsubdir",
+			subdir:      "subdir",
+			create: []create{
+				{path: "/a", typeFlag: tar.TypeDir},
+				{path: "b", typeFlag: tar.TypeReg},
+				{path: "c/d", typeFlag: tar.TypeReg},
+				{path: "c/e", typeFlag: tar.TypeReg},
+			},
+			remove: ConditionalRemoveOptions{
+				Paths: []ConditionalRemovePath{
+					{Path: "a"},
+					{Path: "b"},
+					{Path: "c"},
+					{Path: "c/e"},
+				},
+			},
+			expectedRemoved: []string{"a", "b", "c/e"},
+			expectedRemain:  []string{"c/d", "c"},
+		},
+		{
+			description: "unconditional",
+			create: []create{
+				{path: "/a", typeFlag: tar.TypeDir, mtime: &then, mode: &mode},
+				{path: "b", typeFlag: tar.TypeReg, mtime: &then, mode: &mode},
+				{path: "c/d", typeFlag: tar.TypeReg, mtime: &then, mode: &mode},
+				{path: "c/e", typeFlag: tar.TypeReg, mtime: &then, mode: &mode},
+			},
+			remove: ConditionalRemoveOptions{
+				Paths: []ConditionalRemovePath{
+					{Path: "a"},
+					{Path: "b"},
+					{Path: "c"},
+					{Path: "c/e"},
+				},
+			},
+			expectedRemoved: []string{"a", "b", "c/e"},
+			expectedRemain:  []string{"c/d", "c"},
+		},
+		{
+			description: "conditions-not-met",
+			create: []create{
+				{path: "/a", typeFlag: tar.TypeDir, mtime: &then, mode: &mode},
+				{path: "b", typeFlag: tar.TypeReg, mtime: &then, mode: &mode},
+				{path: "c/d", typeFlag: tar.TypeReg, mtime: &then, mode: &mode},
+				{path: "c/e", typeFlag: tar.TypeReg, mtime: &then, mode: &mode},
+			},
+			remove: ConditionalRemoveOptions{
+				Paths: []ConditionalRemovePath{
+					{Path: "a", Mode: &mismatchedMode},
+					{Path: "b", Mode: &mismatchedMode},
+					{Path: "c", Mode: &mismatchedMode},
+					{Path: "c/e", Mode: &mismatchedMode},
+					{Path: "a", ModTime: &now},
+					{Path: "b", ModTime: &now},
+					{Path: "c", ModTime: &now},
+					{Path: "c/e", ModTime: &now},
+				},
+			},
+			expectedRemain: []string{"a", "b", "c/e", "c/d", "c"},
+		},
+		{
+			description: "conditions-met",
+			create: []create{
+				{path: "/a", typeFlag: tar.TypeDir, mtime: &then, mode: &mode},
+				{path: "b", typeFlag: tar.TypeReg, mtime: &then, mode: &mode},
+				{path: "c/d", typeFlag: tar.TypeReg, mtime: &then, mode: &mode},
+				{path: "c/e", typeFlag: tar.TypeReg, mtime: &then, mode: &mode},
+			},
+			remove: ConditionalRemoveOptions{
+				Paths: []ConditionalRemovePath{
+					{Path: "a", ModTime: &then, Mode: &mode},
+					{Path: "b", ModTime: &then, Mode: &mode},
+					{Path: "c"},
+					{Path: "c/d", ModTime: &then, Mode: &mode},
+				},
+			},
+			expectedRemoved: []string{"a", "b", "c/d"},
+			expectedRemain:  []string{"c", "c/e"},
+		},
+		{
+			description: "symlink-in-parent",
+			create: []create{
+				{path: "/target-dir", typeFlag: tar.TypeDir},
+				{path: "/target-dir/a", typeFlag: tar.TypeReg},
+				{path: "/symlink-dir", typeFlag: tar.TypeDir},
+			},
+			symlinks: map[string]string{"symlink-dir/symlink": "../../../../target-dir"},
+			remove: ConditionalRemoveOptions{
+				Paths: []ConditionalRemovePath{
+					{Path: "symlink-dir/symlink/a"},
+				},
+			},
+			expectedRemoved: []string{"symlink-dir/symlink/a"},
+			expectedRemain:  []string{"target-dir", "symlink-dir", "symlink-dir/symlink"},
+		},
+		{
+			description: "symlink-target",
+			create: []create{
+				{path: "/victim", typeFlag: tar.TypeReg},
+				{path: "/symlink-dir", typeFlag: tar.TypeDir},
+			},
+			symlinks: map[string]string{
+				"symlink-dir/escaping":    "../../../../victim",
+				"symlink-dir/nonescaping": "../victim",
+			},
+			remove: ConditionalRemoveOptions{
+				Paths: []ConditionalRemovePath{
+					{Path: "symlink-dir/escaping"},
+					{Path: "symlink-dir/nonescaping"},
+				},
+			},
+			expectedRemoved: []string{"symlink-dir/escaping", "symlink-dir/nonescaping"},
+			expectedRemain:  []string{"victim", "symlink-dir"},
+		},
+	}
+	for i := range testCases {
+		t.Run(testCases[i].description, func(t *testing.T) {
+			tmpdir := t.TempDir()
+			var create EnsureOptions
+			for _, what := range testCases[i].create {
+				create.Paths = append(create.Paths, EnsurePath{
+					Path:     what.path,
+					Typeflag: what.typeFlag,
+					ModTime:  what.mtime,
+					Chmod:    what.mode,
+				})
+			}
+			created, _, err := EnsureContext(t.Context(), tmpdir, testCases[i].subdir, create)
+			require.NoErrorf(t, err, "unexpected error creating %#v", create)
+			for linkPath, linkContents := range testCases[i].symlinks {
+				require.NoError(t, os.Symlink(linkContents, filepath.Join(tmpdir, testCases[i].subdir, linkPath)))
+			}
+			remove := testCases[i].remove
+			for _, what := range created {
+				remove.Paths = append(remove.Paths, ConditionalRemovePath{
+					Path: what,
+				})
+			}
+			removed, err := ConditionalRemoveContext(t.Context(), tmpdir, testCases[i].subdir, testCases[i].remove)
+			require.NoError(t, err, "unexpected error removing")
+			expectedRemoved := slices.Clone(testCases[i].expectedRemoved)
+			slices.Sort(expectedRemoved)
+			require.EqualValues(t, expectedRemoved, removed, "did not expect these to be removed")
+			var remain []string
+			err = filepath.Walk(filepath.Join(tmpdir, testCases[i].subdir), func(path string, _ fs.FileInfo, err error) error {
+				if err != nil {
+					return err
+				}
+				rel, err := filepath.Rel(filepath.Join(tmpdir, testCases[i].subdir), path)
+				if err != nil {
+					return fmt.Errorf("computing path of %q relative to %q: %w", path, filepath.Join(tmpdir, testCases[i].subdir), err)
+				}
+				if rel != "" && rel == "." {
+					return nil
+				}
+				remain = append(remain, rel)
+				return nil
+			})
+			slices.Sort(remain)
+			expectedRemain := slices.Clone(testCases[i].expectedRemain)
+			slices.Sort(expectedRemain)
+			require.NoError(t, err, "unexpected error checking what's left")
+			require.EqualValues(t, expectedRemain, remain, "did not expect these to be left behind")
+		})
+	}
+}
+
+func TestConditionalRemoveNoChrootNoCancel(t *testing.T) {
+	couldChroot := canChroot
+	canChroot = false
+	testConditionalRemove(t)
+	canChroot = couldChroot
+}
+
+func TestSortedExtendedGlob(t *testing.T) {
+	tmpdir := t.TempDir()
+	buf := []byte("buffer")
+	expect := []string{}
+	for _, name := range []string{"z", "y", "x", "a", "b", "c", "d", "e", "f"} {
+		require.NoError(t, os.WriteFile(filepath.Join(tmpdir, name), buf, 0o600))
+		expect = append(expect, filepath.Join(tmpdir, name))
+	}
+	sort.Strings(expect)
+
+	matched, err := extendedGlob(filepath.Join(tmpdir, "*"))
+	require.NoError(t, err, "globbing")
+	require.ElementsMatch(t, expect, matched, "sorted globbing")
+}
+
+func TestTarPutNoChrootNoCancel(t *testing.T) {
+	couldChroot := canChroot
+	canChroot = false
+	defer func() { canChroot = couldChroot }()
+	testTarPut(t.Context(), t, nil)
+}
+
+func TestTarPutNoChrootCancel(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 1*time.Nanosecond)
+	defer cancel()
+	time.Sleep(1 * time.Millisecond)
+	couldChroot := canChroot
+	canChroot = false
+	defer func() { canChroot = couldChroot }()
+	testTarPut(ctx, t, context.DeadlineExceeded)
+}
+
+func testTarPut(ctx context.Context, t *testing.T, expectedError error) {
+	testCases := []struct {
+		name               string
+		trailingNullsBytes int
+	}{
+		{
+			name:               "without-trailing-nulls",
+			trailingNullsBytes: 0,
+		},
+		{
+			name:               "with-trailing-nulls",
+			trailingNullsBytes: 8192,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			testDir := t.TempDir()
+
+			var tarBuf bytes.Buffer
+			tw := tar.NewWriter(&tarBuf)
+
+			hdr := &tar.Header{
+				Name:    "testfile.txt",
+				Mode:    0o644,
+				Size:    11,
+				ModTime: time.Now(),
+			}
+			err := tw.WriteHeader(hdr)
+			require.NoError(t, err, "failed to write tar header")
+
+			_, err = tw.Write([]byte("hello world"))
+			require.NoError(t, err, "failed to write tar content")
+
+			err = tw.Close()
+			require.NoError(t, err, "failed to close tar writer")
+
+			// Add extra trailing null bytes to simulate what many tar implementations do.
+			// This reproduces issue https://github.com/containers/buildah/issues/6573 where
+			// tar.Reader returns EOF after the standard EOF marker but before all trailing nulls
+			// are consumed, causing broken pipe.
+			if tc.trailingNullsBytes > 0 {
+				extraNulls := make([]byte, tc.trailingNullsBytes)
+				tarBuf.Write(extraNulls)
+			}
+
+			err = PutContext(ctx, testDir, testDir, PutOptions{}, &tarBuf)
+			if expectedError != nil {
+				require.ErrorContains(t, err, expectedError.Error())
+				return
+			}
+			require.NoError(t, err, "Put returned error")
+
+			extractedFile := filepath.Join(testDir, "testfile.txt")
+			content, err := os.ReadFile(extractedFile)
+			require.NoError(t, err, "failed to read extracted file")
+			require.Equal(t, "hello world", string(content), "extracted file content mismatch")
+		})
+	}
+}
+
+func TestCannotChangeMultipleRequestsWithDifferentChroot(t *testing.T) {
+	testDir := t.TempDir()
+
+	stdinR, stdinW, err := os.Pipe()
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		assert.NoError(t, stdinR.Close())
+		assert.NoError(t, stdinW.Close())
+	})
+
+	stdoutR, stdoutW, err := os.Pipe()
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		assert.NoError(t, stdoutR.Close())
+		assert.NoError(t, stdoutW.Close())
+	})
+
+	stderr := bytes.Buffer{}
+
+	cmd := reexec.CommandContext(t.Context(), copierCommand)
+	cmd.Stdin = stdinR
+	cmd.Stdout = stdoutW
+	cmd.Stderr = &stderr
+	cmd.Dir = testDir
+
+	require.NoError(t, cmd.Start())
+
+	encoder := json.NewEncoder(stdinW)
+	decoder := json.NewDecoder(stdoutR)
+
+	req := request{Request: requestEval, Root: testDir, Directory: "/"}
+
+	receiveResponse := func() response {
+		var resp response
+		require.NoError(t, stdoutR.SetReadDeadline(time.Now().Add(time.Second*5)))
+		if !assert.NoError(t, decoder.Decode(&resp), "failed to decode response from copier") {
+			_ = cmd.Wait()
+			t.Logf("stderr: %s", stderr.String())
+			t.FailNow()
+		}
+		return resp
+	}
+
+	require.NoError(t, encoder.Encode(&req), "failed to send first request to copier")
+	resp := receiveResponse()
+	require.Emptyf(t, resp.Error, "first request returned an error: %s", resp.Error)
+
+	require.NoError(t, encoder.Encode(&req), "failed to send second request to copier")
+	resp = receiveResponse()
+	require.Emptyf(t, resp.Error, "second request returned an error: %s", resp.Error)
+
+	require.NoError(t, encoder.Encode(&request{Request: requestQuit}))
+	require.NoError(t, cmd.Wait())
+}
+
+func TestChmodNoChrootNoCancel(t *testing.T) {
+	couldChroot := canChroot
+	canChroot = false
+	testChmod(t)
+	canChroot = couldChroot
+}
+
+func testChmod(t *testing.T) {
+	dirMode := os.FileMode(0o755)
+	fileMode := os.FileMode(0o644)
+	cases := []struct {
+		chmod                 string
+		chmodDirs, chmodFiles *os.FileMode
+		startMode, endMode    os.FileMode
+		isDir                 bool
+		err                   error
+	}{
+		{chmod: "u=rw", startMode: 0o400, endMode: 0o600},
+		{chmod: "u=rwX", startMode: 0o400, endMode: 0o600},
+		{chmod: "u=rw", startMode: 0o400 | fs.ModeDir, endMode: 0o600 | fs.ModeDir, isDir: true},
+		{chmod: "u=rwX", startMode: 0o400 | fs.ModeDir, endMode: 0o700 | fs.ModeDir, isDir: true},
+		{chmod: "u=rwXabc", err: mode.ErrSyntax},
+		{chmod: "go=", startMode: 0o777, endMode: 0o700},
+		{chmod: "644", startMode: 0o753, endMode: 0o644},
+		{chmod: "", startMode: 0o753, endMode: 0o753},
+		{chmodDirs: &dirMode, startMode: 0o500 | fs.ModeDir, endMode: 0o755 | fs.ModeDir, isDir: true},
+		{chmodDirs: &dirMode, startMode: 0o400, endMode: 0o400},
+		{chmodFiles: &fileMode, startMode: 0o500 | fs.ModeDir, endMode: 0o500 | fs.ModeDir, isDir: true},
+		{chmodFiles: &fileMode, startMode: 0o400, endMode: 0o644},
+		{chmod: "u=rwX,go=", chmodFiles: &fileMode, startMode: 0o444, endMode: 0o600},
+		{chmod: "u=rwX,go=", chmodDirs: &dirMode, startMode: 0o555 | fs.ModeDir, endMode: 0o700 | fs.ModeDir, isDir: true},
+	}
+
+	name := "test"
+	uidMap := []idtools.IDMap{{HostID: os.Getuid(), ContainerID: 0, Size: 1}}
+	gidMap := []idtools.IDMap{{HostID: os.Getgid(), ContainerID: 0, Size: 1}}
+
+	for _, v := range cases {
+		t.Run(fmt.Sprintf("get chmod=%v,chmodDirs=%v,chmodFiles=%v,startMode=%O,endMode=%O,isDir=%v", v.chmod, v.chmodDirs, v.chmodFiles, v.startMode, v.endMode, v.isDir), func(t *testing.T) {
+			testDir := t.TempDir()
+			fn := filepath.Join(testDir, name)
+			var err error
+			if v.isDir {
+				err = os.Mkdir(fn, 0)
+			} else {
+				_, err = os.Create(fn)
+			}
+			if err != nil {
+				t.Fatalf("failed to create %s: %v", name, err)
+			}
+			if err = os.Chmod(fn, v.startMode); err != nil {
+				t.Fatalf("failed to chmod %s: %v", name, err)
+			}
+
+			pipeReader, pipeWriter := io.Pipe()
+			var wg sync.WaitGroup
+			wg.Go(func() {
+				opts := GetOptions{Chmod: v.chmod, ChmodDirs: v.chmodDirs, ChmodFiles: v.chmodFiles}
+				err = GetContext(t.Context(), testDir, "", opts, []string{name}, pipeWriter)
+				pipeWriter.Close()
+			})
+			tr := tar.NewReader(pipeReader)
+			hdr, tarErr := tr.Next()
+			for hdr != nil {
+				assert.Equal(t, int64(v.endMode), hdr.Mode)
+				if tarErr != nil {
+					break
+				}
+				hdr, tarErr = tr.Next()
+			}
+			wg.Wait()
+			pipeReader.Close()
+			if v.err != nil {
+				require.ErrorContains(t, err, v.err.Error())
+				require.ErrorIs(t, tarErr, io.ErrUnexpectedEOF, "expected trash at end of archive")
+			} else {
+				require.ErrorIs(t, tarErr, io.EOF, "expected EOF at end of archive")
+			}
+		})
+
+		t.Run(fmt.Sprintf("put chmod=%v,chmodDirs=%v,chmodFiles=%v,startMode=%O,endMode=%O,isDir=%v", v.chmod, v.chmodDirs, v.chmodFiles, v.startMode, v.endMode, v.isDir), func(t *testing.T) {
+			testDir := t.TempDir()
+			typeFlag := byte(tar.TypeReg)
+			if v.isDir {
+				typeFlag = tar.TypeDir
+			}
+			archive := makeArchiveSlice([]tar.Header{
+				{Name: name, Typeflag: typeFlag, Size: 0, Mode: int64(v.startMode), ModTime: testDate},
+			})
+			opts := PutOptions{
+				UIDMap:     uidMap,
+				GIDMap:     gidMap,
+				Chmod:      v.chmod,
+				ChmodDirs:  v.chmodDirs,
+				ChmodFiles: v.chmodFiles,
+			}
+			err := PutContext(t.Context(), testDir, "", opts, bytes.NewReader(archive))
+			if err != nil {
+				require.ErrorContains(t, err, v.err.Error())
+				return
+			}
+			require.ErrorIs(t, err, v.err)
+			fn := filepath.Join(testDir, name)
+			fi, err := os.Stat(fn)
+			if err != nil {
+				t.Fatalf("failed to stat %s: %v", fn, err)
+			}
+			assert.Equal(t, v.endMode, fi.Mode())
+		})
+	}
+}
+
+func TestPutTimestampNoChrootNoCancel(t *testing.T) {
+	couldChroot := canChroot
+	canChroot = false
+	defer func() { canChroot = couldChroot }()
+	testPutTimestamp(t)
+}
+
+func testPutTimestamp(t *testing.T) {
+	override := time.Unix(1600000000, 0)
+	originalTime := time.Unix(1500000000, 0)
+	uidMap := []idtools.IDMap{{HostID: os.Getuid(), ContainerID: 0, Size: 1}}
+	gidMap := []idtools.IDMap{{HostID: os.Getgid(), ContainerID: 0, Size: 1}}
+
+	t.Run("overrides-archive-entry-timestamps", func(t *testing.T) {
+		root := t.TempDir()
+		archive := makeArchive([]tar.Header{
+			{Name: "subdir/", Typeflag: tar.TypeDir, Mode: 0o755, ModTime: originalTime},
+			{Name: "subdir/file.txt", Typeflag: tar.TypeReg, Size: 3, Mode: 0o644, ModTime: originalTime},
+		}, map[string][]byte{"subdir/file.txt": []byte("abc")})
+		err := PutContext(t.Context(), root, root, PutOptions{UIDMap: uidMap, GIDMap: gidMap, Timestamp: &override}, archive)
+		require.NoError(t, err)
+
+		for _, name := range []string{"subdir", "subdir/file.txt"} {
+			info, err := os.Lstat(filepath.Join(root, name))
+			require.NoError(t, err)
+			assert.Equalf(t, override.Unix(), info.ModTime().Unix(), "%q should have overridden timestamp", name)
+		}
+	})
+
+	t.Run("overrides-created-directory-timestamps", func(t *testing.T) {
+		root := t.TempDir()
+		target := filepath.Join(root, "dest", "nested")
+		archive := makeArchive([]tar.Header{
+			{Name: "a/b/file.txt", Typeflag: tar.TypeReg, Size: 2, Mode: 0o644, ModTime: originalTime},
+		}, map[string][]byte{"a/b/file.txt": []byte("hi")})
+		err := PutContext(t.Context(), root, target, PutOptions{UIDMap: uidMap, GIDMap: gidMap, Timestamp: &override}, archive)
+		require.NoError(t, err)
+
+		for _, name := range []string{"dest", "dest/nested", "dest/nested/a", "dest/nested/a/b", "dest/nested/a/b/file.txt"} {
+			info, err := os.Lstat(filepath.Join(root, name))
+			require.NoError(t, err)
+			assert.Equalf(t, override.Unix(), info.ModTime().Unix(), "%q should have overridden timestamp", name)
+		}
+	})
+
+	t.Run("preserves-original-without-override", func(t *testing.T) {
+		root := t.TempDir()
+		archive := makeArchive([]tar.Header{
+			{Name: "file.txt", Typeflag: tar.TypeReg, Size: 5, Mode: 0o644, ModTime: originalTime},
+		}, map[string][]byte{"file.txt": []byte("hello")})
+		err := PutContext(t.Context(), root, root, PutOptions{UIDMap: uidMap, GIDMap: gidMap}, archive)
+		require.NoError(t, err)
+
+		info, err := os.Lstat(filepath.Join(root, "file.txt"))
+		require.NoError(t, err)
+		assert.Equal(t, originalTime.Unix(), info.ModTime().Unix())
+	})
+}
+
+func TestPutCreateDestPathNoChroot(t *testing.T) {
+	couldChroot := canChroot
+	canChroot = false
+	defer func() { canChroot = couldChroot }()
+	testPutCreateDestPath(t)
+}
+
+func testPutCreateDestPath(t *testing.T) {
+	uidMap := []idtools.IDMap{{HostID: os.Getuid(), ContainerID: 0, Size: 1}}
+	gidMap := []idtools.IDMap{{HostID: os.Getgid(), ContainerID: 0, Size: 1}}
+
+	archive := func() io.Reader {
+		return bytes.NewReader(makeArchiveSlice([]tar.Header{
+			{Name: "file.txt", Typeflag: tar.TypeReg, Size: 5, Mode: 0o644, ModTime: testDate},
+		}))
+	}
+
+	testCases := []struct {
+		name           string
+		createDestPath types.OptionalBool
+		destExists     bool
+		fail           bool
+	}{
+		{name: "unset-creates-dest", destExists: false},
+		{name: "true-creates-dest", createDestPath: types.OptionalBoolTrue, destExists: false},
+		{name: "false-missing-dest-fails", createDestPath: types.OptionalBoolFalse, destExists: false, fail: true},
+		{name: "false-existing-dest-succeeds", createDestPath: types.OptionalBoolFalse, destExists: true},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			dest := filepath.Join(root, "dest")
+			if tc.destExists {
+				require.NoError(t, os.Mkdir(dest, 0o755))
+			}
+
+			opts := PutOptions{UIDMap: uidMap, GIDMap: gidMap, CreateDestPath: tc.createDestPath}
+			err := PutContext(t.Context(), root, dest, opts, archive())
+
+			if tc.fail {
+				require.ErrorContains(t, err, "does not exist and CreateDestPath is false",
+					"expected the CreateDestPath guard to reject a missing destination")
+				return
+			}
+			require.NoError(t, err)
+
+			info, err := os.Stat(dest)
+			require.NoError(t, err, "destination should exist")
+			require.True(t, info.IsDir(), "destination should be a directory")
+
+			_, err = os.Stat(filepath.Join(dest, "file.txt"))
+			require.NoError(t, err, "file should have been written into dest")
+		})
+	}
+}
+
+func TestSymlinkNoChroot(t *testing.T) {
+	couldChroot := canChroot
+	canChroot = false
+	testSymlink(t)
+	canChroot = couldChroot
+}
+
+func testSymlink(t *testing.T) {
+	currentOwner := &idtools.IDPair{UID: os.Getuid(), GID: os.Getgid()}
+	symlinkOpts := func(modTime *time.Time) SymlinkOptions {
+		return SymlinkOptions{
+			ModTimeNew: modTime,
+			ChownNew:   currentOwner,
+		}
+	}
+
+	t.Run("basic", func(t *testing.T) {
+		root := t.TempDir()
+		err := SymlinkContext(t.Context(), root, "target", "newlink", symlinkOpts(nil))
+		require.NoError(t, err)
+
+		info, err := os.Lstat(filepath.Join(root, "newlink"))
+		require.NoError(t, err)
+		assert.NotEqual(t, info.Mode()&os.ModeSymlink, 0, "should be a symlink")
+
+		got, err := os.Readlink(filepath.Join(root, "newlink"))
+		require.NoError(t, err)
+		assert.Equal(t, "target", got)
+	})
+
+	t.Run("with-timestamp", func(t *testing.T) {
+		root := t.TempDir()
+		err := SymlinkContext(t.Context(), root, "target", "dated", symlinkOpts(&testDate))
+		require.NoError(t, err)
+
+		info, err := os.Lstat(filepath.Join(root, "dated"))
+		require.NoError(t, err)
+		assert.NotEqual(t, info.Mode()&os.ModeSymlink, 0)
+
+		if !testIgnoreSymlinkDates {
+			assert.Equal(t, testDate.Unix(), info.ModTime().Unix())
+		}
+	})
+
+	t.Run("nested-path", func(t *testing.T) {
+		archive := makeArchive([]tar.Header{
+			{Name: "subdir-a", Typeflag: tar.TypeDir, Mode: 0o755, ModTime: testDate},
+			{Name: "subdir-a/subdir-b", Typeflag: tar.TypeDir, Mode: 0o755, ModTime: testDate},
+		}, nil)
+		root, err := makeContextFromArchive(t, archive, "")
+		require.NoError(t, err)
+
+		err = SymlinkContext(t.Context(), root, "target", "subdir-a/subdir-b/deeplink", symlinkOpts(nil))
+		require.NoError(t, err)
+
+		got, err := os.Readlink(filepath.Join(root, "subdir-a", "subdir-b", "deeplink"))
+		require.NoError(t, err)
+		assert.Equal(t, "target", got)
+	})
+
+	t.Run("path-traversal", func(t *testing.T) {
+		root := t.TempDir()
+		err := SymlinkContext(t.Context(), root, "target", "../../escaped", symlinkOpts(nil))
+		require.NoError(t, err)
+
+		got, err := os.Readlink(filepath.Join(root, "escaped"))
+		require.NoError(t, err)
+		assert.Equal(t, "target", got)
+	})
+
+	t.Run("absolute-path", func(t *testing.T) {
+		root := t.TempDir()
+		err := SymlinkContext(t.Context(), root, "target", "/absolutelink", symlinkOpts(nil))
+		require.NoError(t, err)
+
+		got, err := os.Readlink(filepath.Join(root, "absolutelink"))
+		require.NoError(t, err)
+		assert.Equal(t, "target", got)
+	})
+
+	t.Run("overwrite", func(t *testing.T) {
+		root := t.TempDir()
+		err := SymlinkContext(t.Context(), root, "original-target", "link", symlinkOpts(nil))
+		require.NoError(t, err)
+
+		err = SymlinkContext(t.Context(), root, "new-target", "link", symlinkOpts(nil))
+		require.NoError(t, err)
+
+		got, err := os.Readlink(filepath.Join(root, "link"))
+		require.NoError(t, err)
+		assert.Equal(t, "new-target", got)
+	})
+}
+
+func TestAttemptUnpackDockerCompatibilityNoChroot(t *testing.T) {
+	couldChroot := canChroot
+	canChroot = false
+	testAttemptUnpackDockerCompatibility(t)
+	canChroot = couldChroot
+}
+
+func testAttemptUnpackDockerCompatibility(t *testing.T) {
+	uidMap := []idtools.IDMap{{HostID: os.Getuid(), ContainerID: 0, Size: 1}}
+	gidMap := []idtools.IDMap{{HostID: os.Getgid(), ContainerID: 0, Size: 1}}
+
+	// create a gzip'd tarball in memory containing a single file "hello.txt"
+	innerContent := []byte("hello from inside the archive")
+	var innerBuf bytes.Buffer
+	gw := gzip.NewWriter(&innerBuf)
+	tw := tar.NewWriter(gw)
+	err := tw.WriteHeader(&tar.Header{
+		Name:     "hello.txt",
+		Size:     int64(len(innerContent)),
+		Mode:     0o644,
+		Typeflag: tar.TypeReg,
+	})
+	require.NoError(t, err)
+	_, err = tw.Write(innerContent)
+	require.NoError(t, err)
+
+	err = tw.WriteHeader(&tar.Header{
+		Name:     "subdir",
+		Mode:     0o755,
+		Typeflag: tar.TypeDir,
+	})
+	require.NoError(t, err)
+
+	nestedFileContent := []byte("hello from nested directory")
+	err = tw.WriteHeader(&tar.Header{
+		Name:     "subdir/nested-file.txt",
+		Size:     int64(len(nestedFileContent)),
+		Mode:     0o644,
+		Typeflag: tar.TypeReg,
+	})
+	require.NoError(t, err)
+	_, err = tw.Write(nestedFileContent)
+	require.NoError(t, err)
+
+	err = tw.WriteHeader(&tar.Header{
+		Name:     "hardlink-to-hello.txt",
+		Linkname: "hello.txt",
+		Mode:     0o644,
+		Typeflag: tar.TypeLink,
+	})
+	require.NoError(t, err)
+
+	err = tw.WriteHeader(&tar.Header{
+		Name:     "link-to-hello.txt",
+		Linkname: "hello.txt",
+		Mode:     0o777,
+		Typeflag: tar.TypeSymlink,
+	})
+	require.NoError(t, err)
+
+	if uid == 0 {
+		err = tw.WriteHeader(&tar.Header{
+			Name:     "null-dev",
+			Devmajor: 1,
+			Devminor: 3,
+			Mode:     0o600,
+			Typeflag: tar.TypeChar,
+		})
+		require.NoError(t, err)
+	}
+
+	// nested tarball placed inside archive.tar.gz, unpacking does not recurse into it
+	nestedArchiveContent := []byte("hello from a tarball nested inside another tarball")
+	var nestedArchiveBuf bytes.Buffer
+	ngw := gzip.NewWriter(&nestedArchiveBuf)
+	ntw := tar.NewWriter(ngw)
+	err = ntw.WriteHeader(&tar.Header{
+		Name:     "should-not-be-extracted.txt",
+		Size:     int64(len(nestedArchiveContent)),
+		Mode:     0o644,
+		Typeflag: tar.TypeReg,
+	})
+	require.NoError(t, err)
+	_, err = ntw.Write(nestedArchiveContent)
+	require.NoError(t, err)
+	require.NoError(t, ntw.Close())
+	require.NoError(t, ngw.Close())
+	nestedArchiveBytes := nestedArchiveBuf.Bytes()
+
+	err = tw.WriteHeader(&tar.Header{
+		Name:     "nested.tar.gz",
+		Size:     int64(len(nestedArchiveBytes)),
+		Mode:     0o644,
+		Typeflag: tar.TypeReg,
+	})
+	require.NoError(t, err)
+	_, err = tw.Write(nestedArchiveBytes)
+	require.NoError(t, err)
+
+	require.NoError(t, tw.Close())
+	require.NoError(t, gw.Close())
+
+	// create an outer archive that contains the gzip'd tarball as a regular file
+	archiveBytes := innerBuf.Bytes()
+	plainFileContent := []byte("just an ordinary file, not an archive")
+	outerArchive := makeArchive([]tar.Header{
+		{
+			Name:     "archive.tar.gz",
+			Size:     int64(len(archiveBytes)),
+			Mode:     0o644,
+			Typeflag: tar.TypeReg,
+		},
+		{
+			Name:     "plain.txt",
+			Size:     int64(len(plainFileContent)),
+			Mode:     0o644,
+			Typeflag: tar.TypeReg,
+		},
+	}, map[string][]byte{
+		"archive.tar.gz": archiveBytes,
+		"plain.txt":      plainFileContent,
+	})
+
+	dest := t.TempDir()
+	putOptions := PutOptions{
+		UIDMap:                           uidMap,
+		GIDMap:                           gidMap,
+		AttemptUnpackDockerCompatibility: true,
+	}
+	err = Put(dest, dest, putOptions, outerArchive)
+	require.NoError(t, err)
+
+	// a plain file that is not an archive should be written unchanged
+	plainPath := filepath.Join(dest, "plain.txt")
+	plainOnDisk, err := os.ReadFile(plainPath)
+	require.NoError(t, err, "plain.txt should exist and be written as a normal file")
+	assert.Equal(t, plainFileContent, plainOnDisk)
+
+	// the inner file should have been extracted
+	extractedPath := filepath.Join(dest, "hello.txt")
+	content, err := os.ReadFile(extractedPath)
+	require.NoError(t, err, "extracted file hello.txt should exist")
+	assert.Equal(t, string(innerContent), string(content))
+
+	subdirPath := filepath.Join(dest, "subdir")
+	st, err := os.Stat(subdirPath)
+	require.NoError(t, err, "extracted directory subdir should exist")
+	assert.True(t, st.IsDir(), "subdir should be a directory")
+
+	nestedFilePath := filepath.Join(dest, "subdir", "nested-file.txt")
+	nestedContent, err := os.ReadFile(nestedFilePath)
+	require.NoError(t, err, "extracted file subdir/nested-file.txt should exist")
+	assert.Equal(t, string(nestedFileContent), string(nestedContent))
+
+	symlinkPath := filepath.Join(dest, "link-to-hello.txt")
+	linkTarget, err := os.Readlink(symlinkPath)
+	require.NoError(t, err, "extracted symlink link-to-hello.txt should exist")
+	assert.Equal(t, "hello.txt", linkTarget)
+
+	hardlinkPath := filepath.Join(dest, "hardlink-to-hello.txt")
+	hardlinkInfo, err := os.Stat(hardlinkPath)
+	require.NoError(t, err, "extracted hardlink-to-hello.txt should exist")
+	helloInfo, err := os.Stat(extractedPath)
+	require.NoError(t, err)
+	assert.True(t, os.SameFile(helloInfo, hardlinkInfo), "hardlink-to-hello.txt should be a hardlink to hello.txt")
+
+	if uid == 0 {
+		devPath := filepath.Join(dest, "null-dev")
+		st, err := os.Lstat(devPath)
+		require.NoError(t, err, "extracted device node null-dev should exist")
+		assert.NotEqual(t, os.FileMode(0), st.Mode()&os.ModeCharDevice, "null-dev should be a character device")
+	}
+
+	// the archive file gets extracted instead of copied
+	archivePath := filepath.Join(dest, "archive.tar.gz")
+	_, err = os.Stat(archivePath)
+	assert.True(t, os.IsNotExist(err), "archive.tar.gz should not exist on disk; it was extracted instead of copied")
+
+	// nested.tar.gz must not be extracted, only the top level archive is
+	nestedArchivePath := filepath.Join(dest, "nested.tar.gz")
+	nestedArchiveOnDisk, err := os.ReadFile(nestedArchivePath)
+	require.NoError(t, err, "nested.tar.gz should exist as a file, not be extracted")
+	assert.Equal(t, nestedArchiveBytes, nestedArchiveOnDisk, "nested.tar.gz should be written out byte-for-byte, not expanded")
+
+	extractedNestedPath := filepath.Join(dest, "should-not-be-extracted.txt")
+	_, err = os.Stat(extractedNestedPath)
+	assert.True(t, os.IsNotExist(err), "contents of nested.tar.gz should not have been extracted")
 }

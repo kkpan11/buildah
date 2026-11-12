@@ -28,8 +28,8 @@ load helpers
   run_buildah inspect --type image --format '{{.OCIv1.Config}}' alpine-image
   inspect_after_commit=$output
 
-  # ...except that at some point in November 2019 buildah-inspect started
-  # including version. Strip it out,
+  # ...except that in #2510/#3036/#3829 we started adding a label with
+  # buildah's version. Strip it out for comparison.
   run_buildah --version
   local -a output_fields=($output)
   buildah_version=${output_fields[2]}
@@ -48,6 +48,16 @@ load helpers
   # This one should.
   run_buildah inspect --type image --format '{{.OCIv1.Config}}' $imageid
   expect_output "$inspect_after_commit"
+}
+
+@test "inspect-is-json" {
+  _prefetch alpine
+  run_buildah images -q --no-trunc
+  imageid="$output"
+  run_buildah inspect --type image "$imageid"
+  inspectoutput="$output"
+  # jq will complain if it's not valid JSON
+  run jq . <<< "$inspectoutput"
 }
 
 @test "inspect-config-is-json" {

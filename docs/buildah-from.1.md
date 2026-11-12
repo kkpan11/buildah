@@ -242,7 +242,9 @@ option to `false`.  The environment variables passed in include `http_proxy`,
 `https_proxy`, `ftp_proxy`, `no_proxy`, and also the upper case versions of
 those.
 
-Defaults to `true`
+The default for this option is taken from the `http_proxy` setting in the
+`[containers]` table of containers.conf(5). If unset, that value defaults to
+`true`.
 
 **--ipc** *how*
 
@@ -302,20 +304,11 @@ used for `buildah run`.
 
 Valid _mode_ values are:
 
-- **none**: no networking. Invalid if using **--dns**, **--dns-opt**, or **--dns-search**;
+- **none**: no networking. Invalid if using **--dns**, **--dns-option**, or **--dns-search**;
 - **host**: use the host network stack. Note: the host mode gives the container full access to local system services such as D-bus and is therefore considered insecure;
 - **ns:**_path_: path to a network namespace to join;
 - **private**: create a new namespace for the container (default)
 - **\<network name|ID\>**: Join the network with the given name or ID, e.g. use `--network mynet` to join the network with the name mynet. Only supported for rootful users.
-- **slirp4netns[:OPTIONS,...]**: use **slirp4netns**(1) to create a user network stack. This is the default for rootless containers. It is possible to specify these additional options, they can also be set with `network_cmd_options` in containers.conf:
-  - **allow_host_loopback=true|false**: Allow slirp4netns to reach the host loopback IP (default is 10.0.2.2 or the second IP from slirp4netns cidr subnet when changed, see the cidr option below). The default is false.
-  - **mtu=MTU**: Specify the MTU to use for this network. (Default is `65520`).
-  - **cidr=CIDR**: Specify ip range to use for this network. (Default is `10.0.2.0/24`).
-  - **enable_ipv6=true|false**: Enable IPv6. Default is true. (Required for `outbound_addr6`).
-  - **outbound_addr=INTERFACE**: Specify the outbound interface slirp binds to (ipv4 traffic only).
-  - **outbound_addr=IPv4**: Specify the outbound ipv4 address slirp binds to.
-  - **outbound_addr6=INTERFACE**: Specify the outbound interface slirp binds to (ipv6 traffic only).
-  - **outbound_addr6=IPv6**: Specify the outbound ipv6 address slirp binds to.
 - **pasta[:OPTIONS,...]**: use **pasta**(1) to create a user-mode networking
     stack. \
     This is only supported in rootless mode. \
@@ -341,13 +334,12 @@ Valid _mode_ values are:
     - **pasta:--mtu,1500**: Specify a 1500 bytes MTU for the _tap_ interface in
         the container.
     - **pasta:--ipv4-only,-a,10.0.2.0,-n,24,-g,10.0.2.2,--dns-forward,10.0.2.3,-m,1500,--no-ndp,--no-dhcpv6,--no-dhcp**,
-        equivalent to default slirp4netns(1) options: disable IPv6, assign
+        disable IPv6, assign
         `10.0.2.0/24` to the `tap0` interface in the container, with gateway
         `10.0.2.3`, enable DNS forwarder reachable at `10.0.2.3`, set MTU to 1500
         bytes, disable NDP, DHCPv6 and DHCP support.
     - **pasta:-I,tap0,--ipv4-only,-a,10.0.2.0,-n,24,-g,10.0.2.2,--dns-forward,10.0.2.3,--no-ndp,--no-dhcpv6,--no-dhcp**,
-        equivalent to default slirp4netns(1) options with Podman overrides: same as
-        above, but leave the MTU to 65520 bytes
+        same as above, but leave the MTU to 65520 bytes
     - **pasta:-t,auto,-u,auto,-T,auto,-U,auto**: enable automatic port forwarding
         based on observed bound ports from both host and container sides
     - **pasta:-T,5201**: enable forwarding of TCP port 5201 from container to
@@ -388,24 +380,24 @@ the help of emulation provided by packages like `qemu-user-static`.
 
 **--pull**
 
-When the flag is enabled or set explicitly to `true` (with *--pull=true*), attempt to pull the latest image from the registries
-listed in registries.conf if a local image does not exist or the image is newer
-than the one in storage. Raise an error if the image is not in any listed
-registry and is not present locally.
+Pull image policy. If not specified, the default is **missing**. If an explicit
+**--pull** argument is provided without any value, use the **always** behavior.
 
-If the flag is disabled (with *--pull=false*), do not pull the image from the
-registry, use only the local version. Raise an error if the image is not
-present locally.
+- **always**: Pull base and SBOM scanner images from the registries listed in
+registries.conf.  Raise an error if a base or SBOM scanner image is not found
+in the registries, even if an image with the same name is present locally.
 
-If the pull flag is set to `always` (with *--pull=always*),
-pull the image from the first registry it is found in as listed in registries.conf.
-Raise an error if not found in the registries, even if the image is present locally.
+- **missing**: SBOM scanner images only if they could not be found in the local
+containers storage.  Raise an error if no image could be found and the pull
+fails.
 
-If the pull flag is set to `never` (with *--pull=never*),
-Do not pull the image from the registry, use only the local version. Raise an error
-if the image is not present locally.
+- **never**: Do not pull base and SBOM scanner images from registries, use only
+the local versions.  Raise an error if the image is not present locally.
 
-Defaults to *true*.
+- **newer**: Pull base and SBOM scanner images from the registries listed in
+registries.conf if newer.  Raise an error if a base or SBOM scanner image is
+not found in the registries when image with the same name is not present
+locally.
 
 **--quiet**, **-q**
 
@@ -432,7 +424,7 @@ Security Options
   "label=type:TYPE"   : Set the label type for the container
   "label=level:LEVEL" : Set the label level for the container
   "label=disable"     : Turn off label confinement for the container
-  "no-new-privileges" : Not supported
+  "no-new-privileges" : Disable container processes from gaining additional privileges
 
   "seccomp=unconfined" : Turn off seccomp confinement for the container
   "seccomp=profile.json :  White listed syscalls seccomp Json file to be used as a seccomp filter
@@ -480,7 +472,7 @@ used for `buildah run`.
 The configured value can be "" (the empty string) or "container" to indicate
 that a new user namespace should be created, it can be "host" to indicate that
 the user namespace in which `Buildah` itself is being run should be reused, or
-it can be the path to an user namespace which is already in use by another
+it can be the path to a user namespace which is already in use by another
 process.
 
 **--userns-gid-map** *mapping*

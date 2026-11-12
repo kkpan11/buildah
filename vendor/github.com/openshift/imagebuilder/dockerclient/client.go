@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -17,13 +16,14 @@ import (
 	"strconv"
 	"strings"
 
-	dockerregistrytypes "github.com/docker/docker/api/types/registry"
 	docker "github.com/fsouza/go-dockerclient"
+	dockerregistrytypes "github.com/moby/moby/api/types/registry"
 	"k8s.io/klog"
 
 	"github.com/openshift/imagebuilder"
 	"github.com/openshift/imagebuilder/dockerfile/parser"
 	"github.com/openshift/imagebuilder/imageprogress"
+	"github.com/tonistiigi/dchapes-mode"
 )
 
 // NewClientFromEnv is exposed to simplify getting a client when vendoring this library.
@@ -189,10 +189,13 @@ func (e *ClientExecutor) Stages(b *imagebuilder.Builder, stages imagebuilder.Sta
 		} else {
 			from, err := b.From(stage.Node)
 			if err != nil {
-				return nil, err
+				return nil, fmt.Errorf("error: Determining base image: %v", err)
+			}
+			if b.After != "" {
+				return nil, fmt.Errorf("the --after flag in FROM is not supported by the dockerclient executor")
 			}
 			if prereq := e.Named[from]; prereq != nil {
-				b, ok := stages.ByName(from)
+				b, ok := stages[:i].ByName(from)
 				if !ok {
 					return nil, fmt.Errorf("error: Unable to find stage %s builder", from)
 				}
@@ -229,10 +232,10 @@ func (e *ClientExecutor) Stages(b *imagebuilder.Builder, stages imagebuilder.Sta
 		}
 
 		if err := stageExecutor.Prepare(stage.Builder, stage.Node, stageFrom); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("error: preparing stage using %q as base: %v", stageFrom, err)
 		}
 		if err := stageExecutor.Execute(stage.Builder, stage.Node); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("error: running stage: %v", err)
 		}
 
 		// remember the outcome of the stage execution on the container config in case
@@ -267,6 +270,9 @@ func (e *ClientExecutor) Prepare(b *imagebuilder.Builder, node *parser.Node, fro
 		from, err = b.From(node)
 		if err != nil {
 			return err
+		}
+		if b.After != "" {
+			return fmt.Errorf("the --after flag in FROM is not supported by the dockerclient executor")
 		}
 	}
 
@@ -741,7 +747,7 @@ func (e *ClientExecutor) createOrReplaceContainerPathWithOwner(path string, uid,
 		}
 		err := e.Client.DownloadFromContainer(e.Container.ID, docker.DownloadFromContainerOptions{
 			Path:         dest,
-			OutputStream: ioutil.Discard,
+			OutputStream: io.Discard,
 		})
 		return err
 	}
@@ -881,6 +887,21 @@ func (e *ClientExecutor) Copy(excludes []string, copies ...imagebuilder.Copy) er
 	for _, copy := range copies {
 		if copy.Checksum != "" {
 			return fmt.Errorf("ADD --checksum not supported")
+		}
+		if copy.Link {
+			return fmt.Errorf("ADD or COPY --link not supported")
+		}
+		if copy.Parents {
+			return fmt.Errorf("COPY --parents not supported")
+		}
+		if copy.KeepGitDir {
+			return fmt.Errorf("ADD --keep-git-dir not supported")
+		}
+		if copy.Unpack != nil {
+			return fmt.Errorf("ADD --unpack not supported")
+		}
+		if len(copy.Excludes) > 0 {
+			return fmt.Errorf("ADD or COPY --exclude not supported")
 		}
 		if len(copy.Files) > 0 {
 			return fmt.Errorf("Heredoc syntax is not supported")
@@ -1034,6 +1055,27 @@ func (e *ClientExecutor) getUser(userspec string) (int, int, error) {
 	return int(parsedUid), int(parsedGid), nil
 }
 
+// applyChmod rewrites h's permission bits per set, preserving the file-type
+// bits. It goes through h.FileInfo().Mode() so symbolic clauses see a correct
+// os.FileMode (ModeDir, and setuid/setgid/sticky in their flag positions),
+// then maps the result back onto the tar header's unix convention
+// (setuid/setgid/sticky at 0o4000/0o2000/0o1000). An absolute (numeric or
+// "=") mode replaces the permission and special bits entirely, matching
+// chmod(1).
+func applyChmod(h *tar.Header, set mode.Set) {
+	fm := set.Apply(h.FileInfo().Mode())
+	h.Mode = (h.Mode &^ 0o7777) | int64(fm.Perm())
+	if fm&os.ModeSetuid != 0 {
+		h.Mode |= 0o4000
+	}
+	if fm&os.ModeSetgid != 0 {
+		h.Mode |= 0o2000
+	}
+	if fm&os.ModeSticky != 0 {
+		h.Mode |= 0o1000
+	}
+}
+
 // CopyContainer copies the provided content into a destination container.
 func (e *ClientExecutor) CopyContainer(container *docker.Container, excludes []string, copies ...imagebuilder.Copy) error {
 	chownUid, chownGid := -1, -1
@@ -1052,14 +1094,12 @@ func (e *ClientExecutor) CopyContainer(container *docker.Container, excludes []s
 	for _, c := range copies {
 		var chmod func(h *tar.Header, r io.Reader) (data []byte, update bool, skip bool, err error)
 		if c.Chmod != "" {
-			parsed, err := strconv.ParseInt(c.Chmod, 8, 16)
+			parsed, err := mode.Parse(c.Chmod)
 			if err != nil {
-				return err
+				return fmt.Errorf("invalid chmod %q: %w", c.Chmod, err)
 			}
 			chmod = func(h *tar.Header, r io.Reader) (data []byte, update bool, skip bool, err error) {
-				mode := h.Mode &^ 0o777
-				mode |= parsed & 0o777
-				h.Mode = mode
+				applyChmod(h, parsed)
 				return nil, false, false, nil
 			}
 		}
@@ -1275,7 +1315,7 @@ func (e *ClientExecutor) isContainerGlobMultiple(client *docker.Client, from, gl
 
 	// take the remainder of the input and discard it
 	go func() {
-		n, err := io.Copy(ioutil.Discard, reader)
+		n, err := io.Copy(io.Discard, reader)
 		if n > 0 || err != nil {
 			klog.V(6).Infof("Discarded %d bytes from end of from glob check, and got error: %v", n, err)
 		}
@@ -1419,7 +1459,7 @@ func filterTarPipe(w *tar.Writer, r *tar.Reader, fn func(*tar.Header) bool) erro
 				return err
 			}
 		} else {
-			if _, err := io.Copy(ioutil.Discard, r); err != nil {
+			if _, err := io.Copy(io.Discard, r); err != nil {
 				return err
 			}
 		}
@@ -1429,7 +1469,7 @@ func filterTarPipe(w *tar.Writer, r *tar.Reader, fn func(*tar.Header) bool) erro
 // snapshotPath preserves the contents of path in container containerID as a temporary
 // archive, returning either an error or the path of the archived file.
 func snapshotPath(path, containerID, tempDir string, client *docker.Client) (string, error) {
-	f, err := ioutil.TempFile(tempDir, "archived-path")
+	f, err := os.CreateTemp(tempDir, "archived-path")
 	if err != nil {
 		return "", err
 	}

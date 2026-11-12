@@ -73,11 +73,17 @@ type Decorator interface {
 // To be used with `func Any(DecorFunc, ...WC) Decorator`.
 type DecorFunc func(Statistics) string
 
+// Sync type used by Synchronizer.
+type Sync struct {
+	Tx chan int
+	Rx chan int
+}
+
 // Synchronizer interface.
 // All decorators implement this interface implicitly. Its Sync
 // method exposes width sync channel, if DSyncWidth bit is set.
 type Synchronizer interface {
-	Sync() (chan int, bool)
+	Sync() (*Sync, bool)
 }
 
 // Formatter interface.
@@ -85,7 +91,7 @@ type Synchronizer interface {
 // in order to format string according to decor.WC settings.
 // No need to implement manually as long as decor.WC is embedded.
 type Formatter interface {
-	Format(string) (str string, viewWidth int)
+	Format(string) (_ string, width int)
 }
 
 // Wrapper interface.
@@ -129,26 +135,26 @@ var (
 // W represents width and C represents bit set of width related config.
 // A decorator should embed WC, to enable width synchronization.
 type WC struct {
-	W     int
-	C     int
-	fill  func(s string, w int) string
-	wsync chan int
+	W    int
+	C    int
+	sync *Sync
+	fill func(s string, w int) string
 }
 
 // Format should be called by any Decorator implementation.
 // Returns formatted string and its view (visual) width.
 func (wc WC) Format(str string) (string, int) {
-	viewWidth := runewidth.StringWidth(str)
-	if wc.W > viewWidth {
-		viewWidth = wc.W
+	width := runewidth.StringWidth(str)
+	if wc.W > width {
+		width = wc.W
 	} else if (wc.C & DextraSpace) != 0 {
-		viewWidth++
+		width++
 	}
 	if (wc.C & DSyncWidth) != 0 {
-		wc.wsync <- viewWidth
-		viewWidth = <-wc.wsync
+		wc.sync.Tx <- width
+		width = <-wc.sync.Rx
 	}
-	return wc.fill(str, viewWidth), viewWidth
+	return wc.fill(str, width), width
 }
 
 // Init initializes width related config.
@@ -159,19 +165,19 @@ func (wc *WC) Init() WC {
 		wc.fill = runewidth.FillLeft
 	}
 	if (wc.C & DSyncWidth) != 0 {
-		// it's deliberate choice to override wsync on each Init() call,
+		// it's deliberate choice to override wc.sync on each Init() call,
 		// this way globals like WCSyncSpace can be reused
-		wc.wsync = make(chan int)
+		wc.sync = &Sync{make(chan int, 1), make(chan int, 1)}
 	}
 	return *wc
 }
 
 // Sync is implementation of Synchronizer interface.
-func (wc WC) Sync() (chan int, bool) {
-	if (wc.C&DSyncWidth) != 0 && wc.wsync == nil {
+func (wc WC) Sync() (*Sync, bool) {
+	if (wc.C&DSyncWidth) != 0 && wc.sync == nil {
 		panic(fmt.Sprintf("%T is not initialized", wc))
 	}
-	return wc.wsync, (wc.C & DSyncWidth) != 0
+	return wc.sync, (wc.C & DSyncWidth) != 0
 }
 
 func initWC(wcc ...WC) WC {

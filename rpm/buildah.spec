@@ -7,19 +7,18 @@
 %global debug_package   %{nil}
 %endif
 
-# RHEL's default %%gobuild macro doesn't account for the BUILDTAGS variable, so we
-# set it separately here and do not depend on RHEL's go-[s]rpm-macros package
-# until that's fixed.
-# c9s bz: https://bugzilla.redhat.com/show_bug.cgi?id=2227328
-# c8s bz: https://bugzilla.redhat.com/show_bug.cgi?id=2227331
-%if %{defined rhel}
-%define gobuild(o:) go build -buildmode pie -compiler gc -tags="rpm_crashtraceback libtrust_openssl ${BUILDTAGS:-}" -ldflags "-linkmode=external -compressdwarf=false ${LDFLAGS:-} -B 0x$(head -c20 /dev/urandom|od -An -tx1|tr -d ' \\n') -extldflags '%__global_ldflags'" -a -v -x %{?**};
-%endif
-
 %global gomodulesmode GO111MODULE=on
 
-%if 0%{defined fedora}
+%if %{defined fedora}
 %define build_with_btrfs 1
+%endif
+
+%if 0%{?fedora} >= 43 || 0%{?rhel} >= 10
+%define sequoia 1
+%endif
+
+%if %{defined rhel}
+%define fips 1
 %endif
 
 %global git0 https://github.com/containers/%{name}
@@ -28,6 +27,8 @@ Name: buildah
 # Set different Epoch for copr
 %if %{defined copr_username}
 Epoch: 102
+%else
+Epoch: 2
 %endif
 # DO NOT TOUCH the Version string!
 # The TRUE source of this specfile is:
@@ -59,11 +60,11 @@ BuildRequires: go-rpm-macros
 BuildRequires: gpgme-devel
 BuildRequires: libassuan-devel
 BuildRequires: make
-BuildRequires: ostree-devel
 %if %{defined build_with_btrfs}
 BuildRequires: btrfs-progs-devel
 %endif
 BuildRequires: shadow-utils-subid-devel
+BuildRequires: sqlite-devel
 Requires: containers-common-extra
 %if %{defined fedora}
 BuildRequires: libseccomp-static
@@ -72,6 +73,9 @@ BuildRequires: libseccomp-devel
 %endif
 Requires: libseccomp >= 2.4.1-0
 Suggests: cpp
+%if %{defined sequoia}
+Requires: podman-sequoia
+%endif
 
 %description
 The %{name} package provides a command line tool which can be used to
@@ -82,12 +86,21 @@ or
 * save container's root file system layer to create a new image
 * delete a working container or an image
 
+# This subpackage is only intended for CI testing.
+# Not meant for end user/customer usage.
 %package tests
 Summary: Tests for %{name}
 
-Requires: %{name} = %{version}-%{release}
+Requires: %{name} = %{epoch}:%{version}-%{release}
+%if %{defined bats_epel}
 Requires: bats
+%else
+Recommends: bats
+%endif
 Requires: bzip2
+Requires: xz
+Requires: zstd
+Requires: which
 Requires: podman
 Requires: golang
 Requires: jq
@@ -95,6 +108,7 @@ Requires: httpd-tools
 Requires: openssl
 Requires: nmap-ncat
 Requires: git-daemon
+Requires: libselinux-utils
 
 %description tests
 %{summary}
@@ -117,18 +131,34 @@ CGO_CFLAGS=$(echo $CGO_CFLAGS | sed 's/-specs=\/usr\/lib\/rpm\/redhat\/redhat-an
 export CGO_CFLAGS+=" -m64 -mtune=generic -fcf-protection=full"
 %endif
 
-export CNI_VERSION=`grep '^# github.com/containernetworking/cni ' src/modules.txt | sed 's,.* ,,'`
-export LDFLAGS="-X main.buildInfo=`date +%s` -X main.cniVersion=${CNI_VERSION}"
+export LDFLAGS="-X main.buildInfo=`date +%s`"
 
-export BUILDTAGS="seccomp exclude_graphdriver_devicemapper $(hack/systemd_tag.sh) $(hack/libsubid_tag.sh)"
+export BUILDTAGS="seccomp $(hack/systemd_tag.sh) $(hack/libsubid_tag.sh) libsqlite3"
 %if !%{defined build_with_btrfs}
-export BUILDTAGS+=" btrfs_noversion exclude_graphdriver_btrfs"
+export BUILDTAGS+=" exclude_graphdriver_btrfs"
 %endif
 
+%if %{defined fips}
+export BUILDTAGS+=" libtrust_openssl"
+%endif
+
+%if %{defined sequoia}
+export BUILDTAGS+=" containers_image_sequoia"
+%endif
+
+%{__rm} -f internal/mkcw/embed/entrypoint_amd64.gz
+%{__make} internal/mkcw/embed/entrypoint_amd64.gz
 %gobuild -o bin/%{name} ./cmd/%{name}
 %gobuild -o bin/imgtype ./tests/imgtype
 %gobuild -o bin/copy ./tests/copy
 %gobuild -o bin/tutorial ./tests/tutorial
+%gobuild -o bin/inet ./tests/inet
+%gobuild -o bin/dumpspec ./tests/dumpspec
+%gobuild -o bin/passwd ./tests/passwd
+%gobuild -o bin/crash ./tests/crash
+%gobuild -o bin/wait ./tests/wait
+%gobuild -o bin/grpcnoop ./tests/rpc/noop
+%gobuild -o bin/pipeloop ./tests/pipeloop/pipeloop.go
 %{__make} docs
 
 %install
@@ -139,11 +169,21 @@ cp -pav tests/. %{buildroot}/%{_datadir}/%{name}/test/system
 cp bin/imgtype %{buildroot}/%{_bindir}/%{name}-imgtype
 cp bin/copy    %{buildroot}/%{_bindir}/%{name}-copy
 cp bin/tutorial %{buildroot}/%{_bindir}/%{name}-tutorial
+cp bin/inet     %{buildroot}/%{_bindir}/%{name}-inet
+cp bin/dumpspec %{buildroot}/%{_bindir}/%{name}-dumpspec
+cp bin/passwd %{buildroot}/%{_bindir}/%{name}-passwd
+cp bin/crash %{buildroot}/%{_bindir}/%{name}-crash
+cp bin/wait %{buildroot}/%{_bindir}/%{name}-wait
+cp bin/grpcnoop %{buildroot}/%{_bindir}/%{name}-grpcnoop
+cp bin/pipeloop %{buildroot}/%{_bindir}/%{name}-pipeloop
 
 rm %{buildroot}%{_datadir}/%{name}/test/system/tools/build/*
 
 #define license tag if not already defined
 %{!?_licensedir:%global license %doc}
+
+# Include check to silence rpmlint.
+%check
 
 %files
 %license LICENSE vendor/modules.txt
@@ -159,15 +199,14 @@ rm %{buildroot}%{_datadir}/%{name}/test/system/tools/build/*
 %{_bindir}/%{name}-imgtype
 %{_bindir}/%{name}-copy
 %{_bindir}/%{name}-tutorial
+%{_bindir}/%{name}-inet
+%{_bindir}/%{name}-dumpspec
+%{_bindir}/%{name}-passwd
+%{_bindir}/%{name}-crash
+%{_bindir}/%{name}-wait
+%{_bindir}/%{name}-grpcnoop
+%{_bindir}/%{name}-pipeloop
 %{_datadir}/%{name}/test
 
 %changelog
-%if %{defined autochangelog}
 %autochangelog
-%else
-# NOTE: This changelog will be visible on CentOS 8 Stream builds
-# Other envs are capable of handling autochangelog
-* Fri Jun 16 2023 RH Container Bot <rhcontainerbot@fedoraproject.org>
-- Placeholder changelog for envs that are not autochangelog-ready.
-- Contact upstream if you need to report an issue with the build.
-%endif

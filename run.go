@@ -1,24 +1,36 @@
 package buildah
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net"
 
-	"github.com/containers/buildah/define"
-	"github.com/containers/buildah/internal"
-	"github.com/containers/buildah/pkg/sshagent"
-	"github.com/containers/common/libnetwork/etchosts"
-	"github.com/containers/image/v5/types"
-	"github.com/containers/storage/pkg/lockfile"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
+	"go.podman.io/buildah/copier"
+	"go.podman.io/buildah/define"
+	"go.podman.io/buildah/internal"
+	"go.podman.io/buildah/pkg/sshagent"
+	"go.podman.io/common/libnetwork/etchosts"
+	"go.podman.io/image/v5/types"
+	"go.podman.io/storage/pkg/idtools"
+	"go.podman.io/storage/pkg/lockfile"
 )
 
 const (
 	// runUsingRuntimeCommand is a command we use as a key for reexec
 	runUsingRuntimeCommand = define.Package + "-oci-runtime"
 )
+
+// compatLayerExclusions is the set of items to omit from layers if
+// options.CompatLayerOmissions is set to true.  For whatever reason, the
+// classic builder didn't bake these into images, but BuildKit does.
+var compatLayerExclusions = []copier.ConditionalRemovePath{
+	{Path: "dev", Owner: &idtools.IDPair{UID: 0, GID: 0}},
+	{Path: "proc", Owner: &idtools.IDPair{UID: 0, GID: 0}},
+	{Path: "sys", Owner: &idtools.IDPair{UID: 0, GID: 0}},
+}
 
 // TerminalPolicy takes the value DefaultTerminal, WithoutTerminal, or WithTerminal.
 type TerminalPolicy int
@@ -118,11 +130,11 @@ type RunOptions struct {
 	// namespace), effectively deciding whether or not the process has a
 	// usable network.
 	ConfigureNetwork define.NetworkConfigurationPolicy
-	// CNIPluginPath is the location of CNI plugin helpers, if they should be
-	// run from a location other than the default location.
+	// Deprecated: CNIPluginPath was the location of CNI plugin helpers.
+	// It is no longer used and is expected to be empty.
 	CNIPluginPath string
-	// CNIConfigDir is the location of CNI configuration files, if the files in
-	// the default configuration directory shouldn't be used.
+	// Deprecated: CNIConfigDir was the location of CNI configuration files.
+	// It is no longer used and is expected to be empty.
 	CNIConfigDir string
 	// Terminal provides a way to specify whether or not the command should
 	// be run with a pseudoterminal.  By default (DefaultTerminal), a
@@ -157,35 +169,48 @@ type RunOptions struct {
 	SSHSources map[string]*sshagent.Source `json:"-"`
 	// RunMounts are unparsed mounts to be added for this run
 	RunMounts []string
-	// Map of stages and container mountpoint if any from stage executor
+	// Map of already-mounted stages, images, and container mountpoints
+	// which entries in `RunMounts` might be referring to.  If a value for
+	// the "" key is present, it points to the context directory.
 	StageMountPoints map[string]internal.StageMountDetails
-	// External Image mounts to be cleaned up.
-	// Buildah run --mount could mount image before RUN calls, RUN could cleanup
-	// them up as well
+	// IDs of mounted images to be unmounted before returning
+	// Deprecated: before 1.39, these images would not be consistently
+	// unmounted if Run() returned an error
 	ExternalImageMounts []string
 	// System context of current build
-	SystemContext *types.SystemContext
+	SystemContext *types.SystemContext `json:"-"`
 	// CgroupManager to use for running OCI containers
 	CgroupManager string
 	// CDIConfigDir is the location of CDI configuration files, if the files in
 	// the default configuration locations shouldn't be used.
 	CDIConfigDir string
+	// CompatBuiltinVolumes causes the contents of locations marked as
+	// volumes in the container's configuration to be set up as bind mounts to
+	// directories which are not in the container's rootfs, hiding changes
+	// made to contents of those changes when the container is subsequently
+	// committed.
+	CompatBuiltinVolumes types.OptionalBool
+	// ValidExitCodes is a list of exit codes which should be considered
+	// successful. If empty, only exit code 0 is considered success.
+	ValidExitCodes []int32
+	// Initial umask to set for the process.
+	Umask *uint32
 }
 
 // RunMountArtifacts are the artifacts created when using a run mount.
 type runMountArtifacts struct {
-	// RunMountTargets are the run mount targets inside the container
-	RunMountTargets []string
-	// TmpFiles are artifacts that need to be removed outside the container
-	TmpFiles []string
-	// Any external images which were mounted inside container
+	// RunOverlayDirs are overlay directories which will need to be cleaned up using overlay.RemoveTemp()
+	RunOverlayDirs []string
+	// Any images which were mounted, which should be unmounted
 	MountedImages []string
-	// Agents are the ssh agents started
+	// Agents are the ssh agents started, which should have their Shutdown() methods called
 	Agents []*sshagent.AgentServer
-	// SSHAuthSock is the path to the ssh auth sock inside the container
-	SSHAuthSock string
-	// TargetLocks to be unlocked if there are any.
+	// Lock files, which should have their Unlock() methods called
 	TargetLocks []*lockfile.LockFile
+	// Intermediate mount points, which should be Unmount()ed and Removed()d
+	IntermediateMounts []string
+	// Environment variables that should be set for RUN that may contain secrets, each is name=value form
+	EnvVars []string
 }
 
 // RunMountInfo are the available run mounts for this run
@@ -216,9 +241,17 @@ type IDMaps struct {
 
 // netResult type to hold network info for hosts/resolv.conf
 type netResult struct {
-	entries           etchosts.HostEntries
-	dnsServers        []string
-	excludeIPs        []net.IP
-	ipv6              bool
-	keepHostResolvers bool
+	entries                           etchosts.HostEntries
+	dnsServers                        []string
+	excludeIPs                        []net.IP
+	ipv6                              bool
+	keepHostResolvers                 bool
+	preferredHostContainersInternalIP string
+}
+
+// Run() calls RunContext() with context.TODO().
+//
+//go:fix inline
+func (b *Builder) Run(command []string, options RunOptions) error {
+	return b.RunContext(context.TODO(), command, options)
 }

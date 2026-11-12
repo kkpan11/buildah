@@ -3,9 +3,9 @@ package main
 import (
 	"fmt"
 
-	"github.com/containers/buildah/pkg/parse"
-	"github.com/containers/common/libimage"
 	"github.com/spf13/cobra"
+	"go.podman.io/buildah/pkg/parse"
+	"go.podman.io/common/libimage"
 )
 
 var (
@@ -18,7 +18,8 @@ var (
 
 		Example: `buildah tag imageName firstNewName
   buildah tag imageName firstNewName SecondNewName`,
-		Args: cobra.MinimumNArgs(2),
+		Args:    cobra.MinimumNArgs(2),
+		GroupID: groupImages,
 	}
 )
 
@@ -51,7 +52,7 @@ func tagCmd(c *cobra.Command, args []string) error {
 	return nil
 }
 
-func init() {
+func tagInit() {
 	tagCommand.SetUsageTemplate(UsageTemplate())
 	rootCmd.AddCommand(tagCommand)
 }

@@ -23,14 +23,34 @@ Defaults to false.
 Note: You can also override the default value of --add-history by setting the
 BUILDAH\_HISTORY environment variable. `export BUILDAH_HISTORY=true`
 
+**--allow-empty-wildcard**
+
+If set to true, don't return an error if globbing matches nothing. Only
+meaningful when **--allow-wildcard** is true. Defaults to false.
+
+**--allow-wildcard**
+
+Allow glob patterns in source paths. When set to false, source paths containing
+wildcard characters (*, ?, [) are rejected with an error. Defaults to true.
+
+**--cert-dir** *path*
+
+Use certificates at *path* (\*.crt, \*.cert, \*.key) when connecting to
+registries for pulling images named with the **--from** flag, and when
+connecting to HTTPS servers when fetching sources from locations specified with
+HTTPS URLs.  The default certificates directory is _/etc/containers/certs.d_.
+
 **--checksum** *checksum*
 
-Checksum the source content. The value of *checksum* must be a standard
-container digest string. Only supported for HTTP sources.
+Checksum the source content. For HTTP sources, the value of *checksum* must be
+a standard container digest string. For Git sources, the value of *checksum* must
+be a hex encoded Git commit SHA; a prefix of the full commit ID is sufficient,
+but must be at least 4 characters, matching Git's own minimum abbreviation length.
 
 **--chmod** *permissions*
 
-Sets the access permissions of the destination content. Accepts the numerical format.
+Sets the access permissions of the destination content. Accepts numerical or
+symbolic format.
 
 **--chown** *owner*:*group*
 
@@ -41,6 +61,13 @@ Sets the user and group ownership of the destination content.
 Build context directory. Specifying a context directory causes Buildah to
 chroot into that context directory. This means copying files pointed at
 by symbolic links outside of the chroot will fail.
+
+**--exclude** *pattern*
+
+Exclude copying files matching the specified pattern. The option can be specified
+multiple times. Patterns are matched against each file's path relative to the
+context directory (or, with **--from**, relative to the source container or image root).
+See containerignore(5) for supported formats.
 
 **--from** *containerOrImage*
 
@@ -53,21 +80,78 @@ can be used.
 
 Path to an alternative .containerignore (.dockerignore) file. Requires \-\-contextdir be specified.
 
+**--include** *pattern*
+
+Only copy files matching the specified pattern. The option can be specified multiple times.
+Patterns are matched against each file's path relative to the context directory being copied.
+If a path matches both an **--include** and an **--exclude** pattern, it will be excluded.
+See containerignore(5) for supported formats.
+
+**--keep-git-dir**
+
+When the source is a remote git repository, keep the cloned `.git` directory
+instead of stripping it out. Only meaningful for git sources. Defaults to false.
+
+**--link**
+
+Create an independent image layer for the added files instead of modifying the working
+container's filesystem. If `buildah run` creates a file and `buildah add --link` adds a file
+to the same path, the file from `buildah add --link` will be present in the committed image.
+The --link layer is applied after all container filesystem changes at commit time.
+
+**--no-follow-symlinks**
+
+When a local source is a symbolic link, copy the link as a symbolic link
+instead of dereferencing the link and copying the contents of the target.
+
 **--quiet**, **-q**
 
 Refrain from printing a digest of the added content.
 
+**--required-path** *path*
+
+Require that the specific path is present among the files matched by **--include**. This
+option can be specified multiple times. Must be used with **--include**; using **--required-path**
+without **--include** will fail.
+
 **--retry** *attempts*
 
-Number of times to retry in case of failure when performing pull of images from registry.
+Number of times to retry in case of failure when pulling images from registries
+or retrieving content from HTTPS URLs.
 
 Defaults to `3`.
 
 **--retry-delay** *duration*
 
-Duration of delay between retry attempts in case of failure when performing pull of images from registry.
+Duration of delay between retry attempts in case of failure when pulling images
+from registries or retrieving content from HTTPS URLs.
 
 Defaults to `2s`.
+
+**--timestamp** *seconds*
+
+Set the timestamp ("mtime") for added content to exactly this number of seconds
+since the epoch (Unix time 0, i.e., 00:00:00 UTC on 1 January 1970) to help
+allow for deterministic builds.
+
+The destination directory into which the content is being copied will most
+likely reflect the time at which the content was added to it.
+
+**--tls-verify** *bool-value*
+
+Require verification of certificates when retrieving sources from HTTPS
+locations, or when pulling images referred to with the **--from*** flag
+(defaults to true).  TLS verification cannot be used when talking to an
+insecure registry.
+
+**--unpack** *bool-value*
+
+Control whether archive content is extracted when added. By default, local
+archives are extracted and remote archives (HTTP/HTTPS URLs) are not. Use
+**--unpack=true** to extract remote archives, or **--unpack=false** to copy
+a local archive without extracting it. This corresponds to the **ADD --unpack=** *bool*
+instruction flag in a Containerfile/Dockerfile, which requires an explicit **true**
+or **false** value.
 
 ## EXAMPLE
 
@@ -86,6 +170,10 @@ buildah add containerID '/tmp/workingdir' '/tmp/workingdir'
 buildah add containerID 'https://github.com/containers/buildah/blob/main/README.md' '/tmp'
 
 buildah add containerID 'passwd' 'certs.d' /etc
+
+buildah add containerID '/tmp/myfiles-*' '/dest/'
+
+buildah add --allow-empty-wildcard=true containerID '/tmp/logs-*' '/dest/'
 
 ## FILES
 

@@ -1,30 +1,34 @@
 //go:build linux || freebsd
-// +build linux freebsd
 
 package chroot
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 
-	"github.com/containers/buildah/bind"
-	"github.com/containers/buildah/util"
-	"github.com/containers/storage/pkg/ioutils"
-	"github.com/containers/storage/pkg/reexec"
-	"github.com/containers/storage/pkg/unshare"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
+	lslog "github.com/sirupsen/logrus/hooks/slog"
+	"go.podman.io/buildah/bind"
+	"go.podman.io/buildah/internal/pty"
+	"go.podman.io/buildah/util"
+	"go.podman.io/storage/pkg/ioutils"
+	"go.podman.io/storage/pkg/reexec"
+	"go.podman.io/storage/pkg/unshare"
 	"golang.org/x/sys/unix"
 	"golang.org/x/term"
 )
@@ -34,8 +38,6 @@ const (
 	runUsingChrootCommand = "buildah-chroot-runtime"
 	// runUsingChrootExec is a command we use as a key for reexec
 	runUsingChrootExecCommand = "buildah-chroot-exec"
-	// containersConfEnv is an environment variable that we need to pass down except for the command itself
-	containersConfEnv = "CONTAINERS_CONF"
 )
 
 func init() {
@@ -49,12 +51,26 @@ func init() {
 type runUsingChrootExecSubprocOptions struct {
 	Spec       *specs.Spec
 	BundlePath string
+	NoPivot    bool
 }
 
-// RunUsingChroot runs a chrooted process, using some of the settings from the
+// RunUsingChroot() calls RunUsingChrootContext() with context.TODO().
+//
+//go:fix inline
+func RunUsingChroot(spec *specs.Spec, bundlePath, homeDir string, stdin io.Reader, stdout, stderr io.Writer, noPivot bool) (err error) {
+	return RunUsingChrootContext(context.TODO(), spec, bundlePath, homeDir, stdin, stdout, stderr, noPivot)
+}
+
+// RunUsingChrootContext runs a chrooted process, using some of the settings from the
 // passed-in spec, and using the specified bundlePath to hold temporary files,
 // directories, and mountpoints.
-func RunUsingChroot(spec *specs.Spec, bundlePath, homeDir string, stdin io.Reader, stdout, stderr io.Writer) (err error) {
+func RunUsingChrootContext(ctx context.Context, spec *specs.Spec, bundlePath, homeDir string, stdin io.Reader, stdout, stderr io.Writer, noPivot bool) (err error) {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
 	var confwg sync.WaitGroup
 	var homeFound bool
 	for _, env := range spec.Process.Env {
@@ -74,7 +90,7 @@ func RunUsingChroot(spec *specs.Spec, bundlePath, homeDir string, stdin io.Reade
 	if err != nil {
 		return err
 	}
-	if err = ioutils.AtomicWriteFile(filepath.Join(bundlePath, "config.json"), specbytes, 0600); err != nil {
+	if err = ioutils.AtomicWriteFile(filepath.Join(bundlePath, "config.json"), specbytes, 0o600); err != nil {
 		return fmt.Errorf("storing runtime configuration: %w", err)
 	}
 	logrus.Debugf("config = %v", string(specbytes))
@@ -98,6 +114,7 @@ func RunUsingChroot(spec *specs.Spec, bundlePath, homeDir string, stdin io.Reade
 	config, conferr := json.Marshal(runUsingChrootSubprocOptions{
 		Spec:       spec,
 		BundlePath: bundlePath,
+		NoPivot:    noPivot,
 	})
 	if conferr != nil {
 		return fmt.Errorf("encoding configuration for %q: %w", runUsingChrootCommand, conferr)
@@ -126,13 +143,11 @@ func RunUsingChroot(spec *specs.Spec, bundlePath, homeDir string, stdin io.Reade
 
 	// Start the grandparent subprocess.
 	cmd := unshare.Command(runUsingChrootCommand)
+	cmd.Cmd = reexec.CommandContext(ctx, runUsingChrootCommand) // TODO: add an unshare.CommandContext()
 	setPdeathsig(cmd.Cmd)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = stdin, stdout, stderr
 	cmd.Dir = "/"
 	cmd.Env = []string{fmt.Sprintf("LOGLEVEL=%d", logrus.GetLevel())}
-	if _, ok := os.LookupEnv(containersConfEnv); ok {
-		cmd.Env = append(cmd.Env, containersConfEnv+"="+os.Getenv(containersConfEnv))
-	}
 
 	interrupted := make(chan os.Signal, 100)
 	cmd.Hook = func(int) error {
@@ -148,12 +163,10 @@ func RunUsingChroot(spec *specs.Spec, bundlePath, homeDir string, stdin io.Reade
 	}
 
 	logrus.Debugf("Running %#v in %#v", cmd.Cmd, cmd)
-	confwg.Add(1)
-	go func() {
+	confwg.Go(func() {
 		_, conferr = io.Copy(pwriter, bytes.NewReader(config))
 		pwriter.Close()
-		confwg.Done()
-	}()
+	})
 	cmd.ExtraFiles = append([]*os.File{preader}, cmd.ExtraFiles...)
 	err = cmd.Run()
 	confwg.Wait()
@@ -174,9 +187,13 @@ func runUsingChrootMain() {
 	runtime.LockOSThread()
 
 	// Set logging.
+	logrus.SetOutput(io.Discard)
+	logrus.AddHook(lslog.NewHook(slog.Default(), nil))
 	if level := os.Getenv("LOGLEVEL"); level != "" {
 		if ll, err := strconv.Atoi(level); err == nil {
-			logrus.SetLevel(logrus.Level(ll))
+			ll := logrus.Level(ll)
+			logrus.SetLevel(ll)
+			slog.SetLogLoggerLevel(lslog.Level(ll).Level())
 		}
 		os.Unsetenv("LOGLEVEL")
 	}
@@ -197,6 +214,7 @@ func runUsingChrootMain() {
 		fmt.Fprintf(os.Stderr, "invalid options spec in runUsingChrootMain\n")
 		os.Exit(1)
 	}
+	noPivot := options.NoPivot
 
 	// Prepare to shuttle stdio back and forth.
 	rootUID32, rootGID32, err := util.GetHostRootIDs(options.Spec)
@@ -215,7 +233,7 @@ func runUsingChrootMain() {
 	var stderr io.Writer
 	fdDesc := make(map[int]string)
 	if options.Spec.Process.Terminal {
-		ptyMasterFd, ptyFd, err := getPtyDescriptors()
+		ptyMasterFd, ptyFd, err := pty.GetPtyDescriptors()
 		if err != nil {
 			logrus.Errorf("error opening PTY descriptors: %v", err)
 			os.Exit(1)
@@ -266,7 +284,7 @@ func runUsingChrootMain() {
 			logrus.Warnf("error %s ownership of container PTY %sto %d/%d: %v", op, from, rootUID, rootGID, err)
 		}
 		// Set permissions on the PTY.
-		if err = ctty.Chmod(0620); err != nil {
+		if err = ctty.Chmod(0o620); err != nil {
 			logrus.Errorf("error setting permissions of container PTY: %v", err)
 			os.Exit(1)
 		}
@@ -443,7 +461,7 @@ func runUsingChrootMain() {
 	}()
 
 	// Set up mounts and namespaces, and run the parent subprocess.
-	status, err := runUsingChroot(options.Spec, options.BundlePath, ctty, stdin, stdout, stderr, closeOnceRunning)
+	status, err := runUsingChroot(options.Spec, options.BundlePath, ctty, stdin, stdout, stderr, noPivot, closeOnceRunning)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error running subprocess: %v\n", err)
 		os.Exit(1)
@@ -464,7 +482,7 @@ func runUsingChrootMain() {
 // runUsingChroot, still in the grandparent process, sets up various bind
 // mounts and then runs the parent process in its own user namespace with the
 // necessary ID mappings.
-func runUsingChroot(spec *specs.Spec, bundlePath string, ctty *os.File, stdin io.Reader, stdout, stderr io.Writer, closeOnceRunning []*os.File) (wstatus unix.WaitStatus, err error) {
+func runUsingChroot(spec *specs.Spec, bundlePath string, ctty *os.File, stdin io.Reader, stdout, stderr io.Writer, noPivot bool, closeOnceRunning []*os.File) (wstatus unix.WaitStatus, err error) {
 	var confwg sync.WaitGroup
 
 	// Create a new mount namespace for ourselves and bind mount everything to a new location.
@@ -497,9 +515,10 @@ func runUsingChroot(spec *specs.Spec, bundlePath string, ctty *os.File, stdin io
 	config, conferr := json.Marshal(runUsingChrootExecSubprocOptions{
 		Spec:       spec,
 		BundlePath: bundlePath,
+		NoPivot:    noPivot,
 	})
 	if conferr != nil {
-		fmt.Fprintf(os.Stderr, "error re-encoding configuration for %q", runUsingChrootExecCommand)
+		fmt.Fprintf(os.Stderr, "error re-encoding configuration for %q\n", runUsingChrootExecCommand)
 		os.Exit(1)
 	}
 
@@ -516,9 +535,6 @@ func runUsingChroot(spec *specs.Spec, bundlePath string, ctty *os.File, stdin io
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = stdin, stdout, stderr
 	cmd.Dir = "/"
 	cmd.Env = []string{fmt.Sprintf("LOGLEVEL=%d", logrus.GetLevel())}
-	if _, ok := os.LookupEnv(containersConfEnv); ok {
-		cmd.Env = append(cmd.Env, containersConfEnv+"="+os.Getenv(containersConfEnv))
-	}
 	if ctty != nil {
 		cmd.Setsid = true
 		cmd.Ctty = ctty
@@ -526,7 +542,6 @@ func runUsingChroot(spec *specs.Spec, bundlePath string, ctty *os.File, stdin io
 	cmd.ExtraFiles = append([]*os.File{preader}, cmd.ExtraFiles...)
 	if err := setPlatformUnshareOptions(spec, cmd); err != nil {
 		return 1, fmt.Errorf("setting platform unshare options: %w", err)
-
 	}
 	interrupted := make(chan os.Signal, 100)
 	cmd.Hook = func(int) error {
@@ -545,12 +560,10 @@ func runUsingChroot(spec *specs.Spec, bundlePath string, ctty *os.File, stdin io
 	}
 
 	logrus.Debugf("Running %#v in %#v", cmd.Cmd, cmd)
-	confwg.Add(1)
-	go func() {
+	confwg.Go(func() {
 		_, conferr = io.Copy(pwriter, bytes.NewReader(config))
 		pwriter.Close()
-		confwg.Done()
-	}()
+	})
 	err = cmd.Run()
 	confwg.Wait()
 	signal.Stop(interrupted)
@@ -569,7 +582,7 @@ func runUsingChroot(spec *specs.Spec, bundlePath string, ctty *os.File, stdin io
 				}
 			}
 		}
-		fmt.Fprintf(os.Stderr, "process exited with error: %v", err)
+		fmt.Fprintf(os.Stderr, "process exited with error: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -587,9 +600,13 @@ func runUsingChrootExecMain() {
 	runtime.LockOSThread()
 
 	// Set logging.
+	logrus.SetOutput(io.Discard)
+	logrus.AddHook(lslog.NewHook(slog.Default(), nil))
 	if level := os.Getenv("LOGLEVEL"); level != "" {
 		if ll, err := strconv.Atoi(level); err == nil {
-			logrus.SetLevel(logrus.Level(ll))
+			ll := logrus.Level(ll)
+			logrus.SetLevel(ll)
+			slog.SetLogLoggerLevel(lslog.Level(ll).Level())
 		}
 		os.Unsetenv("LOGLEVEL")
 	}
@@ -621,8 +638,10 @@ func runUsingChrootExecMain() {
 	// Try to chroot into the root.  Do this before we potentially
 	// block the syscall via the seccomp profile. Allow the
 	// platform to override this - on FreeBSD, we use a simple
-	// jail to set the hostname in the container
+	// jail to set the hostname in the container, and on Linux
+	// we attempt to pivot_root.
 	if err := createPlatformContainer(options); err != nil {
+		logrus.Debugf("createPlatformContainer: %v", err)
 		var oldst, newst unix.Stat_t
 		if err := unix.Stat(options.Spec.Root.Path, &oldst); err != nil {
 			fmt.Fprintf(os.Stderr, "error stat()ing intended root directory %q: %v\n", options.Spec.Root.Path, err)
@@ -690,30 +709,39 @@ func runUsingChrootExecMain() {
 
 	// Drop privileges.
 	user := options.Spec.Process.User
+
+	// Check if /proc/self/setgroups is set to "deny" before attempting to set supplemental groups.
+	denied := setgroupsDenied()
+
 	if len(user.AdditionalGids) > 0 {
-		gids := make([]int, len(user.AdditionalGids))
-		for i := range user.AdditionalGids {
-			gids[i] = int(user.AdditionalGids[i])
-		}
-		logrus.Debugf("setting supplemental groups")
-		if err = syscall.Setgroups(gids); err != nil {
-			fmt.Fprintf(os.Stderr, "error setting supplemental groups list: %v", err)
-			os.Exit(1)
-		}
-	} else {
-		setgroups, _ := os.ReadFile("/proc/self/setgroups")
-		if strings.Trim(string(setgroups), "\n") != "deny" {
-			logrus.Debugf("clearing supplemental groups")
-			if err = syscall.Setgroups([]int{}); err != nil {
-				fmt.Fprintf(os.Stderr, "error clearing supplemental groups list: %v", err)
+		if denied {
+			logrus.Debugf("not setting supplemental groups %v: /proc/self/setgroups is \"deny\"", user.AdditionalGids)
+		} else {
+			gids := make([]int, len(user.AdditionalGids))
+			for i := range user.AdditionalGids {
+				gids[i] = int(user.AdditionalGids[i])
+			}
+			logrus.Debugf("setting supplemental groups")
+			if err = syscall.Setgroups(gids); err != nil {
+				fmt.Fprintf(os.Stderr, "error setting supplemental groups list: %v\n", err)
 				os.Exit(1)
 			}
+		}
+	} else {
+		if !denied {
+			logrus.Debugf("clearing supplemental groups")
+			if err = syscall.Setgroups([]int{}); err != nil {
+				fmt.Fprintf(os.Stderr, "error clearing supplemental groups list: %v\n", err)
+				os.Exit(1)
+			}
+		} else {
+			logrus.Debugf("not clearing supplemental groups: /proc/self/setgroups is \"deny\"")
 		}
 	}
 
 	logrus.Debugf("setting gid")
 	if err = unix.Setresgid(int(user.GID), int(user.GID), int(user.GID)); err != nil {
-		fmt.Fprintf(os.Stderr, "error setting GID: %v", err)
+		fmt.Fprintf(os.Stderr, "error setting GID: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -734,8 +762,22 @@ func runUsingChrootExecMain() {
 
 	logrus.Debugf("setting uid")
 	if err = unix.Setresuid(int(user.UID), int(user.UID), int(user.UID)); err != nil {
-		fmt.Fprintf(os.Stderr, "error setting UID: %v", err)
+		fmt.Fprintf(os.Stderr, "error setting UID: %v\n", err)
 		os.Exit(1)
+	}
+
+	if user.Umask != nil {
+		logrus.Debugf("setting umask %04o", *user.Umask)
+		unix.Umask(int(*user.Umask))
+	}
+
+	// Set $PATH to the value for the container, so that when args[0] is not an absolute path,
+	// exec.Command() can find it using exec.LookPath().
+	for _, env := range slices.Backward(options.Spec.Process.Env) {
+		if val, ok := strings.CutPrefix(env, "PATH="); ok {
+			os.Setenv("PATH", val)
+			break
+		}
 	}
 
 	// Actually run the specified command.
@@ -747,7 +789,7 @@ func runUsingChrootExecMain() {
 	logrus.Debugf("Running %#v (PATH = %q)", cmd, os.Getenv("PATH"))
 	interrupted := make(chan os.Signal, 100)
 	if err = cmd.Start(); err != nil {
-		fmt.Fprintf(os.Stderr, "process failed to start with error: %v", err)
+		fmt.Fprintf(os.Stderr, "process failed to start with error: %v\n", err)
 	}
 	go func() {
 		for range interrupted {
@@ -774,7 +816,7 @@ func runUsingChrootExecMain() {
 				}
 			}
 		}
-		fmt.Fprintf(os.Stderr, "process exited with error: %v", err)
+		fmt.Fprintf(os.Stderr, "process exited with error: %v\n", err)
 		os.Exit(1)
 	}
 }

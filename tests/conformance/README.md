@@ -15,25 +15,35 @@ Conformance tests use Docker CE to build images to be compared with images built
 
 ## Run conformance tests
 
-First, pull base images used by various conformance tests:
+These are the base images used by various conformance tests:
 ```
 bash
-docker pull alpine
-docker pull busybox
+docker pull mirror.gcr.io/golang
+docker pull mirror.gcr.io/alpine
+docker pull mirror.gcr.io/busybox
+docker pull quay.io/fedora/python-311:latest
 docker pull quay.io/libpod/centos:7
+docker pull quay.io/libpod/ubuntu:latest
+docker pull quay.io/libpod/busybox@sha256:32968e717e29f79e5b889721908b3be6d1573992e1f3ba4c9a41718e2728458c
+docker pull quay.io/libpod/busybox@sha256:1faaf7a75319417261267b3dcef6a2b14c8c5122d7fcc7abeb07a32bc19728fd
 ```
 
-Then you can run all of the tests with go test:
+This test program is used as input in a few of the conformance tests:
 ```
-go test -v -timeout=30m -tags "$(./btrfs_tag.sh) $(./btrfs_installed_tag.sh)" ./tests/conformance
+make tests/conformance/testdata/mount-targets/true
+```
+
+You can run all of the tests with go test (and under `buildah unshare` or `podman unshare` if you're not root):
+```
+go test -v -timeout=30m -tags "$(./btrfs_installed_tag.sh)" ./tests/conformance
 ```
 
 If you want to run one of the test cases you can use the "-run" flag:
 ```
-go test -v -timeout=30m -tags "$(./btrfs_tag.sh) $(./btrfs_installed_tag.sh)" -run TestConformance/shell ./tests/conformance
+go test -v -timeout=30m -tags "$(./btrfs_installed_tag.sh)" -run TestConformance/shell ./tests/conformance
 ```
 
 If you also want to build and compare on a line-by-line basis, run:
 ```
-go test -v -timeout=60m -tags "$(./btrfs_tag.sh) $(./btrfs_installed_tag.sh)" ./tests/conformance -compare-layers
+go test -v -timeout=60m -tags "$(./btrfs_installed_tag.sh)" ./tests/conformance -compare-layers
 ```

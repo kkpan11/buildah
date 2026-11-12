@@ -6,26 +6,30 @@ package cli
 
 import (
 	"fmt"
+	"maps"
 	"os"
 	"runtime"
 	"strings"
 
-	"github.com/containers/buildah/define"
-	"github.com/containers/buildah/pkg/completion"
-	"github.com/containers/buildah/pkg/parse"
-	commonComp "github.com/containers/common/pkg/completion"
-	"github.com/containers/common/pkg/config"
 	encconfig "github.com/containers/ocicrypt/config"
 	enchelpers "github.com/containers/ocicrypt/helpers"
-	"github.com/containers/storage/pkg/unshare"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/spf13/pflag"
+	"go.podman.io/buildah/define"
+	"go.podman.io/buildah/internal"
+	"go.podman.io/buildah/pkg/completion"
+	"go.podman.io/buildah/pkg/parse"
+	commonComp "go.podman.io/common/pkg/completion"
+	"go.podman.io/common/pkg/config"
+	"go.podman.io/storage/pkg/unshare"
 )
 
 // LayerResults represents the results of the layer flags
 type LayerResults struct {
-	ForceRm bool
-	Layers  bool
+	ForceRm     bool
+	Layers      bool
+	SaveStages  bool
+	StageLabels bool
 }
 
 // UserNSResults represents the results for the UserNS flags
@@ -40,10 +44,12 @@ type UserNSResults struct {
 
 // NameSpaceResults represents the results for Namespace flags
 type NameSpaceResults struct {
-	Cgroup        string
-	IPC           string
-	Network       string
-	CNIConfigDir  string
+	Cgroup  string
+	IPC     string
+	Network string
+	// Deprecated: CNIConfigDir is no longer used and is expected to be empty.
+	CNIConfigDir string
+	// Deprecated: CNIPlugInPath is no longer used and is expected to be empty.
 	CNIPlugInPath string
 	PID           string
 	UTS           string
@@ -51,74 +57,89 @@ type NameSpaceResults struct {
 
 // BudResults represents the results for Build flags
 type BudResults struct {
-	AllPlatforms        bool
-	Annotation          []string
-	Authfile            string
-	BuildArg            []string
-	BuildArgFile        []string
-	BuildContext        []string
-	CacheFrom           []string
-	CacheTo             []string
-	CacheTTL            string
-	CertDir             string
-	Compress            bool
-	Creds               string
-	CPPFlags            []string
-	DisableCompression  bool
-	DisableContentTrust bool
-	IgnoreFile          string
-	File                []string
-	Format              string
-	From                string
-	Iidfile             string
-	Label               []string
-	LayerLabel          []string
-	Logfile             string
-	LogSplitByPlatform  bool
-	Manifest            string
-	NoHostname          bool
-	NoHosts             bool
-	NoCache             bool
-	Timestamp           int64
-	OmitHistory         bool
-	OCIHooksDir         []string
-	Pull                string
-	PullAlways          bool
-	PullNever           bool
-	Quiet               bool
-	IdentityLabel       bool
-	Rm                  bool
-	Runtime             string
-	RuntimeFlags        []string
-	SbomPreset          string
-	SbomScannerImage    string
-	SbomScannerCommand  []string
-	SbomMergeStrategy   string
-	SbomOutput          string
-	SbomImgOutput       string
-	SbomPurlOutput      string
-	SbomImgPurlOutput   string
-	Secrets             []string
-	SSH                 []string
-	SignaturePolicy     string
-	SignBy              string
-	Squash              bool
-	SkipUnusedStages    bool
-	Stdin               bool
-	Tag                 []string
-	BuildOutput         string
-	Target              string
-	TLSVerify           bool
-	Jobs                int
-	LogRusage           bool
-	RusageLogFile       string
-	UnsetEnvs           []string
-	UnsetLabels         []string
-	Envs                []string
-	OSFeatures          []string
-	OSVersion           string
-	CWOptions           string
-	SBOMOptions         []string
+	AllPlatforms           bool
+	Annotation             []string
+	Authfile               string
+	BuildArg               []string
+	BuildArgFile           []string
+	BuildContext           []string
+	CacheFrom              []string
+	CacheTo                []string
+	CacheTTL               string
+	CertDir                string
+	Compress               bool
+	Creds                  string
+	CPPFlags               []string
+	CompressionFormat      string
+	CompressionLevel       int
+	ForceCompressionFormat bool
+	DisableCompression     bool
+	DisableContentTrust    bool
+	IgnoreFile             string
+	File                   []string
+	Format                 string
+	From                   string
+	Iidfile                string
+	IidfileRaw             string
+	InheritLabels          bool
+	InheritAnnotations     bool
+	Label                  []string
+	LayerLabel             []string
+	Logfile                string
+	LogSplitByPlatform     bool
+	Manifest               string
+	MetadataFile           string
+	NoHostname             bool
+	NoHosts                bool
+	NoCache                bool
+	NoCacheFilter          []string
+	Timestamp              int64
+	OmitHistory            bool
+	OCIHooksDir            []string
+	Pull                   string
+	PullAlways             bool
+	PullNever              bool
+	Quiet                  bool
+	IdentityLabel          bool
+	Rm                     bool
+	Runtime                string
+	RuntimeFlags           []string
+	SbomPreset             string
+	SbomScannerImage       string
+	SbomScannerCommand     []string
+	SbomMergeStrategy      string
+	SbomOutput             string
+	SbomImgOutput          string
+	SbomPurlOutput         string
+	SbomImgPurlOutput      string
+	Secrets                []string
+	SSH                    []string
+	SignaturePolicy        string
+	SignBy                 string
+	Squash                 bool
+	SkipUnusedStages       bool
+	Stdin                  bool
+	Tag                    []string
+	BuildOutputs           []string
+	Target                 string
+	TLSVerify              bool
+	Jobs                   int
+	LogRusage              bool
+	RusageLogFile          string
+	UnsetEnvs              []string
+	UnsetLabels            []string
+	UnsetAnnotations       []string
+	Envs                   []string
+	OSFeatures             []string
+	OSVersion              string
+	CWOptions              string
+	SBOMOptions            []string
+	CompatVolumes          bool
+	SourceDateEpoch        string
+	RewriteTimestamp       bool
+	CreatedAnnotation      bool
+	SourcePolicyFile       string
+	TransientRunMounts     []string
 }
 
 // FromAndBugResults represents the results for common flags
@@ -126,6 +147,7 @@ type BudResults struct {
 type FromAndBudResults struct {
 	AddHost        []string
 	BlobCache      string
+	BlobInfoCache  string
 	CapAdd         []string
 	CapDrop        []string
 	CDIConfigDir   string
@@ -182,10 +204,6 @@ func GetNameSpaceFlags(flags *NameSpaceResults) pflag.FlagSet {
 	fs.StringVar(&flags.Cgroup, "cgroupns", "", "'private', or 'host'")
 	fs.StringVar(&flags.IPC, string(specs.IPCNamespace), "", "'private', `path` of IPC namespace to join, or 'host'")
 	fs.StringVar(&flags.Network, string(specs.NetworkNamespace), "", "'private', 'none', 'ns:path' of network namespace to join, or 'host'")
-	fs.StringVar(&flags.CNIConfigDir, "cni-config-dir", "", "`directory` of CNI configuration files")
-	_ = fs.MarkHidden("cni-config-dir")
-	fs.StringVar(&flags.CNIPlugInPath, "cni-plugin-path", "", "`path` of CNI network plugins")
-	_ = fs.MarkHidden("cni-plugin-path")
 	fs.StringVar(&flags.PID, string(specs.PIDNamespace), "", "private, `path` of PID namespace to join, or 'host'")
 	fs.StringVar(&flags.UTS, string(specs.UTSNamespace), "", "private, :`path` of UTS namespace to join, or 'host'")
 	return fs
@@ -207,6 +225,8 @@ func GetLayerFlags(flags *LayerResults) pflag.FlagSet {
 	fs := pflag.FlagSet{}
 	fs.BoolVar(&flags.ForceRm, "force-rm", false, "always remove intermediate containers after a build, even if the build is unsuccessful.")
 	fs.BoolVar(&flags.Layers, "layers", UseLayers(), "use intermediate layers during build. Use BUILDAH_LAYERS environment variable to override.")
+	fs.BoolVar(&flags.SaveStages, "save-stages", false, "save intermediate stage images.")
+	fs.BoolVar(&flags.StageLabels, "stage-labels", false, "add metadata labels to intermediate stage images (requires --save-stages).")
 	return fs
 }
 
@@ -228,9 +248,16 @@ func GetBudFlags(flags *BudResults) pflag.FlagSet {
 	fs.StringVar(&flags.CacheTTL, "cache-ttl", "", "only consider cache images under specified duration.")
 	fs.StringVar(&flags.CertDir, "cert-dir", "", "use certificates at the specified path to access the registry")
 	fs.BoolVar(&flags.Compress, "compress", false, "this is a legacy option, which has no effect on the image")
+	fs.BoolVar(&flags.CompatVolumes, "compat-volumes", false, "preserve the contents of VOLUMEs during RUN instructions")
+	fs.BoolVar(&flags.InheritLabels, "inherit-labels", true, "inherit the labels from the base image or base stages.")
+	fs.BoolVar(&flags.InheritAnnotations, "inherit-annotations", true, "inherit the annotations from the base image or base stages.")
 	fs.StringArrayVar(&flags.CPPFlags, "cpp-flag", []string{}, "set additional flag to pass to C preprocessor (cpp)")
+	fs.BoolVar(&flags.CreatedAnnotation, "created-annotation", true, `set an "org.opencontainers.image.created" annotation in the image`)
 	fs.StringVar(&flags.Creds, "creds", "", "use `[username[:password]]` for accessing the registry")
 	fs.StringVarP(&flags.CWOptions, "cw", "", "", "confidential workload `options`")
+	fs.StringVar(&flags.CompressionFormat, "compression-format", "", "compression format to use for layers and cache")
+	fs.IntVar(&flags.CompressionLevel, "compression-level", 0, "compression level to use for layers and cache")
+	fs.BoolVar(&flags.ForceCompressionFormat, "force-compression", false, "use the specified compression algorithm even if the destination contains a differently-compressed variant already")
 	fs.BoolVarP(&flags.DisableCompression, "disable-compression", "D", true, "don't compress layers by default")
 	fs.BoolVar(&flags.DisableContentTrust, "disable-content-trust", false, "this is a Docker specific option and is a NOOP")
 	fs.StringArrayVar(&flags.Envs, "env", []string{}, "set environment variable for the image")
@@ -239,6 +266,7 @@ func GetBudFlags(flags *BudResults) pflag.FlagSet {
 	fs.StringSliceVarP(&flags.File, "file", "f", []string{}, "`pathname or URL` of a Dockerfile")
 	fs.StringVar(&flags.Format, "format", DefaultFormat(), "`format` of the built image's manifest and metadata. Use BUILDAH_FORMAT environment variable to override.")
 	fs.StringVar(&flags.Iidfile, "iidfile", "", "`file` to write the image ID to")
+	fs.StringVar(&flags.IidfileRaw, "iidfile-raw", "", "`file` to write the image ID to (without algorithm prefix)")
 	fs.IntVar(&flags.Jobs, "jobs", 1, "how many stages to run in parallel")
 	fs.StringArrayVar(&flags.Label, "label", []string{}, "set metadata for an image (default [])")
 	fs.StringArrayVar(&flags.LayerLabel, "layer-label", []string{}, "set metadata for an intermediate image (default [])")
@@ -257,14 +285,20 @@ func GetBudFlags(flags *BudResults) pflag.FlagSet {
 		panic(fmt.Sprintf("error marking the rusage-logfile flag as hidden: %v", err))
 	}
 	fs.StringVar(&flags.Manifest, "manifest", "", "add the image to the specified manifest list. Creates manifest list if it does not exist")
+	fs.StringVar(&flags.MetadataFile, "metadata-file", "", "`file` to write metadata about the image to")
 	fs.BoolVar(&flags.NoCache, "no-cache", false, "do not use existing cached images for the container build. Build from the start with a new set of cached layers.")
+	fs.StringArrayVar(&flags.NoCacheFilter, "no-cache-filter", []string{}, "do not use existing cached images for the specified build `stage`(s). May be used multiple times.")
 	fs.BoolVar(&flags.NoHostname, "no-hostname", false, "do not create new /etc/hostname file for RUN instructions, use the one from the base image.")
 	fs.BoolVar(&flags.NoHosts, "no-hosts", false, "do not create new /etc/hosts file for RUN instructions, use the one from the base image.")
 	fs.String("os", runtime.GOOS, "set the OS to the provided value instead of the current operating system of the host")
 	fs.StringArrayVar(&flags.OSFeatures, "os-feature", []string{}, "set required OS `feature` for the target image in addition to values from the base image")
 	fs.StringVar(&flags.OSVersion, "os-version", "", "set required OS `version` for the target image instead of the value from the base image")
-	fs.StringVar(&flags.Pull, "pull", "true", "pull base and SBOM scanner images from the registry if newer or not present in store, if false, only pull base and SBOM scanner images if not present, if always, pull base and SBOM scanner images even if the named images are present in store, if never, only use images present in store if available")
-	fs.Lookup("pull").NoOptDefVal = "true" //allow `--pull ` to be set to `true` as expected.
+	fs.StringVar(&flags.Pull, "pull", "missing", `pull base and SBOM scanner images from the registry. Values:
+always:  pull base and SBOM scanner images even if the named images are present in store.
+missing: pull base and SBOM scanner images if the named images are not present in store.
+never:   only use images present in store if available.
+newer:   only pull base and SBOM scanner images when newer images exist on the registry than those in the store.`)
+	fs.Lookup("pull").NoOptDefVal = "always" // treat a --pull with no argument like --pull=always
 	fs.BoolVar(&flags.PullAlways, "pull-always", false, "pull the image even if the named image is present in store")
 	if err := fs.MarkHidden("pull-always"); err != nil {
 		panic(fmt.Sprintf("error marking the pull-always flag as hidden: %v", err))
@@ -279,6 +313,7 @@ func GetBudFlags(flags *BudResults) pflag.FlagSet {
 	fs.BoolVar(&flags.Rm, "rm", true, "remove intermediate containers after a successful build")
 	// "runtime" definition moved to avoid name collision in podman build.  Defined in cmd/buildah/build.go.
 	fs.StringSliceVar(&flags.RuntimeFlags, "runtime-flag", []string{}, "add global flags for the container runtime")
+	fs.StringArrayVar(&flags.TransientRunMounts, "mount", []string{}, "set transient mounts for each RUN instruction, e.g. type=secret,id=mysecret")
 	fs.StringVar(&flags.SbomPreset, "sbom", "", "scan working container using `preset` configuration")
 	fs.StringVar(&flags.SbomScannerImage, "sbom-scanner-image", "", "scan working container using scanner command from `image`")
 	fs.StringArrayVar(&flags.SbomScannerCommand, "sbom-scanner-command", nil, "scan working container using `command` in scanner image")
@@ -293,18 +328,26 @@ func GetBudFlags(flags *BudResults) pflag.FlagSet {
 	if err := fs.MarkHidden("signature-policy"); err != nil {
 		panic(fmt.Sprintf("error marking the signature-policy flag as hidden: %v", err))
 	}
+	fs.StringVar(&flags.SourcePolicyFile, "source-policy-file", "", "`pathname` of source policy file for controlling source references during build")
 	fs.BoolVar(&flags.SkipUnusedStages, "skip-unused-stages", true, "skips stages in multi-stage builds which do not affect the final target")
+	sourceDateEpochUsageDefault := ", defaults to current time"
+	if v := os.Getenv(internal.SourceDateEpochName); v != "" {
+		sourceDateEpochUsageDefault = ""
+	}
+	fs.StringVar(&flags.SourceDateEpoch, "source-date-epoch", os.Getenv(internal.SourceDateEpochName), "set new timestamps in image info to `seconds` after the epoch"+sourceDateEpochUsageDefault)
+	fs.BoolVar(&flags.RewriteTimestamp, "rewrite-timestamp", false, "set timestamps in layers to no later than the value for --source-date-epoch")
 	fs.BoolVar(&flags.Squash, "squash", false, "squash all image layers into a single layer")
 	fs.StringArrayVar(&flags.SSH, "ssh", []string{}, "SSH agent socket or keys to expose to the build. (format: default|<id>[=<socket>|<key>[,<key>]])")
 	fs.BoolVar(&flags.Stdin, "stdin", false, "pass stdin into containers")
 	fs.StringArrayVarP(&flags.Tag, "tag", "t", []string{}, "tagged `name` to apply to the built image")
-	fs.StringVarP(&flags.BuildOutput, "output", "o", "", "output destination (format: type=local,dest=path)")
+	fs.StringArrayVarP(&flags.BuildOutputs, "output", "o", nil, "output destination (format: type=local,dest=path)")
 	fs.StringVar(&flags.Target, "target", "", "set the target build stage to build")
-	fs.Int64Var(&flags.Timestamp, "timestamp", 0, "set created timestamp to the specified epoch seconds to allow for deterministic builds, defaults to current time")
+	fs.Int64Var(&flags.Timestamp, "timestamp", 0, "set new timestamps in image info and layer to `seconds` after the epoch, defaults to current times")
 	fs.BoolVar(&flags.TLSVerify, "tls-verify", true, "require HTTPS and verify certificates when accessing the registry")
 	fs.String("variant", "", "override the `variant` of the specified image")
 	fs.StringSliceVar(&flags.UnsetEnvs, "unsetenv", nil, "unset environment variable from final image")
 	fs.StringSliceVar(&flags.UnsetLabels, "unsetlabel", nil, "unset label when inheriting labels from base image")
+	fs.StringSliceVar(&flags.UnsetAnnotations, "unsetannotation", nil, "unset annotation when inheriting annotations from base image")
 	return fs
 }
 
@@ -321,6 +364,8 @@ func GetBudFlagsCompletions() commonComp.FlagCompletions {
 	flagCompletion["cache-to"] = commonComp.AutocompleteNone
 	flagCompletion["cache-ttl"] = commonComp.AutocompleteNone
 	flagCompletion["cert-dir"] = commonComp.AutocompleteDefault
+	flagCompletion["compression-format"] = commonComp.AutocompleteNone
+	flagCompletion["compression-level"] = commonComp.AutocompleteNone
 	flagCompletion["cpp-flag"] = commonComp.AutocompleteNone
 	flagCompletion["creds"] = commonComp.AutocompleteNone
 	flagCompletion["cw"] = commonComp.AutocompleteNone
@@ -331,14 +376,18 @@ func GetBudFlagsCompletions() commonComp.FlagCompletions {
 	flagCompletion["hooks-dir"] = commonComp.AutocompleteNone
 	flagCompletion["ignorefile"] = commonComp.AutocompleteDefault
 	flagCompletion["iidfile"] = commonComp.AutocompleteDefault
+	flagCompletion["iidfile-raw"] = commonComp.AutocompleteDefault
 	flagCompletion["jobs"] = commonComp.AutocompleteNone
 	flagCompletion["label"] = commonComp.AutocompleteNone
 	flagCompletion["layer-label"] = commonComp.AutocompleteNone
 	flagCompletion["logfile"] = commonComp.AutocompleteDefault
 	flagCompletion["manifest"] = commonComp.AutocompleteDefault
+	flagCompletion["metadata-file"] = commonComp.AutocompleteDefault
+	flagCompletion["mount"] = commonComp.AutocompleteNone
 	flagCompletion["os"] = commonComp.AutocompleteNone
 	flagCompletion["os-feature"] = commonComp.AutocompleteNone
 	flagCompletion["os-version"] = commonComp.AutocompleteNone
+	flagCompletion["no-cache-filter"] = commonComp.AutocompleteNone
 	flagCompletion["output"] = commonComp.AutocompleteNone
 	flagCompletion["pull"] = commonComp.AutocompleteDefault
 	flagCompletion["runtime-flag"] = commonComp.AutocompleteNone
@@ -353,12 +402,15 @@ func GetBudFlagsCompletions() commonComp.FlagCompletions {
 	flagCompletion["secret"] = commonComp.AutocompleteNone
 	flagCompletion["sign-by"] = commonComp.AutocompleteNone
 	flagCompletion["signature-policy"] = commonComp.AutocompleteNone
+	flagCompletion["source-policy-file"] = commonComp.AutocompleteDefault
 	flagCompletion["ssh"] = commonComp.AutocompleteNone
+	flagCompletion["source-date-epoch"] = commonComp.AutocompleteNone
 	flagCompletion["tag"] = commonComp.AutocompleteNone
 	flagCompletion["target"] = commonComp.AutocompleteNone
 	flagCompletion["timestamp"] = commonComp.AutocompleteNone
 	flagCompletion["unsetenv"] = commonComp.AutocompleteNone
 	flagCompletion["unsetlabel"] = commonComp.AutocompleteNone
+	flagCompletion["unsetannotation"] = commonComp.AutocompleteNone
 	flagCompletion["variant"] = commonComp.AutocompleteNone
 	return flagCompletion
 }
@@ -374,7 +426,11 @@ func GetFromAndBudFlags(flags *FromAndBudResults, usernsResults *UserNSResults, 
 	fs.StringSliceVar(&flags.AddHost, "add-host", []string{}, "add a custom host-to-IP mapping (`host:ip`) (default [])")
 	fs.StringVar(&flags.BlobCache, "blob-cache", "", "assume image blobs in the specified directory will be available for pushing")
 	if err := fs.MarkHidden("blob-cache"); err != nil {
-		panic(fmt.Sprintf("error marking net flag as hidden: %v", err))
+		panic(fmt.Sprintf("error marking blob-cache flag as hidden: %v", err))
+	}
+	fs.StringVar(&flags.BlobInfoCache, "blob-info-cache-dir", "", "cache information about blobs in the specified directory instead of the default location")
+	if err := fs.MarkHidden("blob-info-cache-dir"); err != nil {
+		panic(fmt.Sprintf("error marking blob-info-cache flag as hidden: %v", err))
 	}
 	fs.StringSliceVar(&flags.CapAdd, "cap-add", []string{}, "add the specified capability when running (default [])")
 	fs.StringSliceVar(&flags.CapDrop, "cap-drop", []string{}, "drop the specified capability when running (default [])")
@@ -391,7 +447,7 @@ func GetFromAndBudFlags(flags *FromAndBudResults, usernsResults *UserNSResults, 
 	fs.StringSliceVar(&flags.DNSSearch, "dns-search", defaultContainerConfig.Containers.DNSSearches.Get(), "set custom DNS search domains")
 	fs.StringSliceVar(&flags.DNSServers, "dns", defaultContainerConfig.Containers.DNSServers.Get(), "set custom DNS servers or disable it completely by setting it to 'none', which prevents the automatic creation of `/etc/resolv.conf`.")
 	fs.StringSliceVar(&flags.DNSOptions, "dns-option", defaultContainerConfig.Containers.DNSOptions.Get(), "set custom DNS options")
-	fs.BoolVar(&flags.HTTPProxy, "http-proxy", true, "pass through HTTP Proxy environment variables")
+	fs.BoolVar(&flags.HTTPProxy, "http-proxy", defaultContainerConfig.Containers.HTTPProxy, "pass through HTTP Proxy environment variables")
 	fs.StringVar(&flags.Isolation, "isolation", DefaultIsolation(), "`type` of process isolation to use. Use BUILDAH_ISOLATION environment variable to override.")
 	fs.StringVarP(&flags.Memory, "memory", "m", "", "memory limit (format: <number>[<unit>], where unit = b, k, m or g)")
 	fs.StringVar(&flags.MemorySwap, "memory-swap", "", "swap limit equal to memory plus swap: '-1' to enable unlimited swap")
@@ -449,13 +505,9 @@ func GetFromAndBudFlagsCompletions() commonComp.FlagCompletions {
 
 	// Add in the usernamespace and namespace flag completions
 	userNsComp := GetUserNSFlagsCompletions()
-	for name, comp := range userNsComp {
-		flagCompletion[name] = comp
-	}
+	maps.Copy(flagCompletion, userNsComp)
 	namespaceComp := GetNameSpaceFlagsCompletions()
-	for name, comp := range namespaceComp {
-		flagCompletion[name] = comp
-	}
+	maps.Copy(flagCompletion, namespaceComp)
 
 	return flagCompletion
 }
@@ -510,7 +562,7 @@ func VerifyFlagsArgsOrder(args []string) error {
 }
 
 // AliasFlags is a function to handle backwards compatibility with old flags
-func AliasFlags(f *pflag.FlagSet, name string) pflag.NormalizedName {
+func AliasFlags(_ *pflag.FlagSet, name string) pflag.NormalizedName {
 	switch name {
 	case "net":
 		name = "network"
@@ -520,6 +572,8 @@ func AliasFlags(f *pflag.FlagSet, name string) pflag.NormalizedName {
 		name = "os"
 	case "purge":
 		name = "rm"
+	case "raw-iidfile":
+		name = "iidfile-raw"
 	case "tty":
 		name = "terminal"
 	}
@@ -544,14 +598,12 @@ func LookupEnvVarReferences(specs, environ []string) []string {
 	for _, spec := range specs {
 		if key, _, ok := strings.Cut(spec, "="); ok {
 			result = append(result, spec)
-
 		} else if key == "*" {
 			result = append(result, environ...)
-
 		} else {
 			prefix := key + "="
-			if strings.HasSuffix(key, "*") {
-				prefix = strings.TrimSuffix(key, "*")
+			if before, ok := strings.CutSuffix(key, "*"); ok {
+				prefix = before
 			}
 
 			for _, spec := range environ {

@@ -77,6 +77,28 @@ ignore the `cmd` value of the container image.  However if you use the array
 form, then the cmd will be appended onto the end of the entrypoint cmd and be
 executed together.
 
+Note: The string form is appended to the `sh -c` command as the entrypoint. The array form
+replaces entrypoint entirely.
+
+String Format:
+```
+$ buildah from scratch
+$ buildah config --entrypoint "/usr/bin/notashell" working-container
+$ buildah inspect --format '{{ .OCIv1.Config.Entrypoint }}' working-container
+[/bin/sh -c /usr/bin/notshell]
+$ buildah inspect --format '{{ .Docker.Config.Entrypoint }}' working-container
+[/bin/sh -c /usr/bin/notshell]
+```
+
+Array Format:
+```
+$ buildah config --entrypoint '["/usr/bin/notashell"]' working-container
+$ buildah inspect --format '{{ .OCIv1.Config.Entrypoint }}' working-container
+[/usr/bin/notashell]
+$ buildah inspect --format '{{ .Docker.Config.Entrypoint }}' working-container
+[/usr/bin/notashell]
+```
+
 **--env**, **-e** *env[=value]*
 
 Add a value (e.g. env=*value*) to the environment for containers based on any
@@ -107,6 +129,12 @@ Note: this setting is not present in the OCIv1 image format, so it is discarded 
 
 Specify how many times the command specified using the *--healthcheck* option
 can fail before the container is considered to be unhealthy.
+
+Note: this setting is not present in the OCIv1 image format, so it is discarded when writing images using OCIv1 formats.
+
+**--healthcheck-start-interval** *interval*
+
+Specify the time between health checks during the start period.
 
 Note: this setting is not present in the OCIv1 image format, so it is discarded when writing images using OCIv1 formats.
 
@@ -202,6 +230,10 @@ Note: this setting is not present in the OCIv1 image format, so it is discarded 
 **--stop-signal** *signal*
 
 Set default *stop signal* for container. This signal will be sent when container is stopped, default is SIGINT.
+
+**--unsetannotation** *annotation*
+
+Unset the image annotation, causing the annotation not to be inherited from the base image.
 
 **--unsetlabel** *label*
 

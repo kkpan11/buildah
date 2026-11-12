@@ -21,8 +21,8 @@ var (
 	}
 )
 
-func dumpBoltCmd(c *cobra.Command, args []string) error {
-	db, err := bolt.Open(args[0], 0600, &bolt.Options{ReadOnly: true})
+func dumpBoltCmd(_ *cobra.Command, args []string) error {
+	db, err := bolt.Open(args[0], 0o600, &bolt.Options{ReadOnly: true})
 	if err != nil {
 		return fmt.Errorf("opening database %q: %w", args[0], err)
 	}
@@ -32,7 +32,7 @@ func dumpBoltCmd(c *cobra.Command, args []string) error {
 		var b strings.Builder
 		for i := range value {
 			if value[i] <= 32 || value[i] >= 127 {
-				b.WriteString(fmt.Sprintf("\\%03o", value[i]))
+				fmt.Fprintf(&b, "\\%03o", value[i])
 			} else {
 				b.WriteByte(value[i])
 			}
@@ -69,6 +69,6 @@ func dumpBoltCmd(c *cobra.Command, args []string) error {
 	})
 }
 
-func init() {
+func dumpboltInit() {
 	rootCmd.AddCommand(dumpBoltCommand)
 }

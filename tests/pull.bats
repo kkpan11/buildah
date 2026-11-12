@@ -32,29 +32,27 @@ load helpers
   run_buildah 125 --registries-conf ${TEST_SOURCES}/registries.conf.block pull $WITH_POLICY_JSON docker.io/alpine
   expect_output --substring "registry docker.io is blocked in"
 
-  run_buildah --retry --registries-conf ${TEST_SOURCES}/registries.conf       pull $WITH_POLICY_JSON docker.io/alpine
+  run_buildah --retry pull $WITH_POLICY_JSON docker.io/alpine
 }
 
 @test "pull-from-registry" {
-  run_buildah --retry pull --registries-conf ${TEST_SOURCES}/registries.conf $WITH_POLICY_JSON busybox:glibc
-  run_buildah pull --registries-conf ${TEST_SOURCES}/registries.conf $WITH_POLICY_JSON busybox:latest
+  run_buildah --retry pull $WITH_POLICY_JSON busybox:glibc
+  run_buildah pull $WITH_POLICY_JSON busybox:latest
   run_buildah images --format "{{.Name}}:{{.Tag}}"
   expect_output --substring "busybox:glibc"
   expect_output --substring "busybox:latest"
-  # We need to see if this file is created after first pull in at least one test
-  [ -f ${TEST_SCRATCH_DIR}/root/defaultNetworkBackend ]
-
-  run_buildah --retry pull --registries-conf ${TEST_SOURCES}/registries.conf $WITH_POLICY_JSON quay.io/libpod/alpine_nginx:latest
+  run_buildah --retry pull $WITH_POLICY_JSON quay.io/libpod/alpine_nginx:latest
   run_buildah images --format "{{.Name}}:{{.Tag}}"
   expect_output --substring "alpine_nginx:latest"
 
   run_buildah rmi quay.io/libpod/alpine_nginx:latest
-  run_buildah --retry pull --registries-conf ${TEST_SOURCES}/registries.conf $WITH_POLICY_JSON quay.io/libpod/alpine_nginx
+  run_buildah --retry pull $WITH_POLICY_JSON quay.io/libpod/alpine_nginx
   run_buildah images --format "{{.Name}}:{{.Tag}}"
   expect_output --substring "alpine_nginx:latest"
 
-  run_buildah --retry pull --registries-conf ${TEST_SOURCES}/registries.conf $WITH_POLICY_JSON alpine@sha256:e9a2035f9d0d7cee1cdd445f5bfa0c5c646455ee26f14565dce23cf2d2de7570
-  run_buildah 125 pull --registries-conf ${TEST_SOURCES}/registries.conf $WITH_POLICY_JSON fakeimage/fortest
+  run_buildah --retry pull $WITH_POLICY_JSON alpine@sha256:634a8f35b5f16dcf4aaa0822adc0b1964bb786fca12f6831de8ddc45e5986a00
+
+  run_buildah 125 pull $WITH_POLICY_JSON fakeimage/fortest
   run_buildah images --format "{{.Name}}:{{.Tag}}"
   assert "$output" !~ "fakeimage/fortest" "fakeimage/fortest found in buildah images"
 }
@@ -207,8 +205,8 @@ load helpers
   run_buildah push $WITH_POLICY_JSON --encryption-key jwe:${TEST_SCRATCH_DIR}/tmp/mykey.pub busybox  oci:${TEST_SCRATCH_DIR}/tmp/busybox_enc
 
   # Try to pull encrypted image without key should fail
-  run_buildah 1 pull $WITH_POLICY_JSON oci:${TEST_SCRATCH_DIR}/tmp/busybox_enc
-  expect_output --substring "archive/tar: invalid tar header"
+  run_buildah 125 pull $WITH_POLICY_JSON oci:${TEST_SCRATCH_DIR}/tmp/busybox_enc
+  expect_output --substring "does not match config's DiffID"
 
   # Try to pull encrypted image with wrong key should fail
   run_buildah 125 pull $WITH_POLICY_JSON --decryption-key ${TEST_SCRATCH_DIR}/tmp/mykey2.pem oci:${TEST_SCRATCH_DIR}/tmp/busybox_enc
@@ -230,8 +228,8 @@ load helpers
   run_buildah push $WITH_POLICY_JSON --tls-verify=false --creds testuser:testpassword --encryption-key jwe:${TEST_SCRATCH_DIR}/tmp/mykey.pub busybox docker://localhost:${REGISTRY_PORT}/buildah/busybox_encrypted:latest
 
   # Try to pull encrypted image without key should fail
-  run_buildah 1 pull $WITH_POLICY_JSON --tls-verify=false --creds testuser:testpassword docker://localhost:${REGISTRY_PORT}/buildah/busybox_encrypted:latest
-  expect_output --substring "archive/tar: invalid tar header"
+  run_buildah 125 pull $WITH_POLICY_JSON --tls-verify=false --creds testuser:testpassword docker://localhost:${REGISTRY_PORT}/buildah/busybox_encrypted:latest
+  expect_output --substring "does not match config's DiffID"
 
   # Try to pull encrypted image with wrong key should fail, with diff. msg
   run_buildah 125 pull $WITH_POLICY_JSON --tls-verify=false --creds testuser:testpassword --decryption-key ${TEST_SCRATCH_DIR}/tmp/mykey2.pem docker://localhost:${REGISTRY_PORT}/buildah/busybox_encrypted:latest
@@ -257,8 +255,8 @@ load helpers
   run_buildah commit --iidfile /dev/null --tls-verify=false --creds testuser:testpassword $WITH_POLICY_JSON --encryption-key jwe:${TEST_SCRATCH_DIR}/tmp/mykey.pub -q $cid docker://localhost:${REGISTRY_PORT}/buildah/busybox_encrypted:latest
 
   # Try to pull encrypted image without key should fail
-  run_buildah 1 pull $WITH_POLICY_JSON --tls-verify=false --creds testuser:testpassword docker://localhost:${REGISTRY_PORT}/buildah/busybox_encrypted:latest
-  expect_output --substring "archive/tar: invalid tar header"
+  run_buildah 125 pull $WITH_POLICY_JSON --tls-verify=false --creds testuser:testpassword docker://localhost:${REGISTRY_PORT}/buildah/busybox_encrypted:latest
+  expect_output --substring "does not match config's DiffID"
 
   # Try to pull encrypted image with wrong key should fail
   run_buildah 125 pull $WITH_POLICY_JSON --tls-verify=false --creds testuser:testpassword --decryption-key ${TEST_SCRATCH_DIR}/tmp/mykey2.pem docker://localhost:${REGISTRY_PORT}/buildah/busybox_encrypted:latest
@@ -402,4 +400,11 @@ load helpers
   armiid=$output
 
   assert "$amdiid" != "$armiid" "AMD and ARM ids should differ"
+}
+
+@test "pull-policy-values" {
+  image=quay.io/libpod/busybox
+  for value in missing ifmissing notpresent always true never false ifnewer newer ; do
+    run_buildah pull --platform=linux/amd64 --policy="${value}" "${image}"
+  done
 }

@@ -12,7 +12,7 @@ load helpers
   echo === Begin CDI configuration in $cdidir/containers-cdi.yaml ===
   cat $cdidir/containers-cdi.yaml
   echo === End CDI configuration ===
-  run_buildah build $WITH_POLICY_JSON --cdi-config-dir=$cdidir --security-opt label=disable --device=containers.github.io/sample=all $BUDFILES/cdi
+  run_buildah build $WITH_POLICY_JSON --cdi-config-dir=$cdidir --security-opt label=disable --device=containers.github.io/sample=all --device=/dev/null:/dev/outsidenull:rwm $BUDFILES/cdi
 }
 
 @test "from with CDI" {
@@ -25,9 +25,9 @@ load helpers
   echo === Begin CDI configuration in $cdidir/containers-cdi.yaml ===
   cat $cdidir/containers-cdi.yaml
   echo === End CDI configuration ===
-  run_buildah from $WITH_POLICY_JSON --security-opt label=disable --cdi-config-dir=$cdidir --device=containers.github.io/sample=all busybox
+  run_buildah from $WITH_POLICY_JSON --security-opt label=disable --cdi-config-dir=$cdidir --device=containers.github.io/sample=all --device=/dev/null:/dev/outsidenull:rwm busybox
   cid="$output"
-  run_buildah run "$cid" cat /dev/containers-cdi.yaml
+  run_buildah run "$cid" cat /dev/containers-cdi.yaml /dev/outsidenull
 }
 
 @test "run with CDI" {
@@ -43,4 +43,31 @@ load helpers
   run_buildah from $WITH_POLICY_JSON --security-opt label=disable busybox
   cid="$output"
   run_buildah run --cdi-config-dir=$cdidir --device=containers.github.io/sample=all "$cid" cat /dev/containers-cdi.yaml
+}
+
+@test "info with CDI" {
+  skip_if_chroot
+  _prefetch busybox
+  cdidir=${TEST_SCRATCH_DIR}/cdi-config-dir
+  mkdir -p $cdidir
+  sed -e s:@@hostcdipath@@:$cdidir:g $BUDFILES/cdi/containers-cdi.yaml > $cdidir/containers-cdi.yaml
+  chmod 644 $cdidir/containers-cdi.yaml
+  cat > ${TEST_SCRATCH_DIR}/containers.conf <<-EOF
+  [engine]
+  cdi_spec_dirs = ["$cdidir"]
+EOF
+  echo === Begin CDI configuration in $cdidir/containers-cdi.yaml ===
+  cat $cdidir/containers-cdi.yaml
+  echo === End CDI configuration ===
+  CONTAINERS_CONF=${TEST_SCRATCH_DIR}/containers.conf run_buildah info
+  info="$output"
+  run jq .cdi <<< "$info"
+  assert $status -eq 0
+  cdi="$output"
+  echo === Begin CDI section of info output ===
+  echo "$cdi"
+  echo === End CDI section of info output ===
+  run jq -r '.vendors.["containers.github.io"].[0].["devices"].[0].["containerEdits"].["mounts"].[0].["containerPath"]' <<< "$cdi"
+  assert "$output" = "/dev/containers-cdi.yaml"
+  assert $status -eq 0
 }

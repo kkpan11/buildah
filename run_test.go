@@ -1,3 +1,5 @@
+//go:build linux || freebsd
+
 package buildah
 
 import (
@@ -10,6 +12,7 @@ import (
 )
 
 func TestAddRlimits(t *testing.T) {
+	t.Parallel()
 	tt := []struct {
 		name   string
 		ulimit []string
@@ -18,14 +21,14 @@ func TestAddRlimits(t *testing.T) {
 		{
 			name:   "empty ulimit",
 			ulimit: []string{},
-			test: func(e error, g *generate.Generator) error {
+			test: func(e error, _ *generate.Generator) error {
 				return e
 			},
 		},
 		{
 			name:   "invalid ulimit argument",
 			ulimit: []string{"bla"},
-			test: func(e error, g *generate.Generator) error {
+			test: func(e error, _ *generate.Generator) error {
 				if e == nil {
 					return errors.New("expected to receive an error but got nil")
 				}
@@ -39,7 +42,7 @@ func TestAddRlimits(t *testing.T) {
 		{
 			name:   "invalid ulimit type",
 			ulimit: []string{"bla=hard"},
-			test: func(e error, g *generate.Generator) error {
+			test: func(e error, _ *generate.Generator) error {
 				if e == nil {
 					return errors.New("expected to receive an error but got nil")
 				}

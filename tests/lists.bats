@@ -2,14 +2,14 @@
 
 load helpers
 
-IMAGE_LIST=docker://registry.k8s.io/pause:3.1
-IMAGE_LIST_DIGEST=docker://registry.k8s.io/pause@sha256:f78411e19d84a252e53bff71a4407a5686c46983a2c2eeed83929b888179acea
-IMAGE_LIST_INSTANCE=docker://registry.k8s.io/pause@sha256:f365626a556e58189fc21d099fc64603db0f440bff07f77c740989515c544a39
-IMAGE_LIST_AMD64_INSTANCE_DIGEST=sha256:59eec8837a4d942cc19a52b8c09ea75121acc38114a2c68b98983ce9356b8610
-IMAGE_LIST_ARM_INSTANCE_DIGEST=sha256:c84b0a3a07b628bc4d62e5047d0f8dff80f7c00979e1e28a821a033ecda8fe53
-IMAGE_LIST_ARM64_INSTANCE_DIGEST=sha256:f365626a556e58189fc21d099fc64603db0f440bff07f77c740989515c544a39
-IMAGE_LIST_PPC64LE_INSTANCE_DIGEST=sha256:bcf9771c0b505e68c65440474179592ffdfa98790eb54ffbf129969c5e429990
-IMAGE_LIST_S390X_INSTANCE_DIGEST=sha256:882a20ee0df7399a445285361d38b711c299ca093af978217112c73803546d5e
+IMAGE_LIST=docker://quay.io/libpod/k8s-pause:3.5-nowin
+IMAGE_LIST_DIGEST=docker://quay.io/libpod/k8s-pause@sha256:7b836454ece3b180021655dbafcf0d7cc1b0ad77015700cee53700a0009f5324
+IMAGE_LIST_INSTANCE=docker://quay.io/libpod/k8s-pause@sha256:76ca2030ac3433ab5bbcfdea286b0876b129fc276e0f9d2811674141ea7bab6b
+IMAGE_LIST_AMD64_INSTANCE_DIGEST=sha256:369201a612f7b2b585a8e6ca99f77a36bcdbd032463d815388a96800b63ef2c8
+IMAGE_LIST_ARM_INSTANCE_DIGEST=sha256:94ee124c4b0ca7c1315c06c31532f78a929051ae8da7f122f905b2cbbfb1ecba
+IMAGE_LIST_ARM64_INSTANCE_DIGEST=sha256:76ca2030ac3433ab5bbcfdea286b0876b129fc276e0f9d2811674141ea7bab6b
+IMAGE_LIST_PPC64LE_INSTANCE_DIGEST=sha256:95e406e45b39993dc89f964ab1ab42db30369bd3406c1b11ef2129ab18d9c7bb
+IMAGE_LIST_S390X_INSTANCE_DIGEST=sha256:fc5aae77765f7f26f729bad7bfb3cef1bf4e9260d616d173af4506b4f9fc63d3
 
 @test "manifest-create" {
     _prefetch busybox
@@ -21,15 +21,86 @@ IMAGE_LIST_S390X_INSTANCE_DIGEST=sha256:882a20ee0df7399a445285361d38b711c299ca09
     assert "$output" =~ "that name is already in use"
     run_buildah manifest create --amend foo
     assert "$output" == "$listid"
-    run_buildah manifest create --amend --annotation red=blue foo busybox
+    run_buildah manifest create --amend --annotation red=blue --annotation green=yellow,orange,purple foo busybox
     assert "$output" == "$listid"
     run_buildah manifest inspect foo
     assert "$output" =~ '"red": "blue"'
+    assert "$output" =~ '"green": "yellow,orange,purple"'
     assert "$output" =~ "${imagedigest}"
     # since manifest exists in local storage this should exit with `0`
     run_buildah manifest exists foo
     # since manifest does not exist in local storage this should exit with `1`
     run_buildah 1 manifest exists foo2
+}
+
+@test "manifest-create-amend-nonlist" {
+    run_buildah bud $WITH_POLICY_JSON -t amend-test:v1 $BUDFILES/from-scratch
+    run_buildah images -q amend-test:v1
+    originalid="$output"
+
+    # --amend should convert a non-list image into a manifest list
+    run_buildah manifest create --amend amend-test:v1
+    listid="$output"
+    # the list ID should differ from the original image
+    assert "$listid" != "$originalid" "list ID should differ from original image ID"
+    run_buildah manifest inspect amend-test:v1
+    # the original image should be the sole entry in the manifest list
+    nmanifests=$(jq '.manifests | length' <<< "$output")
+    assert "$nmanifests" -eq 1 "expected exactly 1 manifest entry"
+}
+
+@test "manifest-create-amend-nonlist-with-images" {
+    run_buildah bud $WITH_POLICY_JSON -t amend-add-test:v1 $BUDFILES/from-scratch
+    run_buildah bud $WITH_POLICY_JSON -t scratch-for-amend $BUDFILES/from-scratch
+
+    # --amend with a non-list image and additional images to add
+    run_buildah manifest create --amend amend-add-test:v1 scratch-for-amend
+    run_buildah manifest inspect amend-add-test:v1
+    # should contain the converted original + the added scratch image
+    nmanifests=$(jq '.manifests | length' <<< "$output")
+    assert "$nmanifests" -ge 2 "expected at least 2 manifest entries (converted + added)"
+}
+
+@test "manifest-create-replace" {
+    run_buildah bud $WITH_POLICY_JSON -t replace-test:v1 $BUDFILES/from-scratch
+    run_buildah images -q replace-test:v1
+    originalid="$output"
+
+    # --replace should untag the existing image and create a fresh empty list
+    run_buildah manifest create --replace replace-test:v1
+    listid="$output"
+    assert "$listid" != "$originalid" "list ID should differ from original image ID"
+    run_buildah manifest inspect replace-test:v1
+    # the new list should have no entries
+    nmanifests=$(jq '.manifests | length' <<< "$output")
+    assert "$nmanifests" -eq 0 "expected empty manifest list"
+    # the original image should still exist (just untagged from replace-test:v1)
+    run_buildah inspect "$originalid"
+}
+
+@test "manifest-create-replace-existing-list" {
+    _prefetch busybox
+    # create a list with an entry so it's non-empty
+    run_buildah manifest create replace-list-test:v1
+    originalid="$output"
+    run_buildah manifest add replace-list-test:v1 busybox
+    run_buildah manifest inspect replace-list-test:v1
+    noriginal=$(jq '.manifests | length' <<< "$output")
+    assert "$noriginal" -gt 0 "setup: original list should have entries"
+
+    # --replace should discard the old list and create a fresh empty one
+    run_buildah manifest create --replace replace-list-test:v1
+    newid="$output"
+    assert "$newid" != "$originalid" "new list ID should differ from original"
+    run_buildah manifest inspect replace-list-test:v1
+    nmanifests=$(jq '.manifests | length' <<< "$output")
+    assert "$nmanifests" -eq 0 "expected empty manifest list after replace"
+}
+
+@test "manifest-create-amend-replace-conflict" {
+    # --amend and --replace together should fail
+    run_buildah 125 manifest create --amend --replace fail-test:v1
+    assert "$output" =~ "mutually exclusive"
 }
 
 @test "manifest-inspect-id" {
@@ -55,15 +126,16 @@ IMAGE_LIST_S390X_INSTANCE_DIGEST=sha256:882a20ee0df7399a445285361d38b711c299ca09
     run sha256sum $TEST_SCRATCH_DIR/randomfile
     blobencoded="${output%% *}"
     run_buildah manifest create foo
-    run_buildah manifest add --artifact --artifact-type image/jpeg --artifact-layer-type image/not-validated --artifact-config-type text/x-not-really --artifact-subject busybox foo $TEST_SCRATCH_DIR/randomfile2
-    run_buildah manifest add --artifact --artifact-type image/png --artifact-layer-type image/not-validated --artifact-config-type text/x-not-really --artifact-subject busybox foo $TEST_SCRATCH_DIR/randomfile
+    run_buildah manifest add --artifact --artifact-type image/jpeg --artifact-layer-type image/not-validated --artifact-config-type text/x-not-really --artifact-subject busybox --artifact-annotation up=down foo $TEST_SCRATCH_DIR/randomfile2
+    run_buildah manifest add --artifact --artifact-type image/png --artifact-layer-type image/not-validated --artifact-config-type text/x-not-really --artifact-subject busybox --artifact-annotation left=right foo $TEST_SCRATCH_DIR/randomfile
     digest="${output##* }"
     alg="${digest%%:*}"
     encoded="${digest##*:}"
-    run_buildah manifest annotate --annotation red=blue foo $TEST_SCRATCH_DIR/randomfile
+    run_buildah manifest annotate --annotation red=blue --annotation green=yellow,orange,purple foo $TEST_SCRATCH_DIR/randomfile
     run_buildah manifest inspect foo
     assert "$output" =~ '"image/png"'
     assert "$output" =~ '"red": "blue"'
+    assert "$output" =~ '"green": "yellow,orange,purple"'
     run_buildah manifest push --all foo oci:$TEST_SCRATCH_DIR/pushed
     run cmp $TEST_SCRATCH_DIR/randomfile $TEST_SCRATCH_DIR/pushed/blobs/sha256/$blobencoded
     assert "$status" -eq 0 "pushed copy of random file did not match original"
@@ -72,7 +144,16 @@ IMAGE_LIST_S390X_INSTANCE_DIGEST=sha256:882a20ee0df7399a445285361d38b711c299ca09
     assert "$output" =~ '"artifactType":"image/png"' "cat $TEST_SCRATCH_DIR/pushed/blobs/$alg/$encoded"
     assert "$output" =~ '"mediaType":"image/not-validated"' "cat $TEST_SCRATCH_DIR/pushed/blobs/$alg/$encoded"
     assert "$output" =~ '"mediaType":"text/x-not-really"' "cat $TEST_SCRATCH_DIR/pushed/blobs/$alg/$encoded"
+    assert "$output" =~ '"annotations":\{"left":"right"\}' "cat $TEST_SCRATCH_DIR/pushed/blobs/$alg/$encoded"
     run_buildah manifest rm foo
+}
+
+@test "manifest-add-multiple-artifacts" {
+    run_buildah manifest create foo
+    createrandom $TEST_SCRATCH_DIR/randomfile4
+    createrandom $TEST_SCRATCH_DIR/randomfile3
+    run_buildah manifest add --artifact foo $TEST_SCRATCH_DIR/randomfile3 $TEST_SCRATCH_DIR/randomfile4
+    run_buildah manifest push --all foo oci:$TEST_SCRATCH_DIR/pushed
 }
 
 @test "manifest-add local image" {
@@ -84,6 +165,8 @@ IMAGE_LIST_S390X_INSTANCE_DIGEST=sha256:882a20ee0df7399a445285361d38b711c299ca09
 }
 
 @test "manifest-add-one" {
+    # This test must be run on amd64 to get an error when pulling an image from a different platform
+    skip_unless_arch amd64
     run_buildah manifest create foo
     run_buildah manifest add --arch=arm64 foo ${IMAGE_LIST_INSTANCE}
     run_buildah manifest inspect foo
@@ -109,9 +192,10 @@ IMAGE_LIST_S390X_INSTANCE_DIGEST=sha256:882a20ee0df7399a445285361d38b711c299ca09
     _prefetch busybox
     run_buildah manifest create foo
     run_buildah manifest add foo busybox
-    run_buildah manifest annotate --index --annotation red=blue foo
+    run_buildah manifest annotate --index --annotation red=blue --annotation green=yellow,orange,purple foo
     run_buildah manifest inspect foo
     assert "$output" =~ '"red": "blue"'
+    assert "$output" =~ '"green": "yellow,orange,purple"'
 }
 
 @test "manifest-annotate instance annotation" {
@@ -119,7 +203,7 @@ IMAGE_LIST_S390X_INSTANCE_DIGEST=sha256:882a20ee0df7399a445285361d38b711c299ca09
     run_buildah manifest create foo
     run_buildah manifest add foo busybox
     instance="${output##* }"
-    run_buildah manifest annotate --annotation red=blue foo "${instance}"
+    run_buildah manifest annotate --annotation red=blue --annotation green=yellow,orange,purple foo "${instance}"
     run_buildah manifest annotate --os OperatingSystem foo "${instance}"
     run_buildah manifest annotate --arch aRCHITECTURE foo "${instance}"
     run_buildah manifest annotate --variant vARIANT foo "${instance}"
@@ -127,6 +211,7 @@ IMAGE_LIST_S390X_INSTANCE_DIGEST=sha256:882a20ee0df7399a445285361d38b711c299ca09
     run_buildah manifest annotate --os-features OSFEATURE1 --os-features OSFEATURE2 foo "${instance}"
     run_buildah manifest inspect foo
     assert "$output" =~ '"red": "blue"'
+    assert "$output" =~ '"green": "yellow,orange,purple"'
     assert "$output" =~ '"os": "OperatingSystem"'
     assert "$output" =~ '"architecture": "aRCHITECTURE"'
     assert "$output" =~ '"variant": "vARIANT"'
@@ -169,6 +254,26 @@ IMAGE_LIST_S390X_INSTANCE_DIGEST=sha256:882a20ee0df7399a445285361d38b711c299ca09
 @test "manifest-rm failures" {
     run_buildah 125 manifest rm foo1
     expect_output --substring "foo1: image not known"
+}
+
+@test "manifest-push-with-timestamp" {
+    outpath=${TEST_SCRATCH_DIR}/out
+
+    run_buildah manifest create foo
+    run_buildah manifest add --all foo ${IMAGE_LIST}
+
+    run_buildah manifest push --timestamp=1 foo oci-archive:${outpath}.a
+    run_buildah manifest push --timestamp=0 foo oci-archive:${outpath}.b
+    sleep 1.1
+    run_buildah manifest push --timestamp=0 foo oci-archive:${outpath}.c
+
+    run_buildah manifest rm foo
+
+    # should be different ( || false is due to bats weirdness )
+    ! diff "${outpath}.a" "${outpath}.b" || false
+
+    # should be the same
+    diff "${outpath}.b" "${outpath}.c"
 }
 
 @test "manifest-push" {
@@ -218,6 +323,11 @@ IMAGE_LIST_S390X_INSTANCE_DIGEST=sha256:882a20ee0df7399a445285361d38b711c299ca09
     expect_output --substring ${IMAGE_LIST_S390X_INSTANCE_DIGEST##sha256:}
 }
 
+@test "manifest-push-all-default-true" {
+    run_buildah manifest push --help
+    expect_output --substring "all.*\(default true\).*authfile"
+}
+
 @test "manifest-push-purge" {
     run_buildah manifest create foo
     run_buildah manifest add --arch=arm64 foo ${IMAGE_LIST}
@@ -239,30 +349,52 @@ IMAGE_LIST_S390X_INSTANCE_DIGEST=sha256:882a20ee0df7399a445285361d38b711c299ca09
     run_buildah manifest add --arch=arm64 foo ${IMAGE_LIST}
     run_buildah manifest inspect foo
     run_buildah 125 manifest push --authfile /tmp/nonexistent $WITH_POLICY_JSON --purge foo dir:${TEST_SCRATCH_DIR}/pushed
+}
 
+@test "manifest-push-digestfile" {
+    run_buildah manifest create foo
+    run_buildah manifest add --arch=arm64 foo ${IMAGE_LIST}
+    digestfile=${TEST_SCRATCH_DIR}/digest.txt
+    run_buildah manifest push --digestfile "$digestfile" $WITH_POLICY_JSON foo dir:${TEST_SCRATCH_DIR}/pushed
+    pushed_digest=$(sha256sum ${TEST_SCRATCH_DIR}/pushed/manifest.json | awk '{print $1}')
+    expect_output --from="$(< "$digestfile")" "sha256:${pushed_digest}"
+}
+
+@test "manifest-push with digestfile should fail on push error without writing file" {
+    run_buildah manifest create foo
+    run_buildah manifest add --arch=arm64 foo ${IMAGE_LIST}
+    digestfile=${TEST_SCRATCH_DIR}/digest.txt
+    touch ${TEST_SCRATCH_DIR}/not-a-dir
+    run_buildah 125 manifest push --digestfile "$digestfile" $WITH_POLICY_JSON foo dir:${TEST_SCRATCH_DIR}/not-a-dir
+    expect_output --substring "not a directory"
+    test ! -e "$digestfile"
 }
 
 @test "manifest-from-tag" {
+    run_buildah info --format '{{.host.arch}}'
+    arch="$output"
     run_buildah from $WITH_POLICY_JSON --name test-container ${IMAGE_LIST}
-    run_buildah inspect --format ''{{.OCIv1.Architecture}}' ${IMAGE_LIST}
-    expect_output --substring $(go env GOARCH)
-    run_buildah inspect --format ''{{.OCIv1.Architecture}}' test-container
-    expect_output --substring $(go env GOARCH)
+    run_buildah inspect --format '{{.OCIv1.Architecture}}' ${IMAGE_LIST#docker://}
+    expect_output --substring "$arch"
+    run_buildah inspect --format '{{.OCIv1.Architecture}}' test-container
+    expect_output --substring "$arch"
 }
 
 @test "manifest-from-digest" {
+    run_buildah info --format '{{.host.arch}}'
+    arch="$output"
     run_buildah from $WITH_POLICY_JSON --name test-container ${IMAGE_LIST_DIGEST}
-    run_buildah inspect --format ''{{.OCIv1.Architecture}}' ${IMAGE_LIST_DIGEST}
-    expect_output --substring $(go env GOARCH)
-    run_buildah inspect --format ''{{.OCIv1.Architecture}}' test-container
-    expect_output --substring $(go env GOARCH)
+    run_buildah inspect --format '{{.OCIv1.Architecture}}' ${IMAGE_LIST_DIGEST#docker://}
+    expect_output --substring "$arch"
+    run_buildah inspect --format '{{.OCIv1.Architecture}}' test-container
+    expect_output --substring "$arch"
 }
 
 @test "manifest-from-instance" {
     run_buildah from $WITH_POLICY_JSON --name test-container ${IMAGE_LIST_INSTANCE}
-    run_buildah inspect --format ''{{.OCIv1.Architecture}}' ${IMAGE_LIST_INSTANCE}
+    run_buildah inspect --format '{{.OCIv1.Architecture}}' ${IMAGE_LIST_INSTANCE#docker://}
     expect_output --substring arm64
-    run_buildah inspect --format ''{{.OCIv1.Architecture}}' test-container
+    run_buildah inspect --format '{{.OCIv1.Architecture}}' test-container
     expect_output --substring arm64
 }
 
@@ -276,7 +408,7 @@ IMAGE_LIST_S390X_INSTANCE_DIGEST=sha256:882a20ee0df7399a445285361d38b711c299ca09
     # Remove the entry for the current arch from the list.
     arch=$(go env GOARCH)
     run_buildah manifest inspect test-list
-    archinstance=$(jq -r '.manifests|map(select(.platform.architecture=="'$arch'"))[].digest' <<< "$output")
+    archinstance=$(jq -r '.manifests|map(select(.platform.architecture=="'$arch'" and .platform.os=="linux"))[].digest' <<< "$output")
     run_buildah manifest remove test-list $archinstance
     # Try to build using the build cache.
     mkdir ${TEST_SCRATCH_DIR}/build
@@ -321,23 +453,39 @@ IMAGE_LIST_S390X_INSTANCE_DIGEST=sha256:882a20ee0df7399a445285361d38b711c299ca09
 
 @test "manifest-skip-some-base-images-with-all-platforms" {
     start_registry
-    run_buildah manifest create localhost:"${REGISTRY_PORT}"/base
-    run_buildah manifest add --all localhost:"${REGISTRY_PORT}"/base ${IMAGE_LIST}
+    local reg=localhost:"${REGISTRY_PORT}"
+    local registry_opts="--tls-verify=false --creds testuser:testpassword"
+    local pause_ref="${reg}/k8s-pause:3.5-nowin"
+    run_buildah manifest create "${reg}/base"
+    # Lima CI sets CI_USE_REGISTRY_CACHE and mirrors quay.io locally; Packit/Testing
+    # Farm does not, and manifest push can re-fetch quay.io and hit rate limits.
+    if [[ -n "${CI_USE_REGISTRY_CACHE}" ]]; then
+        run_buildah manifest add --all "${reg}/base" ${IMAGE_LIST}
+    else
+        which skopeo >/dev/null || skip "skopeo is not installed"
+        run_with_log skopeo copy --all \
+            --dest-tls-verify=false \
+            --dest-creds=testuser:testpassword \
+            ${IMAGE_LIST} \
+            docker://${pause_ref}
+        run_buildah pull ${registry_opts} "${pause_ref}"
+        run_buildah manifest add --all "${reg}/base" "${pause_ref}"
+    fi
     # get a count of how many "real" base images there are
-    run_buildah manifest inspect localhost:"${REGISTRY_PORT}"/base
+    run_buildah manifest inspect "${reg}/base"
     nbaseplatforms=$(grep '"platform"' <<< "$output" | wc -l)
     echo $nbaseplatforms base platforms
     # add some trash that we expect to skip in a --all-platforms build
-    run_buildah build --manifest localhost:"${REGISTRY_PORT}"/base --platform unknown/unknown --no-cache -f $BUDFILES/from-scratch/Containerfile2 $BUDFILES/from-scratch
-    run_buildah build --manifest localhost:"${REGISTRY_PORT}"/base --platform linux/unknown --no-cache -f $BUDFILES/from-scratch/Containerfile2 $BUDFILES/from-scratch
-    run_buildah build --manifest localhost:"${REGISTRY_PORT}"/base --platform unknown/amd64p32 --no-cache -f $BUDFILES/from-scratch/Containerfile2 $BUDFILES/from-scratch
+    run_buildah build --manifest "${reg}/base" --platform unknown/unknown --no-cache -f $BUDFILES/from-scratch/Containerfile2 $BUDFILES/from-scratch
+    run_buildah build --manifest "${reg}/base" --platform linux/unknown --no-cache -f $BUDFILES/from-scratch/Containerfile2 $BUDFILES/from-scratch
+    run_buildah build --manifest "${reg}/base" --platform unknown/amd64p32 --no-cache -f $BUDFILES/from-scratch/Containerfile2 $BUDFILES/from-scratch
     # add a known combination of OS/arch that we can be pretty sure wasn't already there
-    run_buildah build --manifest localhost:"${REGISTRY_PORT}"/base --platform linux/amd64p32 --no-cache -f $BUDFILES/from-scratch/Containerfile2 $BUDFILES/from-scratch
+    run_buildah build --manifest "${reg}/base" --platform linux/amd64p32 --no-cache -f $BUDFILES/from-scratch/Containerfile2 $BUDFILES/from-scratch
     # push the list to the local registry and clean up our local copy
-    run_buildah manifest push --tls-verify=false --creds testuser:testpassword --all localhost:"${REGISTRY_PORT}"/base
-    run_buildah rmi localhost:"${REGISTRY_PORT}"/base
+    run_buildah manifest push ${registry_opts} --all "${reg}/base"
+    run_buildah manifest rm "${reg}/base"
     # build a new list based on the valid base images in the list we just pushed
-    run_buildah build --tls-verify=false --creds testuser:testpassword --manifest derived --all-platforms --from localhost:"${REGISTRY_PORT}"/base $BUDFILES/from-base
+    run_buildah build ${registry_opts} --manifest derived --all-platforms --from "${reg}/base" $BUDFILES/from-base
     run_buildah manifest inspect derived
     nderivedplatforms=$(grep '"platform"' <<< "$output" | wc -l)
     echo $nderivedplatforms derived platforms

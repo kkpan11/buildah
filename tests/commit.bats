@@ -34,23 +34,61 @@ load helpers
   run_buildah from scratch
   CONT=$output
   unset XDG_RUNTIME_DIR
-  run_buildah mount $CONT
+  run_buildah_mount $CONT
   MNT=$output
   run cp ${TEST_SCRATCH_DIR}/file $MNT/file
-  run_buildah umount $CONT
+  run_buildah_umount $CONT
   run_buildah commit $CONT foo
   run_buildah images foo
   expect_output --substring "10.5 MB"
 }
 
-@test "commit-with-remove-identity-label" {
-  _prefetch alpine
-  run_buildah from --quiet --pull=false $WITH_POLICY_JSON alpine
+@test "commit-with-identity-label" {
+  run_buildah from scratch
   cid=$output
-  run_buildah commit --identity-label=false $WITH_POLICY_JSON $cid alpine-image
-  run_buildah images alpine-image
-  run_buildah inspect --format '{{printf "%q" .Docker.Config.Labels}}' alpine-image
-  expect_output "map[]"
+  touch $TEST_SCRATCH_DIR/content.txt
+  run_buildah add $cid $TEST_SCRATCH_DIR/content.txt /
+  run_buildah commit $cid scratch-image-1
+  run_buildah inspect --format '{{printf "%q" .Docker.Config.Labels}}' scratch-image-1
+  assert "$output" != "map[]"
+  run_buildah commit --identity-label=true $cid scratch-image-2
+  run_buildah inspect --format '{{printf "%q" .Docker.Config.Labels}}' scratch-image-2
+  assert "$output" != "map[]"
+}
+
+@test "commit-without-identity-label" {
+  run_buildah from scratch
+  cid=$output
+  touch $TEST_SCRATCH_DIR/content.txt
+  run_buildah add $cid $TEST_SCRATCH_DIR/content.txt /
+  run_buildah commit --identity-label=false $WITH_POLICY_JSON $cid scratch-image
+  run_buildah images scratch-image
+  run_buildah inspect --format '{{printf "%q" .Docker.Config.Labels}}' scratch-image
+  assert "$output" = "map[]"
+}
+
+@test "commit-suppressed-identity-label" {
+  run_buildah from scratch
+  cid=$output
+  touch $TEST_SCRATCH_DIR/content.txt
+  run_buildah add $cid $TEST_SCRATCH_DIR/content.txt /
+
+  run_buildah commit --source-date-epoch=60 $WITH_POLICY_JSON $cid scratch-image-1
+  run_buildah images scratch-image-1
+  run_buildah inspect --format '{{printf "%q" .Docker.Config.Labels}}' scratch-image-1
+  assert "$output" = "map[]"
+
+  export SOURCE_DATE_EPOCH=90
+  run_buildah commit $WITH_POLICY_JSON $cid scratch-image-2
+  unset SOURCE_DATE_EPOCH
+  run_buildah images scratch-image-2
+  run_buildah inspect --format '{{printf "%q" .Docker.Config.Labels}}' scratch-image-2
+  assert "$output" = "map[]"
+
+  run_buildah commit --timestamp=60 $WITH_POLICY_JSON $cid scratch-image-3
+  run_buildah images scratch-image-3
+  run_buildah inspect --format '{{printf "%q" .Docker.Config.Labels}}' scratch-image-3
+  assert "$output" = "map[]"
 }
 
 @test "commit format test" {
@@ -87,6 +125,24 @@ load helpers
   cid=$output
   run_buildah commit --iidfile /dev/null $WITH_POLICY_JSON -q $cid alpine-image
   expect_output ""
+}
+
+@test "commit iidfile" {
+  _prefetch busybox
+  run_buildah from --quiet --pull=false $WITH_POLICY_JSON busybox
+  cid=$output
+  run_buildah commit --iidfile ${TEST_SCRATCH_DIR}/iidfile.txt $cid
+  test -s ${TEST_SCRATCH_DIR}/iidfile.txt
+}
+
+@test "commit metadata-file" {
+  _prefetch busybox
+  run_buildah from --quiet --pull=false $WITH_POLICY_JSON busybox
+  cid=$output
+  run_buildah commit --metadata-file ${TEST_SCRATCH_DIR}/metadata.txt $cid
+  jq . ${TEST_SCRATCH_DIR}/metadata.txt
+  test -s ${TEST_SCRATCH_DIR}/metadata.txt
+  assert $(wc -c < ${TEST_SCRATCH_DIR}/metadata.txt) -gt 2
 }
 
 @test "commit rm test" {
@@ -171,18 +227,6 @@ load helpers
 
 	run_buildah inspect --format '{{ index .Docker.Config.Labels "io.buildah.version"}}' alpine-image
         expect_output "$buildah_version"
-}
-
-@test "commit-parent-id" {
-  _prefetch alpine
-  run_buildah from --quiet --pull $WITH_POLICY_JSON alpine
-  cid=$output
-  run_buildah inspect --format '{{.FromImageID}}' $cid
-  iid=$output
-
-  run_buildah commit $WITH_POLICY_JSON --format docker $cid alpine-image
-  run_buildah inspect --format '{{.Docker.Parent}}' alpine-image
-  expect_output "sha256:$iid" "alpine-image -> .Docker.Parent"
 }
 
 @test "commit-container-id" {
@@ -331,21 +375,21 @@ load helpers
   _prefetch busybox
   run_buildah from --quiet --pull=false $WITH_POLICY_JSON busybox
   cid=$output
-  createrandom ${BATS_TMPDIR}/randomfile1
-  createrandom ${BATS_TMPDIR}/randomfile2
+  createrandom ${TEST_SCRATCH_DIR}/randomfile1
+  createrandom ${TEST_SCRATCH_DIR}/randomfile2
 
   for method in --squash=false --squash=true ; do
-    run_buildah commit $method --add-file ${BATS_TMPDIR}/randomfile1:/randomfile1 $cid with-random-1
-    run_buildah commit $method --add-file ${BATS_TMPDIR}/randomfile2:/in-a-subdir/randomfile2 $cid with-random-2
-    run_buildah commit $method --add-file ${BATS_TMPDIR}/randomfile1:/randomfile1 --add-file ${BATS_TMPDIR}/randomfile2:/in-a-subdir/randomfile2 $cid with-random-both
+    run_buildah commit $method --add-file ${TEST_SCRATCH_DIR}/randomfile1:/randomfile1 $cid with-random-1
+    run_buildah commit $method --add-file ${TEST_SCRATCH_DIR}/randomfile2:/in-a-subdir/randomfile2 $cid with-random-2
+    run_buildah commit $method --add-file ${TEST_SCRATCH_DIR}/randomfile1:/randomfile1 --add-file ${TEST_SCRATCH_DIR}/randomfile2:/in-a-subdir/randomfile2 $cid with-random-both
 
     # first one should have the first file and not the second, and the shell should be there
     run_buildah from --quiet --pull=false $WITH_POLICY_JSON with-random-1
     cid=$output
-    run_buildah mount $cid
+    run_buildah_mount $cid
     mountpoint=$output
     test -s $mountpoint/bin/sh || test -L $mountpoint/bin/sh
-    cmp ${BATS_TMPDIR}/randomfile1 $mountpoint/randomfile1
+    cmp ${TEST_SCRATCH_DIR}/randomfile1 $mountpoint/randomfile1
     run stat -c %u:%g $mountpoint
     [ $status -eq 0 ]
     rootowner=$output
@@ -357,10 +401,10 @@ load helpers
     # second one should have the second file and not the first, and the shell should be there
     run_buildah from --quiet --pull=false $WITH_POLICY_JSON with-random-2
     cid=$output
-    run_buildah mount $cid
+    run_buildah_mount $cid
     mountpoint=$output
     test -s $mountpoint/bin/sh || test -L $mountpoint/bin/sh
-    cmp ${BATS_TMPDIR}/randomfile2 $mountpoint/in-a-subdir/randomfile2
+    cmp ${TEST_SCRATCH_DIR}/randomfile2 $mountpoint/in-a-subdir/randomfile2
     run stat -c %u:%g $mountpoint
     [ $status -eq 0 ]
     rootowner=$output
@@ -372,19 +416,308 @@ load helpers
     # third one should have both files, and the shell should be there
     run_buildah from --quiet --pull=false $WITH_POLICY_JSON with-random-both
     cid=$output
-    run_buildah mount $cid
+    run_buildah_mount $cid
     mountpoint=$output
     test -s $mountpoint/bin/sh || test -L $mountpoint/bin/sh
-    cmp ${BATS_TMPDIR}/randomfile1 $mountpoint/randomfile1
+    cmp ${TEST_SCRATCH_DIR}/randomfile1 $mountpoint/randomfile1
     run stat -c %u:%g $mountpoint
     [ $status -eq 0 ]
     rootowner=$output
     run stat -c %u:%g:%A $mountpoint/randomfile1
     [ $status -eq 0 ]
     assert ${rootowner}:-rw-r--r--
-    cmp ${BATS_TMPDIR}/randomfile2 $mountpoint/in-a-subdir/randomfile2
+    cmp ${TEST_SCRATCH_DIR}/randomfile2 $mountpoint/in-a-subdir/randomfile2
     run stat -c %u:%g:%A $mountpoint/in-a-subdir/randomfile2
     [ $status -eq 0 ]
     assert ${rootowner}:-rw-r--r--
   done
+}
+
+@test "commit with insufficient disk space" {
+  skip_if_rootless_environment
+  _prefetch busybox
+  local tmp=$TEST_SCRATCH_DIR/buildah-test
+  mkdir -p $tmp
+  mount -t tmpfs -o size=4M tmpfs $tmp
+  # Create a temporary file which should not be easy to compress,
+  # which we'll add to our container for committing, but which is
+  # larger than the filesystem where the layer blob that would
+  # contain it, compressed or not, would be written during commit.
+  run dd if=/dev/urandom of=$TEST_SCRATCH_DIR/8M bs=1M count=8
+  # Create a working container.
+  run_buildah from --pull=never $WITH_POLICY_JSON busybox
+  ctrID="$output"
+  # Copy the file into the working container.
+  run_buildah copy $ctrID $TEST_SCRATCH_DIR/8M /8M
+  # Try to commit the image.  The temporary copy of the layer diff should
+  # require more space than is available where we're telling it to store
+  # temporary things.
+  TMPDIR=$tmp run_buildah '?' commit $ctrID
+  umount $tmp
+  expect_output --substring "no space left on device"
+}
+
+@test "commit-with-source-date-epoch" {
+  _prefetch busybox
+  local url=https://raw.githubusercontent.com/containers/buildah/main/tests/bud/from-scratch/Dockerfile
+  local timestamp=60
+  local datestamp="1970-01-01T00:01:00Z"
+  mkdir -p $TEST_SCRATCH_DIR/context
+  createrandom $TEST_SCRATCH_DIR/context/randomfile1
+  createrandom $TEST_SCRATCH_DIR/context/randomfile2
+  run_buildah from -q busybox
+  local cid="$output"
+  run_buildah add --add-history "$cid" $TEST_SCRATCH_DIR/context/* /context
+  # commit using defaults
+  run_buildah commit "$cid" oci:$TEST_SCRATCH_DIR/default
+  # commit with an implicitly-provided timestamp
+  export local SOURCE_DATE_EPOCH=$timestamp
+  run_buildah commit "$cid" oci:$TEST_SCRATCH_DIR/implicit
+  run_buildah commit --rewrite-timestamp "$cid" oci:$TEST_SCRATCH_DIR/implicit-rewritten
+  unset SOURCE_DATE_EPOCH
+  # commit with an explicity-provided timestamp
+  run_buildah commit --source-date-epoch=$timestamp "$cid" oci:$TEST_SCRATCH_DIR/explicit
+  run_buildah commit --source-date-epoch=$timestamp --rewrite-timestamp "$cid" oci:$TEST_SCRATCH_DIR/explicit-rewritten
+
+  # check timestamps in the ones we forced: find the manifest's and config's digests
+  manifestdigest=$(oci_image_manifest_digest "$TEST_SCRATCH_DIR"/explicit)
+  manifestalg=${manifestdigest%%:*}
+  manifestval=${manifestdigest##*:}
+  configdigest=$(oci_image_config_digest "$TEST_SCRATCH_DIR"/explicit)
+  configalg=${configdigest%%:*}
+  configval=${configdigest##*:}
+  # check timestamps in the ones we forced: read the image creation date
+  config="$TEST_SCRATCH_DIR"/explicit/$(oci_image_config "$TEST_SCRATCH_DIR"/explicit)
+  run jq -r '.created' "$config"
+  echo "$output"
+  assert $status = 0 "looking for the image creation date"
+  assert "$output" = "$datestamp" "unexpected creation date for image"
+  # check timestamps in the ones we forced: read the image history entry dates
+  run jq -r '.history[-2].created' "$config"
+  echo "$output"
+  assert $status = 0 "looking for the image history entries"
+  jq '.history' "$config"
+  for line in "$lines[@]"; do
+    assert "$output" = "$datestamp" "unexpected datestamp for history entry"
+  done
+  # check timestamps in the ones we forced: extract the layer blob
+  layer="$TEST_SCRATCH_DIR"/explicit/$(oci_image_last_diff "$TEST_SCRATCH_DIR"/explicit)
+  mkdir -p "$TEST_SCRATCH_DIR"/layer
+  tar -C "$TEST_SCRATCH_DIR"/layer -xvf "$layer"
+  # check timestamps in the ones we forced: walk the layer blob, checking
+  # timestamps
+  for file in $(find $TEST_SCRATCH_DIR/layer/* -print) ; do
+    run stat -c %Y $file
+    assert $status = 0 "checking datestamp on $file in layer"
+    assert "$output" -gt "$timestamp" "unexpected datestamp on $file in layer"
+  done
+  # check timestamps in the ones we forced: check that we have an image config
+  # and manifest with the same digests when we set the source date epoch
+  # implicitly as we did when we forced them explicitly
+  test -s $TEST_SCRATCH_DIR/implicit/blobs/"$manifestalg"/"$manifestval"
+  test -s $TEST_SCRATCH_DIR/implicit/blobs/"$configalg"/"$configval"
+
+  # check timestamps in the ones we forced and rewrote timestamps in: the
+  # version where we rewrote timestamps in the layer should have produced
+  # different diffIDs, and thus a different config blob, and a different
+  # manifest, so the ones we just looked at shouldn't _also_ be in there
+  ! test -s $TEST_SCRATCH_DIR/explicit-rewritten/blobs/"$manifestalg"/"$manifestval"
+  ! test -s $TEST_SCRATCH_DIR/explicit-rewritten/blobs/"$configalg"/"$configval"
+
+  # check timestamps in the ones we forced and rewrote timestamps in: find the
+  # manifest's and config's digests
+  manifestdigest=$(oci_image_manifest_digest "$TEST_SCRATCH_DIR"/explicit-rewritten)
+  manifestalg=${manifestdigest%%:*}
+  manifestval=${manifestdigest##*:}
+  configdigest=$(oci_image_config_digest "$TEST_SCRATCH_DIR"/explicit-rewritten)
+  configalg=${configdigest%%:*}
+  configval=${configdigest##*:}
+  # check timestamps in the ones we forced and rewrote timestamps in: read the
+  # image creation date
+  config="$TEST_SCRATCH_DIR"/explicit-rewritten/$(oci_image_config "$TEST_SCRATCH_DIR"/explicit-rewritten)
+  run jq -r '.created' "$config"
+  echo "$output"
+  assert $status = 0 "looking for the image creation date"
+  assert "$output" = "$datestamp" "unexpected creation date for image"
+  # check timestamps in the ones we forced and rewrote timestamps in: read the
+  # image history entry dates
+  run jq -r '.history[-2].created' "$config"
+  echo "$output"
+  assert $status = 0 "looking for the image history entries"
+  jq '.history' "$config"
+  for line in "$lines[@]"; do
+    assert "$output" = "$datestamp" "unexpected datestamp for history entry"
+  done
+  # check timestamps in the ones we forced and rewrote timestamps in: extract
+  # the layer blob
+  layer="$TEST_SCRATCH_DIR"/explicit-rewritten/$(oci_image_last_diff "$TEST_SCRATCH_DIR"/explicit-rewritten)
+  rm -fr $TEST_SCRATCH_DIR/layer; mkdir -p $TEST_SCRATCH_DIR/layer
+  tar -C $TEST_SCRATCH_DIR/layer -xvf "$layer"
+  # check timestamps in the ones we forced and rewrote timestamps in: walk the
+  # layer blob, checking timestamps
+  for file in $(find $TEST_SCRATCH_DIR/layer/* -print) ; do
+    run stat -c %Y $file
+    assert $status = 0 "checking datestamp on $file in layer"
+    assert "$output" -le "$timestamp" "unexpected datestamp on $file in layer"
+  done
+  # check timestamps in the ones we forced and rewrote timestamps in: check
+  # that we have an image config and manifest with the same digests when we set
+  # the source date epoch implicitly as we did when we forced them explicitly
+  test -s $TEST_SCRATCH_DIR/implicit-rewritten/blobs/"$manifestalg"/"$manifestval"
+  test -s $TEST_SCRATCH_DIR/implicit-rewritten/blobs/"$configalg"/"$configval"
+
+  # check timestamps in the one we didn't force: find the manifest's and config's digests
+  manifestdigest=$(oci_image_manifest_digest "$TEST_SCRATCH_DIR"/default)
+  manifestalg=${manifestdigest%%:*}
+  manifestval=${manifestdigest##*:}
+  configdigest=$(oci_image_config_digest "$TEST_SCRATCH_DIR"/default)
+  configalg=${configdigest%%:*}
+  configval=${configdigest##*:}
+  # check timestamps in the one we didn't force: read the image creation date
+  config="$TEST_SCRATCH_DIR"/default/$(oci_image_config "$TEST_SCRATCH_DIR"/default)
+  run jq -r '.created' "$config"
+  echo "$output"
+  assert $status = 0 "looking for the image creation date"
+  assert "$output" != "$datestamp" "unexpected creation date for image"
+  # check timestamps in the one we didn't force: read the image history entry dates
+  run jq -r '.history[-2].created' "$config"
+  echo "$output"
+  assert $status = 0 "looking for the image history entries"
+  jq '.history' "$config"
+  for line in "$lines[@]"; do
+    assert "$output" != "$datestamp" "unexpected datestamp for history entry"
+  done
+  # check timestamps in the ones we didn't force: extract the layer blob
+  layer="$TEST_SCRATCH_DIR"/default/$(oci_image_last_diff "$TEST_SCRATCH_DIR"/default)
+  rm -fr $TEST_SCRATCH_DIR/layer; mkdir -p $TEST_SCRATCH_DIR/layer
+  tar -C $TEST_SCRATCH_DIR/layer -xvf "$layer"
+  # check timestamps in the ones we didn't force: walk the layer blob, checking timestamps
+  for file in $(find $TEST_SCRATCH_DIR/layer/* -print) ; do
+    run stat -c %Y $file
+    assert $status = 0 "checking datestamp on $file in layer"
+    assert "$output" != "$timestamp" "unexpected datestamp on $file in layer"
+  done
+}
+
+@test "commit-sets-created-annotation" {
+  _prefetch busybox
+  run_buildah from -q busybox
+  local cid="$output"
+  for annotation in a=b c=d ; do
+    local subdir=${annotation%%=*}
+    run_buildah commit --annotation $annotation "$cid" oci:${TEST_SCRATCH_DIR}/$subdir
+    local manifest=${TEST_SCRATCH_DIR}/$subdir/$(oci_image_manifest ${TEST_SCRATCH_DIR}/$subdir)
+    run jq -r '.annotations["'$subdir'"]' "$manifest"
+    assert $status -eq 0
+    echo "$output"
+    assert "$output" = ${annotation##*=}
+  done
+  for flagdir in default: timestamp:--timestamp=0 sde:--source-date-epoch=0 suppressed:--unsetannotation=org.opencontainers.image.created specific:--created-annotation=false explicit:--created-annotation=true ; do
+    local flag=${flagdir##*:}
+    local subdir=${flagdir%%:*}
+    run_buildah commit $flag "$cid" oci:${TEST_SCRATCH_DIR}/$subdir
+    local manifest=${TEST_SCRATCH_DIR}/$subdir/$(oci_image_manifest ${TEST_SCRATCH_DIR}/$subdir)
+    run jq -r '.annotations["org.opencontainers.image.created"]' "$manifest"
+    assert $status -eq 0
+    echo "$output"
+    local manifestcreated="$output"
+    local config=${TEST_SCRATCH_DIR}/$subdir/$(oci_image_config ${TEST_SCRATCH_DIR}/$subdir)
+    run jq -r '.created' "$config"
+    assert $status -eq 0
+    echo "$output"
+    local configcreated="$output"
+    if [[ "$flag" =~ "=0" ]]; then
+      assert $manifestcreated = $configcreated "manifest and config disagree on the image's created-time"
+      assert $manifestcreated = "1970-01-01T00:00:00Z"
+    elif [[ "$flag" =~ "unsetannotation" ]]; then
+      assert $configcreated != ""
+      assert $manifestcreated = "null"
+    elif [[ "$flag" =~ "created-annotation=false" ]]; then
+      assert $configcreated != ""
+      assert $manifestcreated = "null"
+    else
+      assert $manifestcreated = $configcreated "manifest and config disagree on the image's created-time"
+      assert $manifestcreated != ""
+      assert $manifestcreated != "1970-01-01T00:00:00Z"
+    fi
+  done
+}
+
+@test "commit --disable-compression conflicts with compression flags" {
+  _prefetch alpine
+  run_buildah from $WITH_POLICY_JSON alpine
+  cid=$output
+
+  run_buildah 125 commit \
+    $WITH_POLICY_JSON \
+    --disable-compression \
+    --compression-format zstd \
+    $cid \
+    dir:${TEST_SCRATCH_DIR}/should-fail
+  expect_output --substring "cannot be used together"
+
+  run_buildah 125 commit \
+    $WITH_POLICY_JSON \
+    --disable-compression \
+    --force-compression \
+    $cid \
+    dir:${TEST_SCRATCH_DIR}/should-fail
+  expect_output --substring "cannot be used together"
+}
+
+@test "commit --compression-format zstd to dir, oci, and oci-archive" {
+  which skopeo || skip "skopeo is not installed"
+  _prefetch alpine
+  run_buildah from $WITH_POLICY_JSON alpine
+  cid=$output
+  run_buildah run $cid touch /testfile
+
+  for transport in dir oci oci-archive; do
+    local dest=${TEST_SCRATCH_DIR}/commit-zstd-${transport}
+
+    run_buildah commit \
+      $WITH_POLICY_JSON \
+      --compression-format zstd \
+      --disable-compression=false \
+      $cid \
+      ${transport}:$dest
+
+    run skopeo inspect --raw ${transport}:${dest}
+    assert $status -eq 0 "$transport: skopeo inspect should succeed"
+    expect_output --substring "zstd" \
+      "$transport: manifest should reference zstd-compressed layers"
+    assert "$output" !~ "gzip" \
+      "$transport: manifest should NOT reference gzip layers"
+  done
+}
+
+@test "commit should respect compression_format from containers.conf" {
+  which skopeo || skip "skopeo is not installed"
+  _prefetch alpine
+  run_buildah from $WITH_POLICY_JSON alpine
+  cid=$output
+  run_buildah run $cid touch /testfile
+
+  local confdir=${TEST_SCRATCH_DIR}/commit-conf-zstd
+  mkdir -p $confdir
+  cat > $confdir/containers.conf << _EOF
+[engine]
+compression_format="zstd"
+_EOF
+
+  local dest=${TEST_SCRATCH_DIR}/commit-conf-zstd-output
+
+  CONTAINERS_CONF=$confdir/containers.conf \
+    run_buildah commit \
+      $WITH_POLICY_JSON \
+      --disable-compression=false \
+      $cid \
+      dir:$dest
+
+  run skopeo inspect --raw dir:$dest
+  assert $status -eq 0 "skopeo inspect should succeed"
+  expect_output --substring "zstd" \
+    "manifest should reference zstd-compressed layers per containers.conf"
+  assert "$output" !~ "gzip" \
+    "manifest should NOT reference gzip layers when containers.conf specifies zstd"
 }

@@ -82,17 +82,33 @@ function check_matrix() {
 }
 
 @test "config --unsetlabel" {
-  _prefetch registry.fedoraproject.org/fedora-minimal
-  run_buildah from --quiet --pull=false $WITH_POLICY_JSON registry.fedoraproject.org/fedora-minimal
+  base=quay.io/libpod/testimage:20241011
+  _prefetch $base
+  run_buildah from --quiet --pull=false $WITH_POLICY_JSON $base
   cid=$output
-  run_buildah commit $WITH_POLICY_JSON $cid with-name-label
-  run_buildah config --unsetlabel name $cid
-  run_buildah commit $WITH_POLICY_JSON $cid without-name-label
+  run_buildah commit $WITH_POLICY_JSON $cid with-created-by-label
+  run_buildah config --unsetlabel created_by $cid
+  run_buildah commit $WITH_POLICY_JSON $cid without-created-by-label
 
-  run_buildah inspect --format '{{ index .Docker.Config.Labels "name"}}' with-name-label
-  expect_output "fedora" "name label should be set with value as fedora"
-  run_buildah inspect --format '{{ index .Docker.Config.Labels "name"}}' without-name-label
-  expect_output "" "name label should be removed"
+  run_buildah inspect --format '{{ index .Docker.Config.Labels "created_by"}}' with-created-by-label
+  assert "$output" != "" "label should be set in base image"
+  run_buildah inspect --format '{{ index .Docker.Config.Labels "created_by"}}' without-created-by-label
+  assert "$output" == "" "created_by label should be removed"
+}
+
+@test "config --unsetannotation" {
+  base=quay.io/libpod/testimage:20241011
+  _prefetch $base
+  run_buildah from --quiet --pull=false $WITH_POLICY_JSON $base
+  cid=$output
+  run_buildah commit $WITH_POLICY_JSON $cid with-name-annotation
+  run_buildah config --unsetannotation org.opencontainers.image.base.name $cid
+  run_buildah commit $WITH_POLICY_JSON $cid without-name-annotation
+
+  run_buildah inspect --format '{{ index .ImageAnnotations "org.opencontainers.image.base.name"}}' with-name-annotation
+  assert "$output" != "" "annotation should be set in base image"
+  run_buildah inspect --format '{{ index .ImageAnnotations "org.opencontainers.image.base.name"}}' without-name-annotation
+  assert "$output" == "" "name annotation should be removed"
 }
 
 @test "config set empty entrypoint doesn't wipe cmd" {
@@ -193,7 +209,7 @@ function check_matrix() {
   $cid
 
   run_buildah commit --format docker $WITH_POLICY_JSON $cid scratch-image-docker
-  run_buildah commit --format oci $WITH_POLICY_JSON $cid scratch-image-oci
+  run_buildah commit --created-annotation=false --format oci $WITH_POLICY_JSON $cid scratch-image-oci
 
   run_buildah inspect --type=image --format '{{.ImageAnnotations}}'                      scratch-image-oci
   expect_output "map[]"
@@ -204,7 +220,7 @@ function check_matrix() {
   check_matrix 'Config.Labels.LABEL' '<no value>'
 }
 
-@test "config" {
+@test "config flags" {
   run_buildah from $WITH_POLICY_JSON scratch
   cid=$output
   run_buildah config \
@@ -231,6 +247,7 @@ function check_matrix() {
    --hostname cleverhostname \
    --healthcheck "CMD /bin/true" \
    --healthcheck-start-period 5s \
+   --healthcheck-start-interval 30s \
    --healthcheck-interval 6s \
    --healthcheck-timeout 7s \
    --healthcheck-retries 8 \
@@ -289,6 +306,8 @@ function check_matrix() {
   expect_output "[CMD /bin/true]"
   run_buildah inspect               -f      '{{.Docker.Config.Healthcheck.StartPeriod}}' scratch-image-docker
   expect_output "5s"
+  run_buildah inspect               -f      '{{.Docker.Config.Healthcheck.StartInterval}}' scratch-image-docker
+  expect_output "30s"
   run_buildah inspect               -f      '{{.Docker.Config.Healthcheck.Interval}}'    scratch-image-docker
   expect_output "6s"
   run_buildah inspect               -f      '{{.Docker.Config.Healthcheck.Timeout}}'     scratch-image-docker
@@ -351,7 +370,7 @@ EOF
   expect_output --substring "combined=bar/bar1"
 }
 
-@test "user" {
+@test "config user" {
   _prefetch alpine
   run_buildah from --quiet --pull $WITH_POLICY_JSON alpine
   cid=$output
@@ -368,7 +387,7 @@ EOF
   expect_output "$bndoutput"
 }
 
-@test "remove configs using '-' syntax" {
+@test "config remove configs using '-' syntax" {
   run_buildah from $WITH_POLICY_JSON scratch
   cid=$output
   run_buildah config \

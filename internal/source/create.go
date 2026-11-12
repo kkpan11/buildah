@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/containers/storage/pkg/fileutils"
 	spec "github.com/opencontainers/image-spec/specs-go"
 	specV1 "github.com/opencontainers/image-spec/specs-go/v1"
+	"go.podman.io/storage/pkg/fileutils"
 )
 
 // CreateOptions includes data to alter certain knobs when creating a source
@@ -32,6 +32,12 @@ func (o *CreateOptions) createdTime() *time.Time {
 // Create creates an empty source image at the specified `sourcePath`.  Note
 // that `sourcePath` must not exist.
 func Create(ctx context.Context, sourcePath string, options CreateOptions) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
 	if err := fileutils.Exists(sourcePath); err == nil {
 		return fmt.Errorf("creating source image: %q already exists", sourcePath)
 	}

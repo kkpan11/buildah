@@ -5,16 +5,16 @@ import (
 	"fmt"
 	"os"
 
-	buildahcli "github.com/containers/buildah/pkg/cli"
-	"github.com/containers/buildah/util"
 	"github.com/spf13/cobra"
+	buildahcli "go.podman.io/buildah/pkg/cli"
+	"go.podman.io/buildah/util"
 )
 
 type rmResults struct {
 	all bool
 }
 
-func init() {
+func rmInit() {
 	var (
 		rmDescription = "\n  Removes one or more working containers, unmounting them if necessary."
 		opts          rmResults
@@ -30,6 +30,7 @@ func init() {
 		Example: `buildah rm containerID
   buildah rm containerID1 containerID2 containerID3
   buildah rm --all`,
+		GroupID: groupContainers,
 	}
 	rmCommand.SetUsageTemplate(UsageTemplate())
 
@@ -86,7 +87,6 @@ func rmCmd(c *cobra.Command, args []string, iopts rmResults) error {
 			}
 			fmt.Printf("%s\n", id)
 		}
-
 	}
 	return lastError
 }

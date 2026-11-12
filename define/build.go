@@ -2,13 +2,17 @@ package define
 
 import (
 	"io"
+	"net/http"
+	"net/url"
 	"time"
 
-	nettypes "github.com/containers/common/libnetwork/types"
-	"github.com/containers/image/v5/docker/reference"
-	"github.com/containers/image/v5/types"
 	encconfig "github.com/containers/ocicrypt/config"
-	"github.com/containers/storage/pkg/archive"
+	"go.podman.io/common/libimage/manifests"
+	nettypes "go.podman.io/common/libnetwork/types"
+	"go.podman.io/image/v5/docker/reference"
+	"go.podman.io/image/v5/pkg/compression"
+	"go.podman.io/image/v5/types"
+	"go.podman.io/storage/pkg/archive"
 	"golang.org/x/sync/semaphore"
 )
 
@@ -18,12 +22,11 @@ type AdditionalBuildContext struct {
 	IsURL bool
 	// Value is the name of an image which may or may not have already been pulled.
 	IsImage bool
-	// Value holds a URL, an image name, or an absolute filesystem path.
+	// Value holds a URL (if IsURL), an image name (if IsImage), or an absolute filesystem path.
 	Value string
-	// Absolute filesystem path to downloaded and exported build context
-	// from external tar archive. This will be populated only if following
-	// buildcontext is created from IsURL and was downloaded before in any
-	// of the RUN step.
+	// Absolute filesystem path to a downloaded and exported build context
+	// from an external tar archive.  This will be populated only if the
+	// build context was a URL and its contents have been downloaded.
 	DownloadedCache string
 }
 
@@ -49,7 +52,8 @@ type CommonBuildOptions struct {
 	CPUSetMems string
 	// HTTPProxy determines whether *_proxy env vars from the build host are passed into the container.
 	HTTPProxy bool
-	// IdentityLabel if set ensures that default `io.buildah.version` label is not applied to build image.
+	// IdentityLabel if set controls whether or not a `io.buildah.version` label is added to the built image.
+	// Setting this to false does not clear the label if it would be inherited from the base image.
 	IdentityLabel types.OptionalBool
 	// Memory is the upper limit (in bytes) on how much memory running containers can use.
 	Memory int64
@@ -62,6 +66,8 @@ type CommonBuildOptions struct {
 	// LabelOpts is a slice of the fields of an SELinux context, given in "field:pair" format, or "disable".
 	// Recognized field names are "role", "type", and "level".
 	LabelOpts []string
+	// Paths to mask
+	Masks []string
 	// MemorySwap limits the amount of memory and swap together.
 	MemorySwap int64
 	// NoHostname tells the builder not to create /etc/hostname content when running
@@ -109,6 +115,8 @@ type CommonBuildOptions struct {
 	SSHSources []string
 	// OCIHooksDir is the location of OCI hooks for the build containers
 	OCIHooksDir []string
+	// Paths to unmask
+	Unmasks []string
 }
 
 // BuildOptions can be used to alter how an image is built.
@@ -140,9 +148,12 @@ type BuildOptions struct {
 	Runtime string
 	// RuntimeArgs adds global arguments for the runtime.
 	RuntimeArgs []string
-	// TransientMounts is a list of unparsed mounts that will be provided to
+	// TransientMounts is a list of unparsed src:dest volume instructions that will be provided to
 	// RUN instructions.
 	TransientMounts []string
+	// TransientRunMounts is a list of unparsed mounts (e.g. type=secret etc) that will be provided to
+	// RUN instructions.
+	TransientRunMounts []string
 	// CacheFrom specifies any remote repository which can be treated as
 	// potential cache source.
 	CacheFrom []reference.Named
@@ -157,15 +168,26 @@ type BuildOptions struct {
 	// layer blobs.  The default is to not use compression, but
 	// archive.Gzip is recommended.
 	Compression archive.Compression
+	// CompressionFormat is the format to use for the compression of the blobs.
+	CompressionFormat *compression.Algorithm
+	// CompressionLevel specifies what compression level is used.
+	CompressionLevel *int
+	// ForceCompressionFormat ensures that the compression algorithm set in
+	// CompressionFormat is used exclusively, and blobs of other compression
+	// algorithms are not reused.
+	ForceCompressionFormat bool
 	// Arguments which can be interpolated into Dockerfiles
 	Args map[string]string
 	// Map of external additional build contexts
 	AdditionalBuildContexts map[string]*AdditionalBuildContext
 	// Name of the image to write to.
 	Output string
-	// BuildOutput specifies if any custom build output is selected for following build.
-	// It allows end user to export recently built rootfs into a directory or tar.
-	// See the documentation of 'buildah build --output' for the details of the format.
+	// BuildOutputs specifies if any custom build output is selected for
+	// following build.  It allows the end user to export the image's
+	// rootfs to a directory or a tar archive.  See the documentation of
+	// 'buildah build --output' for the details of the syntax.
+	BuildOutputs []string
+	// Deprecated: use BuildOutputs instead.
 	BuildOutput string
 	// ConfidentialWorkload controls whether or not, and if so, how, we produce an
 	// image that's meant to be run using krun as a VM instead of a conventional
@@ -183,7 +205,7 @@ type BuildOptions struct {
 	// Log is a callback that will print a progress message.  If no value
 	// is supplied, the message will be sent to Err (or os.Stderr, if Err
 	// is nil) by default.
-	Log func(format string, args ...interface{})
+	Log func(format string, args ...any)
 	// In is connected to stdin for RUN instructions.
 	In io.Reader
 	// Out is a place where non-error log messages are sent.
@@ -196,6 +218,12 @@ type BuildOptions struct {
 	// specified, indicating that the shared, system-wide default policy
 	// should be used.
 	SignaturePolicyPath string
+	// SourcePolicyFile specifies the path to a BuildKit-compatible source
+	// policy JSON file. When specified, source references (e.g., base images
+	// in FROM instructions) are evaluated against the policy rules. Rules
+	// can DENY specific sources or CONVERT them to different references
+	// (e.g., pinning tags to digests).
+	SourcePolicyFile string
 	// SkipUnusedStages allows users to skip stages in a multi-stage builds
 	// which do not contribute anything to the target stage. Expected default
 	// value is true.
@@ -219,19 +247,24 @@ type BuildOptions struct {
 	// namespace), effectively deciding whether or not the process has a
 	// usable network.
 	ConfigureNetwork NetworkConfigurationPolicy
-	// CNIPluginPath is the location of CNI plugin helpers, if they should be
-	// run from a location other than the default location.
+	// Deprecated: CNIPluginPath was the location of CNI plugin helpers.
+	// It is no longer used and is expected to be empty.
 	CNIPluginPath string
-	// CNIConfigDir is the location of CNI configuration files, if the files in
-	// the default configuration directory shouldn't be used.
+	// Deprecated: CNIConfigDir was the location of CNI configuration files.
+	// It is no longer used and is expected to be empty.
 	CNIConfigDir string
-
-	// NetworkInterface is the libnetwork network interface used to setup CNI or netavark networks.
+	// NetworkInterface is the libnetwork network interface used to setup netavark networks.
 	NetworkInterface nettypes.ContainerNetwork `json:"-"`
 
 	// ID mapping options to use if we're setting up our own user namespace
 	// when handling RUN instructions.
 	IDMappingOptions *IDMappingOptions
+	// InheritLabels controls whether or not built images will retain the labels
+	// which were set in their base images
+	InheritLabels types.OptionalBool
+	// InheritAnnotations controls whether or not built images will retain the annotations
+	// which were set in their base images
+	InheritAnnotations types.OptionalBool
 	// AddCapabilities is a list of capabilities to add to the default set when
 	// handling RUN instructions.
 	AddCapabilities []string
@@ -248,6 +281,8 @@ type BuildOptions struct {
 	DefaultMountsFilePath string
 	// IIDFile tells the builder to write the image ID to the specified file
 	IIDFile string
+	// IIDFileRaw tells the builder to write the image ID to the specified file without the algorithm prefix
+	IIDFileRaw string
 	// Squash tells the builder to produce an image with a single layer instead of with
 	// possibly more than one layer, by only committing a new layer after processing the
 	// final instruction.
@@ -262,9 +297,19 @@ type BuildOptions struct {
 	OnBuild []string
 	// Layers tells the builder to commit an image for each step in the Dockerfile.
 	Layers bool
+	// SaveStages tells the builder to save intermediate stage images instead of removing them.
+	SaveStages bool
+	// StageLabels tells the builder to add metadata labels to all stage images (including the final image).
+	// These labels include stage name (stage alias or position) and base image (pullspec or image ID if
+	// stage uses another stage as base). This option requires SaveStages to be enabled.
+	StageLabels bool
 	// NoCache tells the builder to build the image from scratch without checking for a cache.
 	// It creates a new set of cached images for the build.
 	NoCache bool
+	// NoCacheFilter is a list of stage names or indices for which the cache should not be
+	// used, even when NoCache is false. Named stages not present in this list can still use
+	// the cache. Mirrors "docker buildx build --no-cache-filter".
+	NoCacheFilter []string
 	// RemoveIntermediateCtrs tells the builder whether to remove intermediate containers used
 	// during the build process. Default is true.
 	RemoveIntermediateCtrs bool
@@ -272,6 +317,10 @@ type BuildOptions struct {
 	// the build was unsuccessful.
 	ForceRmIntermediateCtrs bool
 	// BlobDirectory is a directory which we'll use for caching layer blobs.
+	//
+	// This option will be overridden for cache pulls if
+	// CachePullDestinationLookupReferenceFunc is set, and overridden for cache pushes if
+	// CachePushSourceLookupReferenceFunc is set.
 	BlobDirectory string
 	// Target the targeted FROM in the Dockerfile to build.
 	Target string
@@ -281,9 +330,23 @@ type BuildOptions struct {
 	SignBy string
 	// Architecture specifies the target architecture of the image to be built.
 	Architecture string
-	// Timestamp sets the created timestamp to the specified time, allowing
-	// for deterministic, content-addressable builds.
+	// Timestamp specifies a timestamp to use for the image's created-on
+	// date, the corresponding field in new history entries, the timestamps
+	// to set on contents in new layer diffs, and the timestamps to set on
+	// contents written as specified in the BuildOutput field.  If left
+	// unset, the current time is used for the configuration and manifest,
+	// and layer contents are recorded as-is.
 	Timestamp *time.Time
+	// SourceDateEpoch specifies a timestamp to use for the image's
+	// created-on date and the corresponding field in new history entries,
+	// and any content written as specified in the BuildOutput field.  If
+	// left unset, the current time is used for the configuration and
+	// manifest, and layer and BuildOutput contents retain their original
+	// timestamps.
+	SourceDateEpoch *time.Time
+	// RewriteTimestamp, if set, forces timestamps in generated layers to
+	// not be later than the SourceDateEpoch, if it is also set.
+	RewriteTimestamp bool
 	// OS is the specifies the operating system of the image to be built.
 	OS string
 	// MaxPullPushRetries is the maximum number of attempts we'll make to pull or push any one
@@ -326,6 +389,8 @@ type BuildOptions struct {
 	UnsetEnvs []string
 	// UnsetLabels is a list of labels to not add to final image from base image.
 	UnsetLabels []string
+	// UnsetAnnotations is a list of annotations to not add to final image from base image.
+	UnsetAnnotations []string
 	// Envs is a list of environment variables to set in the final image.
 	Envs []string
 	// OSFeatures specifies operating system features the image requires.
@@ -342,4 +407,52 @@ type BuildOptions struct {
 	// CDIConfigDir is the location of CDI configuration files, if the files in
 	// the default configuration locations shouldn't be used.
 	CDIConfigDir string
+	// CachePullSourceLookupReferenceFunc is an optional LookupReferenceFunc
+	// used to look up source references for cache pulls.
+	CachePullSourceLookupReferenceFunc manifests.LookupReferenceFunc
+	// CachePullDestinationLookupReferenceFunc is an optional generator
+	// function which provides a LookupReferenceFunc used to look up
+	// destination references for cache pulls.
+	//
+	// BlobDirectory will be ignored for cache pulls if this option is set.
+	CachePullDestinationLookupReferenceFunc func(srcRef types.ImageReference) manifests.LookupReferenceFunc
+	// CachePushSourceLookupReferenceFunc is an optional generator function
+	// which provides a LookupReferenceFunc used to look up source
+	// references for cache pushes.
+	//
+	// BlobDirectory will be ignored for cache pushes if this option is set.
+	CachePushSourceLookupReferenceFunc func(dest types.ImageReference) manifests.LookupReferenceFunc
+	// CachePushDestinationLookupReferenceFunc is an optional
+	// LookupReferenceFunc used to look up destination references for cache
+	// pushes
+	CachePushDestinationLookupReferenceFunc manifests.LookupReferenceFunc
+	// CompatSetParent causes the "parent" field to be set in the image's
+	// configuration when committing in Docker format.  Newer
+	// BuildKit-based docker build doesn't set this field.
+	CompatSetParent types.OptionalBool
+	// CompatVolumes causes the contents of locations marked as volumes in
+	// base images or by a VOLUME instruction to be preserved during RUN
+	// instructions.  Newer BuildKit-based docker build doesn't bother.
+	CompatVolumes types.OptionalBool
+	// CompatScratchConfig causes the image, if it does not have a base
+	// image, to begin with a truly empty default configuration instead of
+	// a minimal default configuration. Newer BuildKit-based docker build
+	// provides a minimal initial configuration with a working directory
+	// set in it.
+	CompatScratchConfig types.OptionalBool
+	// CompatLayerOmissions causes the "/dev", "/proc", and "/sys"
+	// directories to be omitted from the image and related output.  Newer
+	// BuildKit-based builds include them in the built image by default.
+	CompatLayerOmissions types.OptionalBool
+	// NoPivotRoot inhibits the usage of pivot_root when setting up the rootfs
+	NoPivotRoot bool
+	// CreatedAnnotation controls whether or not an "org.opencontainers.image.created"
+	// annotation is present in the output image.
+	CreatedAnnotation types.OptionalBool
+	// MetadataFile is the name of a file to which the builder should write a JSON map
+	// containing metadata about the built image.
+	MetadataFile string
+	// Proxy controls how we retrieve HTTP or HTTPS build contexts and
+	// sources to ADD.
+	Proxy func(req *http.Request) (*url.URL, error)
 }

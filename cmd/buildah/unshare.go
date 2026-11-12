@@ -1,5 +1,4 @@
 //go:build linux
-// +build linux
 
 package main
 
@@ -10,11 +9,11 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/containers/storage"
-	"github.com/containers/storage/pkg/unshare"
+	"github.com/moby/sys/capability"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
-	"github.com/syndtr/gocapability/capability"
+	"go.podman.io/storage"
+	"go.podman.io/storage/pkg/unshare"
 )
 
 var (
@@ -27,11 +26,12 @@ var (
 		Example: `buildah unshare id
   buildah unshare cat /proc/self/uid_map
   buildah unshare buildah-script.sh`,
+		GroupID: groupSystem,
 	}
 	unshareMounts []string
 )
 
-func init() {
+func unshareInit() {
 	unshareCommand.SetUsageTemplate(UsageTemplate())
 	flags := unshareCommand.Flags()
 	flags.SetInterspersed(false)
@@ -114,7 +114,7 @@ func unshareCmd(c *cobra.Command, args []string) error {
 		}
 		args = []string{shell}
 	}
-	cmd := exec.Command(args[0], args[1:]...)
+	cmd := exec.CommandContext(getContext(), args[0], args[1:]...)
 	cmd.Env = unshare.RootlessEnv()
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
@@ -139,7 +139,7 @@ func debugCapabilities() {
 		logrus.Errorf("error loading our current capabilities: %v", err)
 		return
 	}
-	knownCaps := capability.List()
+	knownCaps := capability.ListKnown()
 	effective := make([]string, 0, len(knownCaps))
 	for i := range knownCaps {
 		have := pid.Get(capability.EFFECTIVE, knownCaps[i])

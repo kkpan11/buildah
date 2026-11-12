@@ -1,15 +1,15 @@
 //go:build darwin
-// +build darwin
 
 package buildah
 
 import (
+	"context"
 	"errors"
 
-	"github.com/containers/buildah/define"
-	nettypes "github.com/containers/common/libnetwork/types"
-	"github.com/containers/storage"
 	"github.com/opencontainers/runtime-spec/specs-go"
+	"go.podman.io/buildah/define"
+	nettypes "go.podman.io/common/libnetwork/types"
+	"go.podman.io/storage"
 )
 
 // ContainerDevices is an alias for a slice of github.com/opencontainers/runc/libcontainer/configs.Device structures.
@@ -21,9 +21,16 @@ func setChildProcess() error {
 
 func runUsingRuntimeMain() {}
 
-func (b *Builder) Run(command []string, options RunOptions) error {
+func (b *Builder) RunContext(ctx context.Context, command []string, options RunOptions) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
 	return errors.New("function not supported on non-linux systems")
 }
+
 func DefaultNamespaceOptions() (NamespaceOptions, error) {
 	options := NamespaceOptions{
 		{Name: string(specs.CgroupNamespace), Host: false},
@@ -38,6 +45,6 @@ func DefaultNamespaceOptions() (NamespaceOptions, error) {
 }
 
 // getNetworkInterface creates the network interface
-func getNetworkInterface(store storage.Store, cniConfDir, cniPluginPath string) (nettypes.ContainerNetwork, error) {
+func getNetworkInterface(store storage.Store) (nettypes.ContainerNetwork, error) {
 	return nil, nil
 }

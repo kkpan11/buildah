@@ -7,20 +7,18 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/containerd/containerd/platforms"
-	cniversion "github.com/containernetworking/cni/pkg/version"
-	"github.com/containers/buildah/define"
-	iversion "github.com/containers/image/v5/version"
+	"github.com/containerd/platforms"
 	ispecs "github.com/opencontainers/image-spec/specs-go"
 	rspecs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/spf13/cobra"
+	"go.podman.io/buildah/define"
+	iversion "go.podman.io/image/v5/version"
 )
 
-//Overwritten at build time
+// Overwritten at build time
 var (
-	GitCommit  string
-	buildInfo  string
-	cniVersion string
+	GitCommit string
+	buildInfo string
 )
 
 type versionInfo struct {
@@ -28,8 +26,6 @@ type versionInfo struct {
 	GoVersion     string `json:"goVersion"`
 	ImageSpec     string `json:"imageSpec"`
 	RuntimeSpec   string `json:"runtimeSpec"`
-	CniSpec       string `json:"cniSpec"`
-	LibcniVersion string `json:"libcniVersion"`
 	ImageVersion  string `json:"imageVersion"`
 	GitCommit     string `json:"gitCommit"`
 	Built         string `json:"built"`
@@ -41,19 +37,20 @@ type versionOptions struct {
 	json bool
 }
 
-func init() {
+func versionInit() {
 	var opts versionOptions
 
-	//cli command to print out the version info of buildah
+	// cli command to print out the version info of buildah
 	versionCommand := &cobra.Command{
 		Use:   "version",
 		Short: "Display the Buildah version information",
 		Long:  "Displays Buildah version information.",
-		RunE: func(c *cobra.Command, args []string) error {
+		RunE: func(_ *cobra.Command, _ []string) error {
 			return versionCmd(opts)
 		},
 		Args:    cobra.NoArgs,
 		Example: `buildah version`,
+		GroupID: groupSystem,
 	}
 	versionCommand.SetUsageTemplate(UsageTemplate())
 
@@ -67,7 +64,7 @@ func versionCmd(opts versionOptions) error {
 	var err error
 	buildTime := int64(0)
 	if buildInfo != "" {
-		//converting unix time from string to int64
+		// converting unix time from string to int64
 		buildTime, err = strconv.ParseInt(buildInfo, 10, 64)
 		if err != nil {
 			return err
@@ -79,8 +76,6 @@ func versionCmd(opts versionOptions) error {
 		GoVersion:     runtime.Version(),
 		ImageSpec:     ispecs.Version,
 		RuntimeSpec:   rspecs.Version,
-		CniSpec:       cniversion.Current(),
-		LibcniVersion: cniVersion,
 		ImageVersion:  iversion.Version,
 		GitCommit:     GitCommit,
 		Built:         time.Unix(buildTime, 0).Format(time.ANSIC),
@@ -101,12 +96,10 @@ func versionCmd(opts versionOptions) error {
 	fmt.Println("Go Version:     ", version.GoVersion)
 	fmt.Println("Image Spec:     ", version.ImageSpec)
 	fmt.Println("Runtime Spec:   ", version.RuntimeSpec)
-	fmt.Println("CNI Spec:       ", version.CniSpec)
-	fmt.Println("libcni Version: ", version.LibcniVersion)
 	fmt.Println("image Version:  ", version.ImageVersion)
 	fmt.Println("Git Commit:     ", version.GitCommit)
 
-	//Prints out the build time in readable format
+	// Prints out the build time in readable format
 	fmt.Println("Built:          ", version.Built)
 	fmt.Println("OS/Arch:        ", version.OsArch)
 	fmt.Println("BuildPlatform:  ", version.BuildPlatform)

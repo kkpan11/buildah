@@ -10,36 +10,36 @@ import (
 	"strings"
 	"time"
 
-	"github.com/containers/buildah/pkg/cli"
-	"github.com/containers/buildah/pkg/parse"
-	"github.com/containers/buildah/util"
-	"github.com/containers/common/libimage"
-	"github.com/containers/common/libimage/manifests"
-	"github.com/containers/common/pkg/auth"
-	cp "github.com/containers/image/v5/copy"
-	"github.com/containers/image/v5/manifest"
-	"github.com/containers/image/v5/pkg/compression"
-	"github.com/containers/image/v5/transports"
-	"github.com/containers/image/v5/transports/alltransports"
-	"github.com/containers/image/v5/types"
-	"github.com/containers/storage"
 	"github.com/hashicorp/go-multierror"
 	digest "github.com/opencontainers/go-digest"
 	imgspecv1 "github.com/opencontainers/image-spec/specs-go/v1"
-	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+	"go.podman.io/buildah/pkg/cli"
+	"go.podman.io/buildah/pkg/parse"
+	"go.podman.io/buildah/util"
+	"go.podman.io/common/libimage"
+	"go.podman.io/common/libimage/manifests"
+	"go.podman.io/common/pkg/auth"
+	cp "go.podman.io/image/v5/copy"
+	"go.podman.io/image/v5/image"
+	"go.podman.io/image/v5/manifest"
+	"go.podman.io/image/v5/pkg/compression"
+	"go.podman.io/image/v5/transports"
+	"go.podman.io/image/v5/transports/alltransports"
+	"go.podman.io/image/v5/types"
+	"go.podman.io/storage"
 )
 
 type manifestCreateOpts struct {
-	os, arch                        string
-	all, tlsVerify, insecure, amend bool
-	annotations                     []string
+	os, arch                                 string
+	all, tlsVerify, insecure, amend, replace bool
+	annotations                              []string
 }
 
 type manifestAddOpts struct {
 	authfile, certDir, creds, os, arch, variant, osVersion string
-	features, osFeatures, annotations                      []string
+	features, osFeatures, annotations, artifactAnnotations []string
 	tlsVerify, insecure, all                               bool
 	artifact, artifactExcludeTitles                        bool
 	artifactType, artifactLayerType                        string
@@ -61,7 +61,7 @@ type manifestInspectOpts struct {
 	tlsVerify bool
 }
 
-func init() {
+func manifestInit() {
 	var (
 		manifestDescription         = "\n  Creates, modifies, and pushes manifest lists and image indexes."
 		manifestCreateDescription   = "\n  Creates manifest lists and image indexes."
@@ -111,7 +111,8 @@ func init() {
 	flags := manifestCreateCommand.Flags()
 	flags.BoolVar(&manifestCreateOpts.all, "all", false, "add all of the lists' images if the images to add are lists")
 	flags.BoolVar(&manifestCreateOpts.amend, "amend", false, "modify an existing list if one with the desired name already exists")
-	flags.StringSliceVar(&manifestCreateOpts.annotations, "annotation", nil, "set an `annotation` for the image index")
+	flags.BoolVar(&manifestCreateOpts.replace, "replace", false, "replace an existing image with the desired name")
+	flags.StringArrayVar(&manifestCreateOpts.annotations, "annotation", nil, "set an `annotation` for the image index")
 	flags.StringVar(&manifestCreateOpts.os, "os", "", "if any of the specified images is a list, choose the one for `os`")
 	if err := flags.MarkHidden("os"); err != nil {
 		panic(fmt.Sprintf("error marking --os as hidden: %v", err))
@@ -147,8 +148,9 @@ func init() {
 	flags.StringVar(&manifestAddOpts.artifactConfigType, "artifact-config-type", imgspecv1.DescriptorEmptyJSON.MediaType, "artifact config media type")
 	flags.StringVar(&manifestAddOpts.artifactConfigFile, "artifact-config", "", "artifact config file")
 	flags.StringVar(&manifestAddOpts.artifactLayerType, "artifact-layer-type", "", "artifact layer media type")
-	flags.BoolVar(&manifestAddOpts.artifactExcludeTitles, "artifact-exclude-titles", false, fmt.Sprintf(`refrain from setting %q annotations on "layers"`, v1.AnnotationTitle))
+	flags.BoolVar(&manifestAddOpts.artifactExcludeTitles, "artifact-exclude-titles", false, fmt.Sprintf(`refrain from setting %q annotations on "layers"`, imgspecv1.AnnotationTitle))
 	flags.StringVar(&manifestAddOpts.artifactSubject, "artifact-subject", "", "artifact subject reference")
+	flags.StringSliceVar(&manifestAddOpts.artifactAnnotations, "artifact-annotation", nil, "artifact annotation")
 	flags.StringVar(&manifestAddOpts.authfile, "authfile", auth.GetDefaultAuthFile(), "path of the authentication file. Use REGISTRY_AUTH_FILE environment variable to override")
 	flags.StringVar(&manifestAddOpts.certDir, "cert-dir", "", "use certificates at the specified path to access the registry")
 	flags.StringVar(&manifestAddOpts.creds, "creds", "", "use `[username[:password]]` for accessing the registry")
@@ -212,7 +214,7 @@ func init() {
 	flags.StringVar(&manifestAnnotateOpts.osVersion, "os-version", "", "override the os `version` of the specified image")
 	flags.StringSliceVar(&manifestAnnotateOpts.features, "features", nil, "override the `features` of the specified image")
 	flags.StringSliceVar(&manifestAnnotateOpts.osFeatures, "os-features", nil, "override the os `features` of the specified image")
-	flags.StringSliceVar(&manifestAnnotateOpts.annotations, "annotation", nil, "set an `annotation` for the specified image")
+	flags.StringArrayVar(&manifestAnnotateOpts.annotations, "annotation", nil, "set an `annotation` for the specified image")
 	flags.StringVar(&manifestAnnotateOpts.subject, "subject", "", "set a subject for the image index")
 	manifestAnnotateCommand.SetUsageTemplate(UsageTemplate())
 	manifestCommand.AddCommand(manifestAnnotateCommand)
@@ -246,7 +248,7 @@ func init() {
 	manifestPushCommand.SetUsageTemplate(UsageTemplate())
 	flags = manifestPushCommand.Flags()
 	flags.BoolVar(&manifestPushOpts.rm, "rm", false, "remove the manifest list if push succeeds")
-	flags.BoolVar(&manifestPushOpts.all, "all", false, "also push the images in the list")
+	flags.BoolVar(&manifestPushOpts.all, "all", true, "also push the images in the list")
 	flags.StringVar(&manifestPushOpts.authfile, "authfile", auth.GetDefaultAuthFile(), "path of the authentication file. Use REGISTRY_AUTH_FILE environment variable to override")
 	flags.StringVar(&manifestPushOpts.certDir, "cert-dir", "", "use certificates at the specified path to access the registry")
 	flags.StringVar(&manifestPushOpts.creds, "creds", "", "use `[username[:password]]` for accessing the registry")
@@ -266,6 +268,7 @@ func init() {
 	if err := flags.MarkHidden("insecure"); err != nil {
 		panic(fmt.Sprintf("error marking insecure as hidden: %v", err))
 	}
+	flags.Int64Var(&manifestPushOpts.destTimestamp, "timestamp", 0, "set timestamps on new content to `seconds` after the epoch")
 	flags.BoolVar(&manifestPushOpts.tlsVerify, "tls-verify", true, "require HTTPS and verify certificates when accessing the registry. TLS verification cannot be used when talking to an insecure registry.")
 	flags.BoolVarP(&manifestPushOpts.quiet, "quiet", "q", false, "don't output progress information when pushing lists")
 	flags.IntVar(&manifestPushOpts.retry, "retry", int(defaultContainerConfig.Engine.Retry), "number of times to retry in case of failure when performing push")
@@ -289,7 +292,7 @@ func init() {
 
 func manifestExistsCmd(c *cobra.Command, args []string) error {
 	if len(args) == 0 {
-		return errors.New("At least a name must be specified for the list")
+		return errors.New("at least a name must be specified for the list")
 	}
 	name := args[0]
 
@@ -320,7 +323,10 @@ func manifestExistsCmd(c *cobra.Command, args []string) error {
 
 func manifestCreateCmd(c *cobra.Command, args []string, opts manifestCreateOpts) error {
 	if len(args) == 0 {
-		return errors.New("At least a name must be specified for the list")
+		return errors.New("at least a name must be specified for the list")
+	}
+	if opts.amend && opts.replace {
+		return errors.New("amend and replace are mutually exclusive")
 	}
 	listImageSpec := args[0]
 	imageSpecs := args[1:]
@@ -347,22 +353,33 @@ func manifestCreateCmd(c *cobra.Command, args []string, opts manifestCreateOpts)
 		return fmt.Errorf("encountered while expanding image name %q: %w", listImageSpec, err)
 	}
 	if manifestListID, err = list.SaveToImage(store, "", names, ""); err != nil {
-		if errors.Is(err, storage.ErrDuplicateName) && opts.amend {
-			for _, name := range names {
-				manifestList, err := runtime.LookupManifestList(listImageSpec)
-				if err != nil {
-					logrus.Debugf("no list named %q found: %v", listImageSpec, err)
-					continue
-				}
-				if _, list, err = manifests.LoadFromImage(store, manifestList.ID()); err != nil {
-					logrus.Debugf("no list found in %q", name)
-					continue
-				}
-				manifestListID = manifestList.ID()
-				break
+		if !errors.Is(err, storage.ErrDuplicateName) {
+			return err
+		}
+		if opts.amend {
+			img, _, lookupErr := runtime.LookupImage(listImageSpec, &libimage.LookupImageOptions{ManifestList: true})
+			if lookupErr != nil {
+				return fmt.Errorf("looking up image to amend %q: %w", listImageSpec, lookupErr)
 			}
-			if list == nil {
-				return fmt.Errorf("--amend specified but no matching manifest list found with name %q", listImageSpec)
+			if manifestList, err := img.ToManifestList(); err == nil {
+				manifestListID = manifestList.ID()
+			} else {
+				converted, convertErr := img.ConvertToManifestList(getContext())
+				if convertErr != nil {
+					return fmt.Errorf("converting image %q to manifest list: %w", listImageSpec, convertErr)
+				}
+				manifestListID = converted.ID()
+			}
+		} else if opts.replace {
+			img, _, lookupErr := runtime.LookupImage(listImageSpec, &libimage.LookupImageOptions{ManifestList: true})
+			if lookupErr != nil {
+				return fmt.Errorf("looking up image to replace %q: %w", listImageSpec, lookupErr)
+			}
+			if err := store.RemoveNames(img.ID(), names); err != nil {
+				return fmt.Errorf("removing name from image %s: %w", img.ID(), err)
+			}
+			if manifestListID, err = list.SaveToImage(store, "", names, ""); err != nil {
+				return err
 			}
 		} else {
 			return err
@@ -431,25 +448,22 @@ func manifestAddCmd(c *cobra.Command, args []string, opts manifestAddOpts) error
 	artifactSpec := []string{}
 	switch len(args) {
 	case 0, 1:
-		return errors.New("At least a list image and an image or artifact to add must be specified")
-	case 2:
+		return errors.New("at least a list image and an image or artifact to add must be specified")
+	default:
 		listImageSpec = args[0]
 		if listImageSpec == "" {
-			return fmt.Errorf(`Invalid image name "%s"`, args[0])
+			return fmt.Errorf("invalid image name %q", args[0])
 		}
 		if opts.artifact {
 			artifactSpec = args[1:]
 		} else {
+			if len(args) > 2 {
+				return errors.New("too many arguments: expected list and image add to list")
+			}
 			imageSpec = args[1]
 			if imageSpec == "" {
-				return fmt.Errorf(`Invalid image name "%s"`, args[1])
+				return fmt.Errorf("invalid image name %q", args[1])
 			}
-		}
-	default:
-		if opts.artifact {
-			artifactSpec = args[1:]
-		} else {
-			return errors.New("Too many arguments: expected list and image add to list")
 		}
 	}
 
@@ -526,6 +540,13 @@ func manifestAddCmd(c *cobra.Command, args []string, opts manifestAddOpts) error
 			options.ConfigDescriptor.Size = -1
 			options.ConfigFile = opts.artifactConfigFile
 		}
+		if len(opts.artifactAnnotations) > 0 {
+			options.Annotations = make(map[string]string, len(opts.artifactAnnotations))
+			for _, annotation := range opts.artifactAnnotations {
+				k, v, _ := strings.Cut(annotation, "=")
+				options.Annotations[k] = v
+			}
+		}
 		options.ExcludeTitles = opts.artifactExcludeTitles
 		instanceDigest, err = list.AddArtifact(getContext(), systemContext, options, artifactSpec...)
 		if err != nil {
@@ -534,7 +555,7 @@ func manifestAddCmd(c *cobra.Command, args []string, opts manifestAddOpts) error
 		}
 	} else {
 		var changedArtifactFlags []string
-		for _, artifactOption := range []string{"artifact-type", "artifact-config", "artifact-config-type", "artifact-layer-type", "artifact-subject", "artifact-exclude-titles"} {
+		for _, artifactOption := range []string{"artifact-type", "artifact-config", "artifact-config-type", "artifact-layer-type", "artifact-subject", "artifact-exclude-titles", "artifact-annotation"} {
 			if c.Flags().Changed(artifactOption) {
 				changedArtifactFlags = append(changedArtifactFlags, "--"+artifactOption)
 			}
@@ -623,24 +644,24 @@ func manifestAddCmd(c *cobra.Command, args []string, opts manifestAddOpts) error
 	return err
 }
 
-func manifestRemoveCmd(c *cobra.Command, args []string, opts manifestRemoveOpts) error {
+func manifestRemoveCmd(c *cobra.Command, args []string, _ manifestRemoveOpts) error {
 	listImageSpec := ""
 	var instanceDigest digest.Digest
 	var instanceSpec string
 	switch len(args) {
 	case 0, 1:
-		return errors.New("At least a list image and one or more instance digests must be specified")
+		return errors.New("at least a list image and one or more instance digests must be specified")
 	case 2:
 		listImageSpec = args[0]
 		if listImageSpec == "" {
-			return fmt.Errorf(`Invalid image name "%s"`, args[0])
+			return fmt.Errorf(`invalid image name "%s"`, args[0])
 		}
 		instanceSpec = args[1]
 		if instanceSpec == "" {
-			return fmt.Errorf(`Invalid instance "%s"`, args[1])
+			return fmt.Errorf(`invalid instance "%s"`, args[1])
 		}
 	default:
-		return errors.New("At least two arguments are necessary: list and digest of instance to remove from list")
+		return errors.New("at least two arguments are necessary: list and digest of instance to remove from list")
 	}
 
 	store, err := getStore(c)
@@ -671,23 +692,23 @@ func manifestRemoveCmd(c *cobra.Command, args []string, opts manifestRemoveOpts)
 		if err != nil {
 			if instanceRef, err = alltransports.ParseImageName(util.DefaultTransport + instanceSpec); err != nil {
 				if instanceRef, _, err = util.FindImage(store, "", systemContext, instanceSpec); err != nil {
-					return fmt.Errorf(`Invalid instance "%s": %v`, instanceSpec, err)
+					return fmt.Errorf(`invalid instance "%s": %v`, instanceSpec, err)
 				}
 			}
 		}
 		ctx := getContext()
 		instanceImg, err := instanceRef.NewImageSource(ctx, systemContext)
 		if err != nil {
-			return fmt.Errorf("Reading image instance: %w", err)
+			return fmt.Errorf("reading image instance: %w", err)
 		}
 		defer instanceImg.Close()
-		manifestBytes, _, err := instanceImg.GetManifest(ctx, nil)
+		manifestBytes, _, err := image.UnparsedInstance(instanceImg, nil).Manifest(ctx)
 		if err != nil {
-			return fmt.Errorf("Reading image instance manifest: %w", err)
+			return fmt.Errorf("reading image instance manifest: %w", err)
 		}
 		d, err = manifest.Digest(manifestBytes)
 		if err != nil {
-			return fmt.Errorf("Digesting image instance manifest: %w", err)
+			return fmt.Errorf("digesting image instance manifest: %w", err)
 		}
 	}
 	instanceDigest = d
@@ -720,7 +741,7 @@ func manifestRmCmd(c *cobra.Command, args []string) error {
 		Filters:        []string{"readonly=false"},
 		LookupManifest: true,
 	}
-	rmiReports, rmiErrors := runtime.RemoveImages(context.Background(), args, options)
+	rmiReports, rmiErrors := runtime.RemoveImages(getContext(), args, options)
 	for _, r := range rmiReports {
 		for _, u := range r.Untagged {
 			fmt.Printf("untagged: %s\n", u)
@@ -746,29 +767,29 @@ func manifestAnnotateCmd(c *cobra.Command, args []string, opts manifestAnnotateO
 	}
 	switch len(args) {
 	case 0:
-		return errors.New("At least a list image must be specified")
+		return errors.New("at least a list image must be specified")
 	case 1:
 		listImageSpec = args[0]
 		if listImageSpec == "" {
-			return fmt.Errorf(`Invalid image name "%s"`, args[0])
+			return fmt.Errorf(`invalid image name "%s"`, args[0])
 		}
 		if !opts.index {
-			return errors.New(`Expected an instance digest, image name, or artifact name`)
+			return errors.New(`expected an instance digest, image name, or artifact name`)
 		}
 	case 2:
 		listImageSpec = args[0]
 		if listImageSpec == "" {
-			return fmt.Errorf(`Invalid image name "%s"`, args[0])
+			return fmt.Errorf(`invalid image name "%s"`, args[0])
 		}
 		if opts.index {
-			return fmt.Errorf(`Did not expect image or artifact name "%s" when modifying the entire index`, args[1])
+			return fmt.Errorf(`did not expect image or artifact name "%s" when modifying the entire index`, args[1])
 		}
 		instanceSpec = args[1]
 		if instanceSpec == "" {
-			return fmt.Errorf(`Invalid instance digest, image name, or artifact name "%s"`, instanceSpec)
+			return fmt.Errorf(`invalid instance digest, image name, or artifact name "%s"`, instanceSpec)
 		}
 	default:
-		return errors.New("Expected either a list name and --index or a list name and an image digest or image name or artifact name")
+		return errors.New("expected either a list name and --index or a list name and an image digest or image name or artifact name")
 	}
 
 	store, err := getStore(c)
@@ -811,23 +832,23 @@ func manifestAnnotateCmd(c *cobra.Command, args []string, opts manifestAnnotateO
 				if instanceRef, err = alltransports.ParseImageName(util.DefaultTransport + instanceSpec); err != nil {
 					// check if the local image exists
 					if instanceRef, _, err = util.FindImage(store, "", systemContext, instanceSpec); err != nil {
-						return fmt.Errorf(`Invalid instance "%s": %v`, instanceSpec, err)
+						return fmt.Errorf(`invalid instance "%s": %v`, instanceSpec, err)
 					}
 				}
 			}
 			ctx := getContext()
 			instanceImg, err := instanceRef.NewImageSource(ctx, systemContext)
 			if err != nil {
-				return fmt.Errorf("Reading image instance: %w", err)
+				return fmt.Errorf("reading image instance: %w", err)
 			}
 			defer instanceImg.Close()
-			manifestBytes, _, err := instanceImg.GetManifest(ctx, nil)
+			manifestBytes, _, err := image.UnparsedInstance(instanceImg, nil).Manifest(ctx)
 			if err != nil {
-				return fmt.Errorf("Reading image instance manifest: %w", err)
+				return fmt.Errorf("reading image instance manifest: %w", err)
 			}
 			d, err = manifest.Digest(manifestBytes)
 			if err != nil {
-				return fmt.Errorf("Digesting image instance manifest: %w", err)
+				return fmt.Errorf("digesting image instance manifest: %w", err)
 			}
 		}
 		instance = d
@@ -917,7 +938,7 @@ func manifestAnnotateCmd(c *cobra.Command, args []string, opts manifestAnnotateO
 		}
 		defer src.Close()
 
-		manifestBytes, manifestType, err := src.GetManifest(ctx, nil)
+		manifestBytes, manifestType, err := image.UnparsedInstance(src, nil).Manifest(ctx)
 		if err != nil {
 			logrus.Errorf("Error while trying to read artifact subject manifest: %v", err)
 			return err
@@ -958,14 +979,14 @@ func manifestInspectCmd(c *cobra.Command, args []string, opts manifestInspectOpt
 	imageSpec := ""
 	switch len(args) {
 	case 0:
-		return errors.New("At least a source list ID must be specified")
+		return errors.New("at least a source list ID must be specified")
 	case 1:
 		imageSpec = args[0]
 		if imageSpec == "" {
-			return fmt.Errorf(`Invalid image name "%s"`, imageSpec)
+			return fmt.Errorf(`invalid image name "%s"`, imageSpec)
 		}
 	default:
-		return errors.New("Only one argument is necessary for inspect: an image name")
+		return errors.New("only one argument is necessary for inspect: an image name")
 	}
 
 	store, err := getStore(c)
@@ -1058,7 +1079,7 @@ func manifestInspect(ctx context.Context, store storage.Store, systemContext *ty
 		}
 		defer src.Close()
 
-		manifestBytes, manifestType, err := src.GetManifest(ctx, nil)
+		manifestBytes, manifestType, err := image.UnparsedInstance(src, nil).Manifest(ctx)
 		if err != nil {
 			appendErr(fmt.Errorf("loading manifest %q: %w", transports.ImageName(ref), err))
 			continue
@@ -1087,7 +1108,7 @@ func manifestPushCmd(c *cobra.Command, args []string, opts pushOptions) error {
 	destSpec := ""
 	switch len(args) {
 	case 0:
-		return errors.New("At least a source list ID must be specified")
+		return errors.New("at least a source list ID must be specified")
 	case 1:
 		listImageSpec = args[0]
 		destSpec = "docker://" + listImageSpec
@@ -1095,7 +1116,7 @@ func manifestPushCmd(c *cobra.Command, args []string, opts pushOptions) error {
 		listImageSpec = args[0]
 		destSpec = args[1]
 	default:
-		return errors.New("Only two arguments are necessary to push: source and destination")
+		return errors.New("only two arguments are necessary to push: source and destination")
 	}
 	if listImageSpec == "" {
 		return fmt.Errorf(`invalid image name "%s"`, listImageSpec)
@@ -1127,6 +1148,9 @@ func manifestPushCmd(c *cobra.Command, args []string, opts pushOptions) error {
 			// is selected then defaults to `true`.
 			opts.forceCompressionFormat = true
 		}
+	}
+	if c.Flag("timestamp").Changed {
+		opts.timestampSet = true
 	}
 
 	return manifestPush(systemContext, store, listImageSpec, destSpec, opts)
@@ -1199,18 +1223,26 @@ func manifestPush(systemContext *types.SystemContext, store storage.Store, listI
 	if !opts.quiet {
 		options.ReportWriter = os.Stderr
 	}
-
+	if opts.timestampSet {
+		ts := time.Unix(opts.destTimestamp, 0).UTC()
+		options.DestinationTimestamp = &ts
+	}
 	_, digest, err := list.Push(getContext(), dest, options)
-
-	if err == nil && opts.rm {
-		_, err = store.DeleteImage(manifestList.ID(), true)
+	if err != nil {
+		return err
 	}
 
 	if opts.digestfile != "" {
-		if err = os.WriteFile(opts.digestfile, []byte(digest.String()), 0644); err != nil {
+		if err := os.WriteFile(opts.digestfile, []byte(digest.String()+"\n"), 0o644); err != nil {
 			return util.GetFailureCause(err, fmt.Errorf("failed to write digest to file %q: %w", opts.digestfile, err))
 		}
 	}
 
-	return err
+	if opts.rm {
+		if _, err := store.DeleteImage(manifestList.ID(), true); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }

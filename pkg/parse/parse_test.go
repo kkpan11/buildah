@@ -1,18 +1,23 @@
-package parse
+package parse //nolint:revive,nolintlint
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"runtime"
 	"testing"
 
-	"github.com/containers/buildah/define"
-	"github.com/containers/image/v5/types"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/spf13/pflag"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.podman.io/buildah/define"
+	"go.podman.io/common/pkg/config"
+	"go.podman.io/image/v5/types"
 )
 
 func TestCommonBuildOptionsFromFlagSet(t *testing.T) {
+	t.Parallel()
 	fs := pflag.NewFlagSet("testme", pflag.PanicOnError)
 	fs.String("memory", "1GB", "")
 	fs.String("shm-size", "5TB", "")
@@ -26,8 +31,88 @@ func TestCommonBuildOptionsFromFlagSet(t *testing.T) {
 	assert.Equal(t, cbo.Memory, int64(2147483648))
 }
 
+func TestCommonBuildOptionsSeccompFromConfig(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "containers.conf")
+	t.Setenv("CONTAINERS_CONF", configPath)
+	t.Cleanup(func() {
+		_, err := config.Reload()
+		assert.NoError(t, err)
+	})
+
+	defaultOptions := new(define.CommonBuildOptions)
+	require.NoError(t, parseSecurityOpts(nil, defaultOptions))
+	if !supportsSeccomp {
+		assert.Empty(t, defaultOptions.SeccompProfilePath)
+	}
+
+	tests := []struct {
+		name                           string
+		containersConf                 string
+		securityOpts                   []string
+		expectedProfile                string
+		configIgnoredWithoutSeccompTag bool
+	}{
+		{
+			name:                           "configured unconfined",
+			containersConf:                 "[containers]\nseccomp_profile = \"unconfined\"\n",
+			expectedProfile:                "unconfined",
+			configIgnoredWithoutSeccompTag: true,
+		},
+		{
+			name:            "command line overrides config",
+			containersConf:  "[containers]\nseccomp_profile = \"unconfined\"\n",
+			securityOpts:    []string{"seccomp=/tmp/custom-seccomp.json"},
+			expectedProfile: "/tmp/custom-seccomp.json",
+		},
+		{
+			name:                           "configured custom profile",
+			containersConf:                 "[containers]\nseccomp_profile = \"/tmp/custom-seccomp.json\"\n",
+			expectedProfile:                "/tmp/custom-seccomp.json",
+			configIgnoredWithoutSeccompTag: true,
+		},
+		{
+			name:            "no configured profile",
+			containersConf:  "[containers]\n",
+			expectedProfile: defaultOptions.SeccompProfilePath,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			require.NoError(t, os.WriteFile(configPath, []byte(test.containersConf), 0o600))
+			_, err := config.Reload()
+			require.NoError(t, err)
+
+			fs := newCommonBuildOptionsFlagSet(t, test.securityOpts)
+			commonOpts, err := CommonBuildOptionsFromFlagSet(fs, fs.Lookup)
+			require.NoError(t, err)
+			expectedProfile := test.expectedProfile
+			if test.configIgnoredWithoutSeccompTag && !supportsSeccomp {
+				expectedProfile = ""
+			}
+			assert.Equal(t, expectedProfile, commonOpts.SeccompProfilePath)
+		})
+	}
+}
+
+func newCommonBuildOptionsFlagSet(t *testing.T, securityOpts []string) *pflag.FlagSet {
+	t.Helper()
+
+	fs := pflag.NewFlagSet("common-build-options", pflag.ContinueOnError)
+	fs.String("cpuset-cpus", "", "")
+	fs.String("cpuset-mems", "", "")
+	fs.String("cgroup-parent", "", "")
+	fs.String("shm-size", "65536k", "")
+	fs.StringArray("security-opt", nil, "")
+	for _, securityOpt := range securityOpts {
+		require.NoError(t, fs.Set("security-opt", securityOpt))
+	}
+	return fs
+}
+
 // TestDeviceParser verifies the given device strings is parsed correctly
 func TestDeviceParser(t *testing.T) {
+	t.Parallel()
 	if runtime.GOOS != "linux" {
 		t.Skip("Devices is only supported on Linux")
 	}
@@ -60,7 +145,7 @@ func TestDeviceParser(t *testing.T) {
 	assert.Equal(t, dest, "/dev/foo")
 	assert.Equal(t, permissions, "rm")
 
-	//test bogus permissions
+	// test bogus permissions
 	_, _, _, err = Device("/dev/fuse1:BOGUS")
 	assert.Error(t, err)
 
@@ -75,6 +160,7 @@ func TestDeviceParser(t *testing.T) {
 }
 
 func TestIsValidDeviceMode(t *testing.T) {
+	t.Parallel()
 	if runtime.GOOS != "linux" {
 		t.Skip("Devices is only supported on Linux")
 	}
@@ -87,6 +173,7 @@ func TestIsValidDeviceMode(t *testing.T) {
 }
 
 func TestDeviceFromPath(t *testing.T) {
+	t.Parallel()
 	if runtime.GOOS != "linux" {
 		t.Skip("Devices is only supported on Linux")
 	}
@@ -114,6 +201,7 @@ func TestDeviceFromPath(t *testing.T) {
 }
 
 func TestIDMappingOptions(t *testing.T) {
+	t.Parallel()
 	fs := pflag.NewFlagSet("testme", pflag.PanicOnError)
 	pfs := pflag.NewFlagSet("persist", pflag.PanicOnError)
 	fs.String("userns-uid-map-user", "", "")
@@ -133,6 +221,7 @@ func TestIDMappingOptions(t *testing.T) {
 }
 
 func TestIsolation(t *testing.T) {
+	t.Parallel()
 	def, err := defaultIsolation()
 	if err != nil {
 		assert.Error(t, err)
@@ -161,6 +250,7 @@ func TestIsolation(t *testing.T) {
 }
 
 func TestNamespaceOptions(t *testing.T) {
+	t.Parallel()
 	fs := pflag.NewFlagSet("testme", pflag.PanicOnError)
 	fs.String("cgroupns", "", "")
 	err := fs.Parse([]string{"--cgroupns", "private"})
@@ -175,6 +265,7 @@ func TestNamespaceOptions(t *testing.T) {
 }
 
 func TestParsePlatform(t *testing.T) {
+	t.Parallel()
 	os, arch, variant, err := Platform("a/b/c")
 	assert.NoError(t, err)
 	assert.NoError(t, err)
@@ -193,7 +284,25 @@ func TestParsePlatform(t *testing.T) {
 	assert.Error(t, err)
 }
 
+func TestParsePullPolicy(t *testing.T) {
+	t.Parallel()
+	for name, want := range define.PolicyMap {
+		t.Run(name, func(t *testing.T) {
+			got, err := pullPolicyWithFlags(name, false, false)
+			require.NoErrorf(t, err, "expected value %q to be recognized", name)
+			require.Equal(t, want, got)
+		})
+	}
+	for _, name := range []string{"try", "truth"} {
+		t.Run(name, func(t *testing.T) {
+			_, err := pullPolicyWithFlags(name, false, false)
+			require.Error(t, err)
+		})
+	}
+}
+
 func TestSplitStringWithColonEscape(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		volume         string
 		expectedResult []string
@@ -210,6 +319,7 @@ func TestSplitStringWithColonEscape(t *testing.T) {
 }
 
 func TestSystemContextFromFlagSet(t *testing.T) {
+	t.Parallel()
 	fs := pflag.NewFlagSet("testme", pflag.PanicOnError)
 	fs.Bool("tls-verify", false, "")
 	err := fs.Parse([]string{"--tls-verify", "false"})
@@ -221,4 +331,101 @@ func TestSystemContextFromFlagSet(t *testing.T) {
 		DockerInsecureSkipTLSVerify: types.OptionalBoolFalse,
 		DockerRegistryUserAgent:     fmt.Sprintf("Buildah/%s", define.Version),
 	})
+}
+
+func TestGetBuildOutput(t *testing.T) {
+	testCases := []struct {
+		description string
+		input       string
+		output      define.BuildOutputOption
+	}{
+		{
+			description: "hyphen",
+			input:       "-",
+			output: define.BuildOutputOption{
+				IsStdout: true,
+			},
+		},
+		{
+			description: "just-a-path",
+			input:       "/tmp",
+			output: define.BuildOutputOption{
+				IsDir: true,
+				Path:  "/tmp",
+			},
+		},
+		{
+			description: "normal-path",
+			input:       "type=local,dest=/tmp",
+			output: define.BuildOutputOption{
+				IsDir: true,
+				Path:  "/tmp",
+			},
+		},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.description, func(t *testing.T) {
+			result, err := GetBuildOutput(testCase.input)
+			require.NoErrorf(t, err, "expected to be able to parse %q", testCase.input)
+			assert.Equal(t, testCase.output, result)
+		})
+	}
+}
+
+func TestSecrets(t *testing.T) {
+	errorTests := []struct {
+		name  string
+		input string
+	}{
+		{"bare-src-no-equals", "id=,src"},
+		{"bare-id-no-equals", "id"},
+		{"known-key-without-value", "id=mysecret,src"},
+		{"empty-id", "id="},
+		{"unknown-key", "id=mysecret,bogus=x"},
+	}
+	for _, tc := range errorTests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Secrets([]string{tc.input})
+			assert.Error(t, err, "expected error for input %q", tc.input)
+		})
+	}
+
+	tmpfile, err := os.CreateTemp(t.TempDir(), "secret")
+	require.NoError(t, err)
+	_, err = tmpfile.WriteString("supersecret")
+	require.NoError(t, err)
+	tmpfile.Close()
+
+	t.Setenv("TEST_SECRET_ENV", "envsecret")
+
+	validFile := tmpfile.Name()
+
+	successTests := []struct {
+		name     string
+		input    string
+		expected define.Secret
+	}{
+		{
+			"id-and-file-src",
+			"id=mysecret,src=" + validFile,
+			define.Secret{ID: "mysecret", Source: validFile, SourceType: "file"},
+		},
+		{
+			"id-and-env",
+			"id=TEST_SECRET_ENV,env=TEST_SECRET_ENV",
+			define.Secret{ID: "TEST_SECRET_ENV", Source: "TEST_SECRET_ENV", SourceType: "env"},
+		},
+		{
+			"id-only-env-fallback",
+			"id=TEST_SECRET_ENV",
+			define.Secret{ID: "TEST_SECRET_ENV", Source: "TEST_SECRET_ENV", SourceType: "env"},
+		},
+	}
+	for _, tc := range successTests {
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := Secrets([]string{tc.input})
+			require.NoError(t, err)
+			assert.Equal(t, tc.expected, result[tc.expected.ID])
+		})
+	}
 }

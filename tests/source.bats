@@ -11,7 +11,7 @@ load helpers
   run jq -r .manifests[0].mediaType $srcdir/index.json
   expect_output "application/vnd.oci.image.manifest.v1+json"
   run jq -r .mediaType $srcdir/index.json
-  expect_output null # TODO: common#839 will change this to "application/vnd.oci.image.index.v1+json"
+  expect_output "application/vnd.oci.image.index.v1+json"
   # Digest of manifest
   run jq -r .manifests[0].digest $srcdir/index.json
   manifestDigest=${output//sha256:/} # strip off the sha256 prefix
@@ -39,7 +39,6 @@ load helpers
   # Inspect the config
   run jq -r .created $srcdir/blobs/sha256/$configDigest
   assert "$status" -eq 0 "status of jq .created on configDigest"
-  creatd=$output
   run date --date="$output"
   assert "$status" -eq 0 "status of date (this should never ever fail)"
   run jq -r .author $srcdir/blobs/sha256/$configDigest
@@ -150,9 +149,5 @@ load helpers
   expect_output --substring "Copying blob"
   expect_output --substring "Copying config"
 
-  run diff -r $srcdir $pulldir
-  # FIXME: if there's a nonzero chance of this failing, include actual diffs
-  assert "$status" -eq 0 "status from diff of srcdir vs pulldir"
-
-  stop_registry
+  diff -r "$srcdir" "$pulldir"
 }

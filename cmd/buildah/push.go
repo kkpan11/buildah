@@ -1,33 +1,34 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strings"
 	"time"
 
-	"errors"
-
-	"github.com/containers/buildah"
-	"github.com/containers/buildah/define"
-	"github.com/containers/buildah/pkg/cli"
-	"github.com/containers/buildah/pkg/parse"
-	util "github.com/containers/buildah/util"
-	"github.com/containers/common/pkg/auth"
-	"github.com/containers/image/v5/manifest"
-	"github.com/containers/image/v5/pkg/compression"
-	"github.com/containers/image/v5/transports"
-	"github.com/containers/image/v5/transports/alltransports"
-	"github.com/containers/storage"
 	imgspecv1 "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+	"go.podman.io/buildah"
+	"go.podman.io/buildah/define"
+	"go.podman.io/buildah/pkg/cli"
+	"go.podman.io/buildah/pkg/parse"
+	util "go.podman.io/buildah/util"
+	"go.podman.io/common/pkg/auth"
+	"go.podman.io/common/pkg/config"
+	"go.podman.io/image/v5/manifest"
+	"go.podman.io/image/v5/pkg/compression"
+	"go.podman.io/image/v5/transports"
+	"go.podman.io/image/v5/transports/alltransports"
+	"go.podman.io/storage"
 )
 
 type pushOptions struct {
 	all                    bool
 	authfile               string
 	blobCache              string
+	blobInfoCache          string
 	certDir                string
 	creds                  string
 	digestfile             string
@@ -48,9 +49,11 @@ type pushOptions struct {
 	encryptLayers          []int
 	insecure               bool
 	addCompression         []string
+	destTimestamp          int64
+	timestampSet           bool
 }
 
-func init() {
+func pushInit() {
 	var (
 		opts            pushOptions
 		pushDescription = fmt.Sprintf(`
@@ -75,6 +78,7 @@ func init() {
 		Example: `buildah push imageID docker://registry.example.com/repository:tag
   buildah push imageID docker-daemon:image:tagi
   buildah push imageID oci:/path/to/layout:image:tag`,
+		GroupID: groupImages,
 	}
 	pushCommand.SetUsageTemplate(UsageTemplate())
 
@@ -83,6 +87,10 @@ func init() {
 	flags.BoolVar(&opts.all, "all", false, "push all of the images referenced by the manifest list")
 	flags.StringVar(&opts.authfile, "authfile", auth.GetDefaultAuthFile(), "path of the authentication file. Use REGISTRY_AUTH_FILE environment variable to override")
 	flags.StringVar(&opts.blobCache, "blob-cache", "", "assume image blobs in the specified directory will be available for pushing")
+	flags.StringVar(&opts.blobInfoCache, "blob-info-cache-dir", "", "cache information about blobs in the specified directory instead of the default location")
+	if err := flags.MarkHidden("blob-info-cache-dir"); err != nil {
+		panic(fmt.Sprintf("error marking blob-info-cache-dir as hidden: %v", err))
+	}
 	flags.StringVar(&opts.certDir, "cert-dir", "", "use certificates at the specified path to access the registry")
 	flags.StringVar(&opts.creds, "creds", "", "use `[username[:password]]` for accessing the registry")
 	flags.StringVar(&opts.digestfile, "digestfile", "", "after copying the image, write the digest of the resulting image to the file")
@@ -136,7 +144,7 @@ func pushCmd(c *cobra.Command, args []string, iopts pushOptions) error {
 			return fmt.Errorf(`invalid image name "%s"`, args[0])
 		}
 	default:
-		return errors.New("Only two arguments are necessary to push: source and destination")
+		return errors.New("only two arguments are necessary to push: source and destination")
 	}
 
 	compress := define.Gzip
@@ -152,9 +160,11 @@ func pushCmd(c *cobra.Command, args []string, iopts pushOptions) error {
 	dest, err := alltransports.ParseImageName(destSpec)
 	// add the docker:// transport to see if they neglected it.
 	if err != nil {
-		destTransport := strings.Split(destSpec, ":")[0]
-		if t := transports.Get(destTransport); t != nil {
-			return err
+		destTransport, _, destHasSeparator := strings.Cut(destSpec, ":")
+		if destHasSeparator {
+			if t := transports.Get(destTransport); t != nil {
+				return err
+			}
 		}
 
 		if strings.Contains(destSpec, "://") {
@@ -194,14 +204,6 @@ func pushCmd(c *cobra.Command, args []string, iopts pushOptions) error {
 		return fmt.Errorf("unable to obtain encryption config: %w", err)
 	}
 
-	if c.Flag("compression-format").Changed {
-		if !c.Flag("force-compression").Changed {
-			// If `compression-format` is set and no value for `--force-compression`
-			// is selected then defaults to `true`.
-			iopts.forceCompressionFormat = true
-		}
-	}
-
 	options := buildah.PushOptions{
 		Compression:            compress,
 		ManifestType:           manifestType,
@@ -222,8 +224,12 @@ func pushCmd(c *cobra.Command, args []string, iopts pushOptions) error {
 			return fmt.Errorf("unable to parse value provided %q as --retry-delay: %w", iopts.retryDelay, err)
 		}
 	}
-	if !iopts.quiet {
+	if !iopts.quiet && logrus.IsLevelEnabled(logrus.WarnLevel) {
 		options.ReportWriter = os.Stderr
+	}
+	defaultContainerConfig, err := config.Default()
+	if err != nil {
+		return fmt.Errorf("failed to get container config: %w", err)
 	}
 	if iopts.compressionFormat != "" {
 		algo, err := compression.AlgorithmByName(iopts.compressionFormat)
@@ -231,9 +237,23 @@ func pushCmd(c *cobra.Command, args []string, iopts pushOptions) error {
 			return err
 		}
 		options.CompressionFormat = &algo
+		if !c.Flag("force-compression").Changed {
+			options.ForceCompressionFormat = true
+		}
+	} else if defaultContainerConfig.Engine.CompressionFormat != "" && defaultContainerConfig.Engine.CompressionFormat != "gzip" {
+		algo, err := compression.AlgorithmByName(defaultContainerConfig.Engine.CompressionFormat)
+		if err != nil {
+			return fmt.Errorf("parsing compression_format from containers.conf: %w", err)
+		}
+		options.CompressionFormat = &algo
+		if !c.Flag("force-compression").Changed {
+			options.ForceCompressionFormat = true
+		}
 	}
 	if c.Flag("compression-level").Changed {
 		options.CompressionLevel = &iopts.compressionLevel
+	} else {
+		options.CompressionLevel = defaultContainerConfig.Engine.CompressionLevel
 	}
 
 	ref, digest, err := buildah.Push(getContext(), src, dest, options)
@@ -255,7 +275,7 @@ func pushCmd(c *cobra.Command, args []string, iopts pushOptions) error {
 	logrus.Debugf("Successfully pushed %s with digest %s", transports.ImageName(dest), digest.String())
 
 	if iopts.digestfile != "" {
-		if err = os.WriteFile(iopts.digestfile, []byte(digest.String()), 0644); err != nil {
+		if err = os.WriteFile(iopts.digestfile, []byte(digest.String()+"\n"), 0o644); err != nil {
 			return util.GetFailureCause(err, fmt.Errorf("failed to write digest to file %q: %w", iopts.digestfile, err))
 		}
 	}

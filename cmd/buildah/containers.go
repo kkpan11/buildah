@@ -4,17 +4,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
-	"regexp"
 	"strings"
-	"text/template"
 
-	"github.com/containers/buildah"
-	"github.com/containers/buildah/define"
-	"github.com/containers/buildah/pkg/formats"
-	"github.com/containers/buildah/util"
-	"github.com/containers/storage"
 	"github.com/spf13/cobra"
+	"go.podman.io/buildah"
+	"go.podman.io/buildah/define"
+	"go.podman.io/buildah/util"
+	"go.podman.io/common/pkg/formats"
+	"go.podman.io/storage"
 )
 
 var containersHeader = map[string]string{
@@ -66,7 +63,7 @@ type containersResults struct {
 	quiet      bool
 }
 
-func init() {
+func containersInit() {
 	var (
 		containersDescription = "\n  Lists containers which appear to be " + define.Package + " working containers, their\n  names and IDs, and the names and IDs of the images from which they were\n  initialized."
 		opts                  containersResults
@@ -76,13 +73,14 @@ func init() {
 		Aliases: []string{"list", "ls", "ps"},
 		Short:   "List working containers and their base images",
 		Long:    containersDescription,
-		//Flags:                  sortFlags(containersFlags),
+		// Flags:                  sortFlags(containersFlags),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return containersCmd(cmd, args, opts)
 		},
 		Example: `buildah containers
   buildah containers --format "{{.ContainerID}} {{.ContainerName}}"
   buildah containers -q --noheading --notruncate`,
+		GroupID: groupContainers,
 	}
 	containersCommand.SetUsageTemplate(UsageTemplate())
 
@@ -168,11 +166,13 @@ func outputContainers(store storage.Store, opts containerOptions, params *contai
 				continue
 			}
 			if opts.json {
-				JSONContainers = append(JSONContainers, jsonContainer{ID: builder.ContainerID,
+				JSONContainers = append(JSONContainers, jsonContainer{
+					ID:            builder.ContainerID,
 					Builder:       true,
 					ImageID:       builder.FromImageID,
 					ImageName:     image,
-					ContainerName: builder.Container})
+					ContainerName: builder.Container,
+				})
 				continue
 			}
 			output := containerOutputParams{
@@ -208,11 +208,13 @@ func outputContainers(store storage.Store, opts containerOptions, params *contai
 				continue
 			}
 			if opts.json {
-				JSONContainers = append(JSONContainers, jsonContainer{ID: container.ID,
+				JSONContainers = append(JSONContainers, jsonContainer{
+					ID:            container.ID,
 					Builder:       ours,
 					ImageID:       container.ImageID,
 					ImageName:     imageNameForID(container.ImageID),
-					ContainerName: name})
+					ContainerName: name,
+				})
 				continue
 			}
 			output := containerOutputParams{
@@ -249,33 +251,13 @@ func outputContainers(store storage.Store, opts containerOptions, params *contai
 	return nil
 }
 
-func containersToGeneric(templParams []containerOutputParams) (genericParams []interface{}) {
+func containersToGeneric(templParams []containerOutputParams) (genericParams []any) {
 	if len(templParams) > 0 {
 		for _, v := range templParams {
-			genericParams = append(genericParams, interface{}(v))
+			genericParams = append(genericParams, any(v))
 		}
 	}
 	return genericParams
-}
-
-func containerOutputUsingTemplate(format string, params containerOutputParams) error {
-	if matched, err := regexp.MatchString("{{.*}}", format); err != nil {
-		return fmt.Errorf("validating format provided: %s: %w", format, err)
-	} else if !matched {
-		return fmt.Errorf("invalid format provided: %s", format)
-	}
-
-	tmpl, err := template.New("container").Parse(format)
-	if err != nil {
-		return fmt.Errorf("Template parsing error: %w", err)
-	}
-
-	err = tmpl.Execute(os.Stdout, params)
-	if err != nil {
-		return err
-	}
-	fmt.Println()
-	return nil
 }
 
 func containerOutputUsingFormatString(truncate bool, params containerOutputParams) {
@@ -296,8 +278,8 @@ func containerOutputHeader(truncate bool) {
 
 func parseCtrFilter(filter string) (*containerFilterParams, error) {
 	params := new(containerFilterParams)
-	filters := strings.Split(filter, ",")
-	for _, param := range filters {
+	filters := strings.SplitSeq(filter, ",")
+	for param := range filters {
 		pair := strings.SplitN(param, "=", 2)
 		if len(pair) != 2 {
 			return nil, fmt.Errorf("incorrect filter value %q, should be of form filter=value", param)

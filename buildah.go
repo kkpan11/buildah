@@ -11,15 +11,15 @@ import (
 	"sort"
 	"time"
 
-	"github.com/containers/buildah/define"
-	"github.com/containers/buildah/docker"
-	nettypes "github.com/containers/common/libnetwork/types"
-	"github.com/containers/image/v5/types"
 	encconfig "github.com/containers/ocicrypt/config"
-	"github.com/containers/storage"
-	"github.com/containers/storage/pkg/ioutils"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/sirupsen/logrus"
+	"go.podman.io/buildah/define"
+	"go.podman.io/buildah/docker"
+	nettypes "go.podman.io/common/libnetwork/types"
+	"go.podman.io/image/v5/types"
+	"go.podman.io/storage"
+	"go.podman.io/storage/pkg/ioutils"
 )
 
 const (
@@ -132,8 +132,8 @@ type Builder struct {
 	ImageHistoryComment string `json:"history-comment,omitempty"`
 
 	// Image metadata and runtime settings, in multiple formats.
-	OCIv1  v1.Image       `json:"ociv1,omitempty"`
-	Docker docker.V2Image `json:"docker,omitempty"`
+	OCIv1  v1.Image       `json:"ociv1"`
+	Docker docker.V2Image `json:"docker"`
 	// DefaultMountsFilePath is the file path holding the mounts to be mounted in "host-path:container-path" format.
 	DefaultMountsFilePath string `json:"defaultMountsFilePath,omitempty"`
 
@@ -147,14 +147,13 @@ type Builder struct {
 	// namespace), effectively deciding whether or not the process has a
 	// usable network.
 	ConfigureNetwork define.NetworkConfigurationPolicy
-	// CNIPluginPath is the location of CNI plugin helpers, if they should be
-	// run from a location other than the default location.
+	// Deprecated: CNIPluginPath was the location of CNI plugin helpers.
+	// It is no longer used and is expected to be empty.
 	CNIPluginPath string
-	// CNIConfigDir is the location of CNI configuration files, if the files in
-	// the default configuration directory shouldn't be used.
+	// Deprecated: CNIConfigDir was the location of CNI configuration files.
+	// It is no longer used and is expected to be empty.
 	CNIConfigDir string
-
-	// NetworkInterface is the libnetwork network interface used to setup CNI or netavark networks.
+	// NetworkInterface is the libnetwork network interface used to setup netavark networks.
 	NetworkInterface nettypes.ContainerNetwork `json:"-"`
 
 	// GroupAdd is a list of groups to add to the primary process when Run() is
@@ -180,6 +179,7 @@ type Builder struct {
 	// Format to use for a container image we eventually commit, when we do.
 	Format string
 	// TempVolumes are temporary mount points created during Run() calls.
+	// Deprecated: do not use.
 	TempVolumes map[string]bool
 	// ContentDigester counts the digest of all Add()ed content since it was
 	// last restarted.
@@ -191,6 +191,13 @@ type Builder struct {
 	// CDIConfigDir is the location of CDI configuration files, if the files in
 	// the default configuration locations shouldn't be used.
 	CDIConfigDir string
+	// PrependedLinkedLayers and AppendedLinkedLayers are combinations of
+	// history entries and locations of either directory trees (if
+	// directories, per os.Stat()) or uncompressed layer blobs which should
+	// be added to the image at commit-time.  The order of these relative
+	// to PrependedEmptyLayers and AppendedEmptyLayers in the committed
+	// image is not guaranteed.
+	PrependedLinkedLayers, AppendedLinkedLayers []LinkedLayer
 }
 
 // BuilderInfo are used as objects to display container information
@@ -216,13 +223,15 @@ type BuilderInfo struct {
 	NamespaceOptions      define.NamespaceOptions
 	Capabilities          []string
 	ConfigureNetwork      string
-	CNIPluginPath         string
-	CNIConfigDir          string
-	IDMappingOptions      define.IDMappingOptions
-	History               []v1.History
-	Devices               define.ContainerDevices
-	DeviceSpecs           []string
-	CDIConfigDir          string
+	// Deprecated: CNIPluginPath is no longer used and is expected to be empty.
+	CNIPluginPath string
+	// Deprecated: CNIConfigDir is no longer used and is expected to be empty.
+	CNIConfigDir     string
+	IDMappingOptions define.IDMappingOptions
+	History          []v1.History
+	Devices          define.ContainerDevices
+	DeviceSpecs      []string
+	CDIConfigDir     string
 }
 
 // GetBuildInfo gets a pointer to a Builder object and returns a BuilderInfo object from it.
@@ -253,8 +262,6 @@ func GetBuildInfo(b *Builder) BuilderInfo {
 		Isolation:             b.Isolation.String(),
 		NamespaceOptions:      b.NamespaceOptions,
 		ConfigureNetwork:      fmt.Sprintf("%v", b.ConfigureNetwork),
-		CNIPluginPath:         b.CNIPluginPath,
-		CNIConfigDir:          b.CNIConfigDir,
 		IDMappingOptions:      b.IDMappingOptions,
 		Capabilities:          b.Capabilities,
 		History:               history,
@@ -325,14 +332,13 @@ type BuilderOptions struct {
 	// namespace), effectively deciding whether or not the process has a
 	// usable network.
 	ConfigureNetwork define.NetworkConfigurationPolicy
-	// CNIPluginPath is the location of CNI plugin helpers, if they should be
-	// run from a location other than the default location.
+	// Deprecated: CNIPluginPath was the location of CNI plugin helpers.
+	// It is no longer used and is expected to be empty.
 	CNIPluginPath string
-	// CNIConfigDir is the location of CNI configuration files, if the files in
-	// the default configuration directory shouldn't be used.
+	// Deprecated: CNIConfigDir was the location of CNI configuration files.
+	// It is no longer used and is expected to be empty.
 	CNIConfigDir string
-
-	// NetworkInterface is the libnetwork network interface used to setup CNI or netavark networks.
+	// NetworkInterface is the libnetwork network interface used to setup netavark networks.
 	NetworkInterface nettypes.ContainerNetwork `json:"-"`
 
 	// ID mapping options to use if we're setting up our own user namespace.
@@ -370,6 +376,11 @@ type BuilderOptions struct {
 	// CDIConfigDir is the location of CDI configuration files, if the files in
 	// the default configuration locations shouldn't be used.
 	CDIConfigDir string
+	// CompatScratchConfig controls whether a "scratch" image is created
+	// with a truly empty configuration, as would have happened in the past
+	// (when set to true), or with a minimal initial configuration which
+	// has a working directory set in it.
+	CompatScratchConfig types.OptionalBool
 }
 
 // ImportOptions are used to initialize a Builder from an existing container
@@ -449,7 +460,7 @@ func OpenBuilder(store storage.Store, container string) (*Builder, error) {
 		return nil, fmt.Errorf("container %q is not a %s container (is a %q container)", container, define.Package, b.Type)
 	}
 
-	netInt, err := getNetworkInterface(store, b.CNIConfigDir, b.CNIPluginPath)
+	netInt, err := getNetworkInterface(store)
 	if err != nil {
 		return nil, err
 	}
@@ -563,7 +574,7 @@ func (b *Builder) Save() error {
 	if err != nil {
 		return err
 	}
-	if err = ioutils.AtomicWriteFile(filepath.Join(cdir, stateFile), buildstate, 0600); err != nil {
+	if err = ioutils.AtomicWriteFile(filepath.Join(cdir, stateFile), buildstate, 0o600); err != nil {
 		return fmt.Errorf("saving builder state to %q: %w", filepath.Join(cdir, stateFile), err)
 	}
 	return nil

@@ -1,5 +1,4 @@
 //go:build seccomp && linux
-// +build seccomp,linux
 
 package buildah
 
@@ -7,8 +6,8 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/containers/common/pkg/seccomp"
 	"github.com/opencontainers/runtime-spec/specs-go"
+	"go.podman.io/common/pkg/seccomp"
 )
 
 func setupSeccomp(spec *specs.Spec, seccompProfilePath string) error {
@@ -26,7 +25,7 @@ func setupSeccomp(spec *specs.Spec, seccompProfilePath string) error {
 		if err != nil {
 			return fmt.Errorf("opening seccomp profile failed: %w", err)
 		}
-		seccompConfig, err := seccomp.LoadProfile(string(seccompProfile), spec)
+		seccompConfig, err := seccomp.LoadProfileFromBytes(seccompProfile, spec)
 		if err != nil {
 			return fmt.Errorf("loading seccomp profile (%s) failed: %w", seccompProfilePath, err)
 		}

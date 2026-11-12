@@ -21,8 +21,7 @@ load helpers
   skip_if_chroot
   skip_if_rootless
 
-  mkdir -p $TEST_SCRATCH_DIR/no-cni-configs
-  RUNOPTS="--cni-config-dir=${TEST_SCRATCH_DIR}/no-cni-configs ${RUNC_BINARY:+--runtime $RUNC_BINARY}"
+  RUNOPTS="${RUNC_BINARY:+--runtime $RUNC_BINARY}"
   # Check if we're running in an environment that can even test this.
   run readlink /proc/self/ns/user
   echo "readlink /proc/self/ns/user -> $output"
@@ -103,8 +102,7 @@ idmapping_check_permission() {
 
 @test "idmapping" {
   skip_if_rootless_environment
-  mkdir -p $TEST_SCRATCH_DIR/no-cni-configs
-  RUNOPTS="--cni-config-dir=${TEST_SCRATCH_DIR}/no-cni-configs ${RUNC_BINARY:+--runtime $RUNC_BINARY}"
+  RUNOPTS="${RUNC_BINARY:+--runtime $RUNC_BINARY}"
 
   # Check if we're running in an environment that can even test this.
   run readlink /proc/self/ns/user
@@ -233,7 +231,7 @@ idmapping_check_permission() {
     expect_output "0:0 4700" "stat(someotherfile), in container test"
 
     # Check that the copied file has the right permissions on host.
-    run_buildah mount "$ctr"
+    run_buildah_mount "$ctr"
     mnt="$output"
     run stat -c '%u:%g %a' "$mnt"/somedir/someotherfile
     assert "$status" -eq 0 "status of stat $mnt/somedir/someotherfile"
@@ -271,8 +269,7 @@ idmapping_check_permission() {
 }
 
 general_namespace() {
-  mkdir -p $TEST_SCRATCH_DIR/no-cni-configs
-  RUNOPTS="--cni-config-dir=${TEST_SCRATCH_DIR}/no-cni-configs ${RUNC_BINARY:+--runtime $RUNC_BINARY}"
+  RUNOPTS="${RUNC_BINARY:+--runtime $RUNC_BINARY}"
   mytmpdir=$TEST_SCRATCH_DIR/my-dir
   mkdir -p ${mytmpdir}
 
@@ -450,7 +447,7 @@ _EOF
 	run_buildah commit --squash $WITH_POLICY_JSON --rm "$cid" squashed
 	run_buildah from --quiet squashed
 	cid=$output
-	run_buildah mount $cid
+	run_buildah_mount $cid
 	mountpoint=$output
 	run stat -c %u:%g $mountpoint/randomfile
 	[ "$status" -eq 0 ]

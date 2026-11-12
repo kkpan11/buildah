@@ -1,6 +1,7 @@
 package buildah
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -8,17 +9,16 @@ import (
 	"path/filepath"
 	"sync"
 
-	"github.com/containers/buildah/copier"
-	"github.com/containers/image/v5/docker/reference"
-	"github.com/containers/image/v5/pkg/sysregistriesv2"
-	"github.com/containers/image/v5/types"
-	"github.com/containers/storage"
-	"github.com/containers/storage/pkg/idtools"
-	"github.com/containers/storage/pkg/reexec"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 	rspec "github.com/opencontainers/runtime-spec/specs-go"
-	"github.com/opencontainers/selinux/go-selinux/label"
 	"github.com/sirupsen/logrus"
+	"go.podman.io/buildah/copier"
+	"go.podman.io/image/v5/docker/reference"
+	"go.podman.io/image/v5/pkg/sysregistriesv2"
+	"go.podman.io/image/v5/types"
+	"go.podman.io/storage"
+	"go.podman.io/storage/pkg/idtools"
+	"go.podman.io/storage/pkg/reexec"
 )
 
 // InitReexec is a wrapper for reexec.Init().  It should be called at
@@ -26,20 +26,6 @@ import (
 // immediately.
 func InitReexec() bool {
 	return reexec.Init()
-}
-
-func copyStringStringMap(m map[string]string) map[string]string {
-	n := map[string]string{}
-	for k, v := range m {
-		n[k] = v
-	}
-	return n
-}
-
-func copyStringSlice(s []string) []string {
-	t := make([]string, len(s))
-	copy(t, s)
-	return t
 }
 
 func copyHistory(history []v1.History) []v1.History {
@@ -108,17 +94,17 @@ func convertRuntimeIDMaps(UIDMap, GIDMap []rspec.LinuxIDMapping) ([]idtools.IDMa
 func isRegistryBlocked(registry string, sc *types.SystemContext) (bool, error) {
 	reginfo, err := sysregistriesv2.FindRegistry(sc, registry)
 	if err != nil {
-		return false, fmt.Errorf("unable to parse the registries configuration (%s): %w", sysregistriesv2.ConfigPath(sc), err)
+		return false, fmt.Errorf("unable to parse the registries configuration (%s): %w", sysregistriesv2.ConfigurationSourceDescription(sc), err)
 	}
 	if reginfo != nil {
 		if reginfo.Blocked {
-			logrus.Debugf("registry %q is marked as blocked in registries configuration %q", registry, sysregistriesv2.ConfigPath(sc))
+			logrus.Debugf("registry %q is marked as blocked in registries configuration %q", registry, sysregistriesv2.ConfigurationSourceDescription(sc))
 		} else {
-			logrus.Debugf("registry %q is not marked as blocked in registries configuration %q", registry, sysregistriesv2.ConfigPath(sc))
+			logrus.Debugf("registry %q is not marked as blocked in registries configuration %q", registry, sysregistriesv2.ConfigurationSourceDescription(sc))
 		}
 		return reginfo.Blocked, nil
 	}
-	logrus.Debugf("registry %q is not listed in registries configuration %q, assuming it's not blocked", registry, sysregistriesv2.ConfigPath(sc))
+	logrus.Debugf("registry %q is not listed in registries configuration %q, assuming it's not blocked", registry, sysregistriesv2.ConfigurationSourceDescription(sc))
 	return false, nil
 }
 
@@ -145,38 +131,6 @@ func isReferenceBlocked(ref types.ImageReference, sc *types.SystemContext) (bool
 	return false, nil
 }
 
-// ReserveSELinuxLabels reads containers storage and reserves SELinux contexts
-// which are already being used by buildah containers.
-func ReserveSELinuxLabels(store storage.Store, id string) error {
-	if selinuxGetEnabled() {
-		containers, err := store.Containers()
-		if err != nil {
-			return fmt.Errorf("getting list of containers: %w", err)
-		}
-
-		for _, c := range containers {
-			if id == c.ID {
-				continue
-			} else {
-				b, err := OpenBuilder(store, c.ID)
-				if err != nil {
-					if errors.Is(err, os.ErrNotExist) {
-						// Ignore not exist errors since containers probably created by other tool
-						// TODO, we need to read other containers json data to reserve their SELinux labels
-						continue
-					}
-					return err
-				}
-				// Prevent different containers from using same MCS label
-				if err := label.ReserveLabel(b.ProcessLabel); err != nil {
-					return fmt.Errorf("reserving SELinux label %q: %w", b.ProcessLabel, err)
-				}
-			}
-		}
-	}
-	return nil
-}
-
 // IsContainer identifies if the specified container id is a buildah container
 // in the specified store.
 func IsContainer(id string, store storage.Store) (bool, error) {
@@ -198,24 +152,20 @@ func IsContainer(id string, store storage.Store) (bool, error) {
 // Copy content from the directory "src" to the directory "dest", ensuring that
 // content from outside of "root" (which is a parent of "src" or "src" itself)
 // isn't read.
-func extractWithTar(root, src, dest string) error {
+func extractWithTar(ctx context.Context, root, src, dest string) error {
 	var getErr, putErr error
 	var wg sync.WaitGroup
 
 	pipeReader, pipeWriter := io.Pipe()
 
-	wg.Add(1)
-	go func() {
-		getErr = copier.Get(root, src, copier.GetOptions{}, []string{"."}, pipeWriter)
+	wg.Go(func() {
+		getErr = copier.GetContext(ctx, root, src, copier.GetOptions{}, []string{"."}, pipeWriter)
 		pipeWriter.Close()
-		wg.Done()
-	}()
-	wg.Add(1)
-	go func() {
-		putErr = copier.Put(dest, dest, copier.PutOptions{}, pipeReader)
+	})
+	wg.Go(func() {
+		putErr = copier.PutContext(ctx, dest, dest, copier.PutOptions{}, pipeReader)
 		pipeReader.Close()
-		wg.Done()
-	}()
+	})
 	wg.Wait()
 
 	if getErr != nil {

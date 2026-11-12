@@ -1,6 +1,6 @@
-package types
+package mkcwtypes
 
-import "github.com/containers/buildah/define"
+import "go.podman.io/buildah/define"
 
 // WorkloadConfig is the data type which is encoded and stored in /krun-sev.json in a container
 // image, and included directly in the disk image.
@@ -28,7 +28,8 @@ type SnpWorkloadData struct {
 	Generation string `json:"gen"` // "milan" (naples=1, rome=2, milan=3, genoa/bergamo/siena=4, turin=5)
 }
 
+//nolint:revive,staticcheck // Don't warn about bad naming.
 const (
 	// SEV_NO_ES is a known trusted execution environment type: AMD-SEV (secure encrypted virtualization without encrypted state, requires epyc 1000 "naples")
-	SEV_NO_ES define.TeeType = "sev_no_es" //revive:disable-line:var-naming
+	SEV_NO_ES define.TeeType = "sev_no_es"
 )

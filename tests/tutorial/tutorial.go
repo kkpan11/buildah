@@ -7,12 +7,12 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/containers/buildah"
-	"github.com/containers/buildah/define"
-	"github.com/containers/buildah/imagebuildah"
-	"github.com/containers/storage"
-	"github.com/containers/storage/pkg/unshare"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"go.podman.io/buildah"
+	"go.podman.io/buildah/define"
+	"go.podman.io/buildah/imagebuildah"
+	"go.podman.io/storage"
+	"go.podman.io/storage/pkg/unshare"
 )
 
 func main() {

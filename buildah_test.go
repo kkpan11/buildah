@@ -1,17 +1,25 @@
 package buildah
 
 import (
-	"context"
 	"flag"
+	"io"
+	"log/slog"
 	"os"
 	"testing"
 
-	"github.com/containers/storage"
-	"github.com/containers/storage/types"
 	"github.com/sirupsen/logrus"
+	lslog "github.com/sirupsen/logrus/hooks/slog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	imagetypes "go.podman.io/image/v5/types"
+	"go.podman.io/storage"
+	"go.podman.io/storage/types"
 )
+
+var testSystemContext = imagetypes.SystemContext{
+	SignaturePolicyPath:      "tests/policy.json",
+	SystemRegistriesConfPath: "tests/registries.conf",
+}
 
 func TestMain(m *testing.M) {
 	var logLevel string
@@ -29,12 +37,21 @@ func TestMain(m *testing.M) {
 	if debug && level < logrus.DebugLevel {
 		level = logrus.DebugLevel
 	}
+	logrus.SetOutput(io.Discard)
+	logrus.AddHook(lslog.NewHook(slog.Default(), nil))
 	logrus.SetLevel(level)
+	slog.SetLogLoggerLevel(lslog.Level(level).Level())
 	os.Exit(m.Run())
 }
 
 func TestOpenBuilderCommonBuildOpts(t *testing.T) {
-	ctx := context.TODO()
+	// This test cannot be parallelized as this uses NewBuilder()
+	// which eventually and indirectly accesses a global variable
+	// defined in `go-selinux`, this must be fixed at `go-selinux`
+	// or builder must enable sometime of locking mechanism i.e if
+	// routine is creating Builder other's must wait for it.
+	// Tracked here: https://github.com/containers/buildah/issues/5967
+	ctx := t.Context()
 	store, err := storage.GetStore(types.StoreOptions{
 		RunRoot:         t.TempDir(),
 		GraphRoot:       t.TempDir(),
@@ -68,7 +85,8 @@ func TestOpenBuilderCommonBuildOpts(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, container)
 	b, err = ImportBuilder(ctx, store, ImportOptions{
-		Container: container.ID,
+		Container:           container.ID,
+		SignaturePolicyPath: testSystemContext.SignaturePolicyPath,
 	})
 	require.NoError(t, err)
 	require.NotNil(t, b.CommonBuildOpts)

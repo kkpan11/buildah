@@ -7,19 +7,20 @@ import (
 	"runtime"
 	"time"
 
-	"github.com/containers/buildah"
-	"github.com/containers/buildah/define"
-	"github.com/containers/buildah/pkg/cli"
-	"github.com/containers/buildah/pkg/parse"
-	"github.com/containers/common/pkg/auth"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+	"go.podman.io/buildah"
+	"go.podman.io/buildah/define"
+	"go.podman.io/buildah/pkg/cli"
+	"go.podman.io/buildah/pkg/parse"
+	"go.podman.io/common/pkg/auth"
 )
 
 type pullOptions struct {
 	allTags          bool
 	authfile         string
 	blobCache        string
+	blobInfoCache    string
 	certDir          string
 	creds            string
 	signaturePolicy  string
@@ -32,7 +33,7 @@ type pullOptions struct {
 	retryDelay       string
 }
 
-func init() {
+func pullInit() {
 	var (
 		opts pullOptions
 
@@ -51,6 +52,7 @@ func init() {
 		Example: `buildah pull imagename
   buildah pull docker-daemon:imagename:imagetag
   buildah pull myregistry/myrepository/imagename:imagetag`,
+		GroupID: groupImages,
 	}
 	pullCommand.SetUsageTemplate(UsageTemplate())
 
@@ -59,6 +61,10 @@ func init() {
 	flags.BoolVarP(&opts.allTags, "all-tags", "a", false, "download all tagged images in the repository")
 	flags.StringVar(&opts.authfile, "authfile", auth.GetDefaultAuthFile(), "path of the authentication file. Use REGISTRY_AUTH_FILE environment variable to override")
 	flags.StringVar(&opts.blobCache, "blob-cache", "", "store copies of pulled image blobs in the specified directory")
+	flags.StringVar(&opts.blobInfoCache, "blob-info-cache-dir", "", "cache information about blobs in the specified directory instead of the default location")
+	if err := flags.MarkHidden("blob-info-cache-dir"); err != nil {
+		panic(fmt.Sprintf("error marking blob-info-cache-dir as hidden: %v", err))
+	}
 	flags.StringVar(&opts.certDir, "cert-dir", "", "use certificates at the specified path to access the registry")
 	flags.StringVar(&opts.creds, "creds", "", "use `[username[:password]]` for accessing the registry")
 	flags.StringVar(&opts.pullPolicy, "policy", "missing", "missing, always, ifnewer, or never.")

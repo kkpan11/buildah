@@ -6,12 +6,12 @@ import (
 	"fmt"
 	"os"
 	"regexp"
-	"text/template"
 
-	"github.com/containers/buildah"
-	buildahcli "github.com/containers/buildah/pkg/cli"
-	"github.com/containers/buildah/pkg/parse"
 	"github.com/spf13/cobra"
+	"go.podman.io/buildah"
+	buildahcli "go.podman.io/buildah/pkg/cli"
+	"go.podman.io/buildah/pkg/parse"
+	"go.podman.io/common/pkg/formats"
 	"golang.org/x/term"
 )
 
@@ -26,7 +26,7 @@ type inspectResults struct {
 	inspectType string
 }
 
-func init() {
+func inspectInit() {
 	var (
 		opts               inspectResults
 		inspectDescription = "\n  Inspects a build container's or built image's configuration."
@@ -113,9 +113,9 @@ func inspectCmd(c *cobra.Command, args []string, iopts inspectResults) error {
 		} else if !matched {
 			return fmt.Errorf("invalid format provided: %s", format)
 		}
-		t, err := template.New("format").Parse(format)
+		t, err := formats.NewParse("inspect", format)
 		if err != nil {
-			return fmt.Errorf("Template parsing error: %w", err)
+			return fmt.Errorf("template parsing error: %w", err)
 		}
 		if err = t.Execute(os.Stdout, out); err != nil {
 			return err

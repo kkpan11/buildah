@@ -1,16 +1,17 @@
 package main
 
 import (
+	"fmt"
 	"os"
 
-	"github.com/containers/buildah/imagebuildah"
-	buildahcli "github.com/containers/buildah/pkg/cli"
-	"github.com/containers/buildah/util"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+	"go.podman.io/buildah/imagebuildah"
+	buildahcli "go.podman.io/buildah/pkg/cli"
+	"go.podman.io/buildah/util"
 )
 
-func init() {
+func buildInit() {
 	buildDescription := `
   Builds an OCI image using instructions in one or more Containerfiles.
 
@@ -71,9 +72,9 @@ func init() {
 
 func buildCmd(c *cobra.Command, inputArgs []string, iopts buildahcli.BuildOptions) error {
 	if c.Flag("logfile").Changed {
-		logfile, err := os.OpenFile(iopts.Logfile, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+		logfile, err := os.OpenFile(iopts.Logfile, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 		if err != nil {
-			return err
+			return fmt.Errorf("opening log file: %w", err)
 		}
 		iopts.Logwriter = logfile
 		defer iopts.Logwriter.Close()

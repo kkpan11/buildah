@@ -7,7 +7,7 @@ import (
 	"os"
 	"sort"
 
-	"github.com/containers/buildah/define"
+	"go.podman.io/buildah/define"
 )
 
 // getComponentNameVersionPurl extracts the "name", "version", and "purl"
@@ -202,7 +202,7 @@ func Merge(mergeStrategy define.SBOMMergeStrategy, inputOutputSBOM, inputSBOM, o
 		Dependencies []string `json:"dependencies,omitempty"`
 	}
 	type purlDocument struct {
-		ImageContents purlImageContents `json:"image_contents,omitempty"`
+		ImageContents purlImageContents `json:"image_contents"`
 	}
 	purls := []string{}
 	seenPurls := make(map[string]struct{})

@@ -3,12 +3,13 @@ package buildah
 import (
 	"testing"
 
-	"github.com/containers/storage"
 	"github.com/openshift/imagebuilder"
 	"github.com/stretchr/testify/assert"
+	"go.podman.io/storage"
 )
 
 func TestGetImageName(t *testing.T) {
+	t.Parallel()
 	tt := []struct {
 		caseName string
 		name     string
@@ -30,6 +31,7 @@ func TestGetImageName(t *testing.T) {
 }
 
 func TestNoBaseImageSpecifierIsScratch(t *testing.T) {
+	t.Parallel()
 	assert.Equal(t, "scratch", imagebuilder.NoBaseImageSpecifier) // juuuuust in case
 	assert.Equal(t, "scratch", BaseImageFakeName)
 }

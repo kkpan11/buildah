@@ -3,24 +3,25 @@ package main
 import (
 	"fmt"
 
-	"github.com/containers/buildah"
 	"github.com/spf13/cobra"
+	"go.podman.io/buildah"
 )
 
 var (
-	renameDescription = "\n  Renames a local container."
+	renameDescription = "\n  Renames a working container."
 	renameCommand     = &cobra.Command{
 		Use:   "rename",
-		Short: "Rename a container",
+		Short: "Rename a working container",
 		Long:  renameDescription,
 		RunE:  renameCmd,
 		Example: `buildah rename containerName NewName
   buildah rename containerID NewName`,
-		Args: cobra.ExactArgs(2),
+		Args:    cobra.ExactArgs(2),
+		GroupID: groupContainers,
 	}
 )
 
-func init() {
+func renameInit() {
 	renameCommand.SetUsageTemplate(UsageTemplate())
 	rootCmd.AddCommand(renameCommand)
 }
@@ -47,7 +48,7 @@ func renameCmd(c *cobra.Command, args []string) error {
 	}
 
 	if build, err := openBuilder(getContext(), store, newName); err == nil {
-		return fmt.Errorf("The container name %q is already in use by container %q", newName, build.ContainerID)
+		return fmt.Errorf("the container name %q is already in use by container %q", newName, build.ContainerID)
 	}
 
 	err = store.SetNames(builder.ContainerID, []string{newName})

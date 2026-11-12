@@ -34,6 +34,12 @@ Add a custom host-to-IP mapping (host:ip)
 
 Add a line to /etc/hosts. The format is hostname:ip. The **--add-host** option can be set multiple times. Conflicts with the --no-hosts option.
 
+Instead of an IP address, the special flag host-gateway can be given. This resolves to an IP address the container can use to connect to the host. The IP address chosen depends on your network setup, thus there's no guarantee that Buildah can determine the host-gateway address automatically, which will then cause Buildah to fail with an error message. You can overwrite this IP address using the host_containers_internal_ip option in containers.conf.
+
+The host-gateway address is also used by Buildah to automatically add the host.containers.internal and host.docker.internal hostnames to /etc/hosts. You can prevent that by either giving the --no-hosts option, or by setting host_containers_internal_ip="none" in containers.conf. If no host-gateway address was configured manually and Buildah fails to determine the IP address automatically, Buildah will silently skip adding these internal hostnames to /etc/hosts. If Buildah is running in a virtual machine using podman machine (this includes Mac and Windows hosts), Buildah will silently skip adding the internal hostnames to /etc/hosts, unless an IP address was configured manually; the internal hostnames are resolved by the gvproxy DNS resolver instead.
+
+Buildah will use the /etc/hosts file of the host as a basis by default, i.e. any hostname present in this file will also be present in the /etc/hosts file of the container. A different base file can be configured using the base_hosts_file config in containers.conf
+
 **--all-platforms**
 
 Instead of building for a set of platforms specified using the **--platform** option, inspect the build's base images, and build for all of the platforms for which they are all available.  Stages that use *scratch* as a starting point can not be inspected, so at least one non-*scratch* stage must be present for detection to work usefully.
@@ -183,12 +189,13 @@ given.
 
 **--cert-dir** *path*
 
-Use certificates at *path* (\*.crt, \*.cert, \*.key) to connect to the registry.
+Use certificates at *path* (\*.crt, \*.cert, \*.key) to connect to the registry
+and retrieve contents from HTTPS locations for ADD instructions.
 The default certificates directory is _/etc/containers/certs.d_.
 
 **--cgroup-parent**=""
 
-Path to cgroups under which the cgroup for the container will be created. If the path is not absolute, the path is considered to be relative to the cgroups path of the init process. Cgroups will be created if they do not already exist.
+Path to cgroups under which the cgroup for RUN instructions will be created. If the path is not absolute, the path is considered to be relative to the cgroups path of the init process. Cgroups will be created if they do not already exist.
 
 **--cgroupns** *how*
 
@@ -197,11 +204,33 @@ The configured value can be "" (the empty string) or "private" to indicate
 that a new cgroup namespace should be created, or it can be "host" to indicate
 that the cgroup namespace in which `buildah` itself is being run should be reused.
 
+**--compat-volumes**
+
+Handle directories marked using the VOLUME instruction (both in this build, and
+those inherited from base images) such that their contents can only be modified
+by ADD and COPY instructions. Any changes made in those locations by RUN
+instructions will be reverted. Before the introduction of this option, this
+behavior was the default, but it is now disabled by default.
+
 **--compress**
 
 This option is added to be aligned with other containers CLIs.
 Buildah doesn't send a copy of the context directory to a daemon or a remote server.
 Thus, compressing the data before sending it is irrelevant to Buildah.
+
+**--compression-format** *format*
+
+Specifies the compression format to use.  Supported values are: `gzip`, `zstd` and `zstd:chunked`.
+`zstd:chunked` is incompatible with encrypting images, and will be treated as `zstd` with a warning in that case.
+If not specified, the format is read from the `compression_format` setting in containers.conf.
+
+This option affects cache pushes with `--cache-to` and the final image when it is written to a non-local destination (e.g., `dir:`, `oci:`, `oci-archive:`, or a registry).
+When the output is local container storage (the default), layers are always decompressed on ingest, so compression is applied at `buildah push` time instead.
+
+**--compression-level** *level*
+
+Specifies the compression level to use.  The value is specific to the compression algorithm used, e.g. for zstd the accepted values are in the range 1-20 (inclusive), while for gzip it is 1-9 (inclusive).
+If not specified, the level is read from the `compression_level` setting in containers.conf.
 
 **--cpp-flag**=""
 
@@ -281,6 +310,16 @@ Memory nodes (MEMs) in which to allow execution (0-3, 0,1). Only effective on NU
 If you have four memory nodes on your system (0-3), use `--cpuset-mems=0,1`
 then processes in your container will only use memory from the first
 two memory nodes.
+
+**--created-annotation**
+
+Add an image *annotation* (see also **--annotation**) to the image metadata
+setting "org.opencontainers.image.created" to the current time, or to the
+datestamp specified to the **--source-date-epoch** or **--timestamp** flag,
+if either was used.  If *false*, no such annotation will be present in the
+written image.
+
+Note: this information is not present in Docker image formats, so it is discarded when writing images in Docker formats.
 
 **--creds** *creds*
 
@@ -419,6 +458,11 @@ context directory will be prepended to the local file value.
 
 If you specify `-f -`, the Containerfile contents will be read from stdin.
 
+**--force-compression**
+
+If set, uses the specified compression algorithm even if the destination contains a differently-compressed variant already.
+Defaults to `true` if `--compression-format` is explicitly specified on the command-line or `compression_format` is set in containers.conf, `false` otherwise.
+
 **--force-rm** *bool-value*
 
 Always remove intermediate containers after a build, even if the build fails (default false).
@@ -467,17 +511,23 @@ For the bind-mount conditions, only mounts explicitly requested by the caller vi
 
 If --hooks-dir is unset for root callers, Buildah will currently default to /usr/share/containers/oci/hooks.d and /etc/containers/oci/hooks.d in order of increasing precedence. Using these defaults is deprecated, and callers should migrate to explicitly setting --hooks-dir.
 
-**--http-proxy**=true
+**--http-proxy**
 
 By default proxy environment variables are passed into the container if set
-for the buildah process.  This can be disabled by setting the `--http-proxy`
+for the Buildah process.  This can be disabled by setting the `--http-proxy`
 option to `false`.  The environment variables passed in include `http_proxy`,
 `https_proxy`, `ftp_proxy`, `no_proxy`, and also the upper case versions of
 those.
 
+The default for this option is taken from the `http_proxy` setting in the
+`[containers]` table of containers.conf(5). If unset, that value defaults to
+`true`.
+
 **--identity-label** *bool-value*
 
-Adds default identity label `io.buildah.version` if set. (default true).
+Adds a label `io.buildah.version` with its value set to the version of buildah
+which built the image (default true unless `--timestamp` or
+`--source-date-epoch` is used).
 
 **--ignorefile** *file*
 
@@ -487,6 +537,24 @@ Path to an alternative .containerignore (.dockerignore) file.
 
 Write the built image's ID to the file.  When `--platform` is specified more
 than once, attempting to use this option will trigger an error.
+
+**--iidfile-raw** *ImageIDfile*
+
+Write the built image's ID to the file without the algorithm prefix
+(e.g., `sha256:`). When `--platform` is specified more than once, attempting to
+use this option will trigger an error.
+
+An alias `--raw-iidfile` is also available.
+
+**--inherit-annotations** *bool-value*
+
+Inherit the annotations from the base image or base stages. (default true).
+Use cases which set this flag to *false* may need to do the same for the
+**--created-annotation** flag.
+
+**--inherit-labels** *bool-value*
+
+Inherit the labels from the base image or base stages. (default true).
 
 **--ipc** *how*
 
@@ -524,10 +592,16 @@ no limit on the number of jobs that run in parallel.
 Add an image *label* (e.g. label=*value*) to the image metadata. Can be used multiple times.
 If *label* is named, but neither `=` nor a `value` is provided, then the *label* is set to an empty value.
 
+In the label *value*, a `$VAR` or `${VAR}` reference is expanded when the
+variable is set in the final build stage (by `ENV` or a declared `ARG`, or a
+matching `--build-arg`), and is kept literally when it is not set. A `$`
+preceded by a backslash, as in `\$VAR`, always produces the literal text
+`$VAR`.
+
 Users can set a special LABEL **io.containers.capabilities=CAP1,CAP2,CAP3** in
 a Containerfile that specifies the list of Linux capabilities required for the
 container to run properly. This label specified in a container image tells
-container engines, like Podman, to run the container with just these
+container engines, like Podman, which recognize this label to run the container with just these
 capabilities. The container engine launches the container with just the specified
 capabilities, as long as this list of capabilities is a subset of the default
 list.
@@ -538,7 +612,8 @@ capabilities.
 
 **--layer-label** *label[=value]*
 
-Add an intermediate image *label* (e.g. label=*value*) to the intermediate image metadata. It can be used multiple times.
+Add an intermediate image *label* (e.g. label=*value*) to the metadata in intermediate images, i.e., any images built for
+non-final stages and for non-final instructions in stages when **--layers** is **true**. It can be used multiple times.
 If *label* is named, but neither `=` nor a `value` is provided, then the *label* is set to an empty value.
 
 **--layers** *bool-value*
@@ -587,26 +662,37 @@ The format of `LIMIT` is `<number>[<unit>]`. Unit can be `b` (bytes),
 `k` (kilobytes), `m` (megabytes), or `g` (gigabytes). If you don't specify a
 unit, `b` is used. Set LIMIT to `-1` to enable unlimited swap.
 
+**--metadata-file** *MetadataFile*
+
+Write information about the built image to the named file.  When `--platform`
+is specified more than once, attempting to use this option will trigger an
+error.
+
+**--mount** *mount-instruction*
+
+Adds this mount to each `RUN` command in a Containerfile before executing. For example:
+
+`buildah build --mount type=secret,id=mysecret ...`
+
+and a Containerfile entry of:
+
+`RUN cat /run/secrets/mysecret`
+
+Has the same effect as:
+
+`RUN --mount=type=secret,id=mysecret cat /run/secrets/mysecret`
+
 **--network**, **--net**=*mode*
 
 Sets the configuration for network namespaces when handling `RUN` instructions.
 
 Valid _mode_ values are:
 
-- **none**: no networking. Invalid if using **--dns**, **--dns-opt**, or **--dns-search**;
+- **none**: no networking. Invalid if using **--dns**, **--dns-option**, or **--dns-search**;
 - **host**: use the host network stack. Note: the host mode gives the container full access to local system services such as D-bus and is therefore considered insecure;
 - **ns:**_path_: path to a network namespace to join;
 - **private**: create a new namespace for the container (default)
 - **\<network name|ID\>**: Join the network with the given name or ID, e.g. use `--network mynet` to join the network with the name mynet. Only supported for rootful users.
-- **slirp4netns[:OPTIONS,...]**: use **slirp4netns**(1) to create a user network stack. This is the default for rootless containers. It is possible to specify these additional options, they can also be set with `network_cmd_options` in containers.conf:
-  - **allow_host_loopback=true|false**: Allow slirp4netns to reach the host loopback IP (default is 10.0.2.2 or the second IP from slirp4netns cidr subnet when changed, see the cidr option below). The default is false.
-  - **mtu=MTU**: Specify the MTU to use for this network. (Default is `65520`).
-  - **cidr=CIDR**: Specify ip range to use for this network. (Default is `10.0.2.0/24`).
-  - **enable_ipv6=true|false**: Enable IPv6. Default is true. (Required for `outbound_addr6`).
-  - **outbound_addr=INTERFACE**: Specify the outbound interface slirp binds to (ipv4 traffic only).
-  - **outbound_addr=IPv4**: Specify the outbound ipv4 address slirp binds to.
-  - **outbound_addr6=INTERFACE**: Specify the outbound interface slirp binds to (ipv6 traffic only).
-  - **outbound_addr6=IPv6**: Specify the outbound ipv6 address slirp binds to.
 - **pasta[:OPTIONS,...]**: use **pasta**(1) to create a user-mode networking
     stack. \
     This is only supported in rootless mode. \
@@ -632,13 +718,12 @@ Valid _mode_ values are:
     - **pasta:--mtu,1500**: Specify a 1500 bytes MTU for the _tap_ interface in
         the container.
     - **pasta:--ipv4-only,-a,10.0.2.0,-n,24,-g,10.0.2.2,--dns-forward,10.0.2.3,-m,1500,--no-ndp,--no-dhcpv6,--no-dhcp**,
-        equivalent to default slirp4netns(1) options: disable IPv6, assign
+        disable IPv6, assign
         `10.0.2.0/24` to the `tap0` interface in the container, with gateway
         `10.0.2.3`, enable DNS forwarder reachable at `10.0.2.3`, set MTU to 1500
         bytes, disable NDP, DHCPv6 and DHCP support.
     - **pasta:-I,tap0,--ipv4-only,-a,10.0.2.0,-n,24,-g,10.0.2.2,--dns-forward,10.0.2.3,--no-ndp,--no-dhcpv6,--no-dhcp**,
-        equivalent to default slirp4netns(1) options with Podman overrides: same as
-        above, but leave the MTU to 65520 bytes
+        same as above, but leave the MTU to 65520 bytes
     - **pasta:-t,auto,-u,auto,-T,auto,-U,auto**: enable automatic port forwarding
         based on observed bound ports from both host and container sides
     - **pasta:-T,5201**: enable forwarding of TCP port 5201 from container to
@@ -648,6 +733,16 @@ Valid _mode_ values are:
 **--no-cache**
 
 Do not use existing cached images for the container build. Build from the start with a new set of cached layers.
+
+**--no-cache-filter** *stage*
+
+Do not use existing cached images for the named or numbered build *stage*, without requiring **--no-cache** to also be set.
+Stages not named by **--no-cache-filter** may still use the cache. Only has an effect when **--layers** is used, since
+caching is not performed on a per-stage basis otherwise. May be specified multiple times.
+
+Notes: **--no-cache** disables the cache for all stages, so **--no-cache-filter** has no additional effect when both are set.
+If a stage's name is identical to another stage's numeric position (for example, a stage literally named "1"),
+a value passed to **--no-cache-filter** may match both.
 
 **--no-hostname**
 
@@ -695,24 +790,34 @@ Windows base images, so using this option is usually unnecessary.
 
 **--output**, **-o**=""
 
-Output destination (format: type=local,dest=path)
+Additional output (format: type=local,dest=path)
 
-The --output (or -o) option extends the default behavior of building a container image by allowing users to export the contents of the image as files on the local filesystem, which can be useful for generating local binaries, code generation, etc.
+The --output (or -o) option supplements the default behavior of building a
+container image by allowing users to export the image's contents as files on
+the local filesystem, which can be useful for generating local binaries, code
+generation, etc.
 
-The value for --output is a comma-separated sequence of key=value pairs, defining the output type and options.
+The value for --output is a comma-separated sequence of key=value pairs,
+defining the output type and options.
 
 Supported _keys_ are:
-- **dest**: Destination path for exported output. Valid value is absolute or relative path, `-` means the standard output.
-- **type**: Defines the type of output to be used. Valid values is documented below.
+ **dest**: Destination for exported output. Can be set to `-` to indicate standard output, or to an absolute or relative path.
+ **type**: Defines the type of output to be written. Must be one of the values listed below.
 
 Valid _type_ values are:
-- **local**: write the resulting build files to a directory on the client-side.
-- **tar**: write the resulting files as a single tarball (.tar).
+ **local**: write the resulting build files to a directory on the client-side.
+ **tar**: write the resulting files as a single tarball (.tar).
 
-If no type is specified, the value defaults to **local**.
-Alternatively, instead of a comma-separated sequence, the value of **--output** can be just a destination (in the `**dest**` format) (e.g. `--output some-path`, `--output -`) where `--output some-path` is treated as if **type=local** and `--output -` is treated as if **type=tar**.
+Alternatively, instead of a comma-separated sequence, the value of **--output**
+can be just the destination (in the `**dest**` format) (e.g. `--output
+some-path`, `--output -`), and the **type** will be inferred to be **tar** if
+the output destination is `-`, and **local** otherwise.
 
-Note: The **--tag** option can also be used to change the file image format to supported `containers-transports(5)`.
+Timestamps on the output contents will be set to exactly match the value
+specified using the **--timestamp** flag, or to exactly match the value
+specified for the **--source-date-epoch** flag, if either are specified.
+
+Note that the **--tag** option can also be used to write the image to any location described by `containers-transports(5)`.
 
 **--pid** *how*
 
@@ -746,31 +851,24 @@ The `buildah build` command allows building images for all Linux architectures, 
 
 **--pull**
 
-When the *--pull* flag is enabled or set explicitly to `true` (with
-*--pull=true*), attempt to pull the latest versions of base and SBOM scanner
-images from the registries listed in registries.conf if a local base or SBOM
-scanner image does not exist or the image in the registry is newer than the one
-in local storage. Raise an error if the base or SBOM scanner image is not in
-any listed registry and is not present locally.
+Pull image policy. If not specified, the default is **missing**. If an explicit
+**--pull** argument is provided without any value, use the **always** behavior.
 
-If the flag is disabled (with *--pull=false*), do not pull base and SBOM
-scanner images from registries, use only local versions. Raise an error if a
-base or SBOM scanner image is not present locally.
+- **always**: Pull base and SBOM scanner images from the registries listed in
+registries.conf.  Raise an error if a base or SBOM scanner image is not found
+in the registries, even if an image with the same name is present locally.
 
-If the pull flag is set to `always` (with *--pull=always*), pull base and SBOM
-scanner images from the registries listed in registries.conf.  Raise an error
-if a base or SBOM scanner image is not found in the registries, even if an
-image with the same name is present locally.
+- **missing**: SBOM scanner images only if they could not be found in the local
+containers storage.  Raise an error if no image could be found and the pull
+fails.
 
-If the pull flag is set to `missing` (with *--pull=missing*), pull base and
-SBOM scanner images only if they could not be found in the local containers
-storage.  Raise an error if no image could be found and the pull fails.
+- **never**: Do not pull base and SBOM scanner images from registries, use only
+the local versions.  Raise an error if the image is not present locally.
 
-If the pull flag is set to `never` (with *--pull=never*), do not pull base and
-SBOM scanner images from registries, use only the local versions.  Raise an
-error if the image is not present locally.
-
-Defaults to *true*.
+- **newer**: Pull base and SBOM scanner images from the registries listed in
+registries.conf if newer.  Raise an error if a base or SBOM scanner image is
+not found in the registries when image with the same name is not present
+locally.
 
 **--quiet**, **-q**
 
@@ -789,6 +887,13 @@ Defaults to `3`.
 Duration of delay between retry attempts in case of failure when performing push/pull of images to/from registry.
 
 Defaults to `2s`.
+
+**--rewrite-timestamp**
+
+When generating new layers for the image, ensure that no newly added content
+bears a timestamp later than the value used by the **--source-date-epoch**
+flag, if one was provided, by replacing any timestamps which are later than
+that value, with that value.
 
 **--rm** *bool-value*
 
@@ -809,6 +914,19 @@ consult the manpages of the selected container runtime.
 
 Note: Do not pass the leading `--` to the flag. To pass the runc flag `--log-format json`
 to buildah build, the option given would be `--runtime-flag log-format=json`.
+
+**--save-stages** *bool-value*
+
+Preserve intermediate stage images instead of removing them after the build completes
+(Default is `false`). By default, Buildah removes intermediate stage images to save space.
+This option keeps those images, which can be useful for debugging multi-stage builds or
+for reusing intermediate stages in subsequent builds.
+
+`--save-stages` can be used with `--layers` and subsequent builds with `--layers` can use
+the preserved intermediate layers as cache.
+
+When combined with `--stage-labels`, all stage images (including the final image) will
+include metadata labels for easier identification and management.
 
 **--sbom** *preset*
 
@@ -901,17 +1019,29 @@ specified.  These text substitutions are performed:
 
 Generate SBOMs using the specified scanner image.
 
-**--secret**=**id=id,src=path**
+**--secret**=**id=id[,src=*envOrFile*][,env=ENV][,type=file|env]**
 
 Pass secret information to be used in the Containerfile for building images
 in a safe way that will not end up stored in the final image, or be seen in other stages.
-The secret will be mounted in the container at the default location of `/run/secrets/id`.
+The value of the secret will be read from an environment variable or file named
+by the "id" option, or named by the "src" option if it is specified, or from an
+environment variable specified by the "env" option.
+The secret will be mounted in the container at `/run/secrets/<id>` by default.
 
 To later use the secret, use the --mount flag in a `RUN` instruction within a `Containerfile`:
 
 `RUN --mount=type=secret,id=mysecret cat /run/secrets/mysecret`
 
-Note: Changing the contents of secret files will not trigger a rebuild of layers that use said secrets.
+The location of the secret in the container can be overridden using the
+"target", "dst", or "destination" option of the `RUN --mount` flag.
+
+`RUN --mount=type=secret,id=mysecret,target=/run/secrets/myothersecret cat /run/secrets/myothersecret`
+
+The secret may alternatively be exposed as an environment variable to the process:
+
+`RUN --mount=type=secret,id=mysecret,env=FOO sh -c 'echo "Hello $FOO"'`
+
+Note: changing the contents of secret files will not trigger a rebuild of layers that use said secrets.
 
 **--security-opt**=[]
 
@@ -925,10 +1055,16 @@ Security Options
   "label=type:TYPE"       : Set the label type for the container
   "label=level:LEVEL"     : Set the label level for the container
   "label=disable"         : Turn off label confinement for the container
+
+  "mask=_/path/1:/path/2_": The paths to mask separated by a colon. A masked path cannot be accessed inside the container.
+
   "no-new-privileges"     : Disable container processes from gaining additional privileges
 
   "seccomp=unconfined"    : Turn off seccomp confinement for the container
   "seccomp=profile.json   : JSON configuration for a seccomp filter
+
+  "unmask=_ALL_ or _/path/1:/path/2_, or shell expanded paths (/proc/*): Paths to unmask separated by a colon. If set to **ALL**, it unmasks all the paths that are masked or made read-only by default.
+  The default masked paths are **/proc/acpi, /proc/interrupts, /proc/kcore, /proc/keys, /proc/latency_stats, /proc/sched_debug, /proc/scsi, /proc/timer_list, /proc/timer_stats, /sys/devices/virtual/powercap, /sys/firmware**, and **/sys/fs/selinux**.  The default paths that are read-only are **/proc/asound**, **/proc/bus**, **/proc/fs**, **/proc/irq**, **/proc/sys**, and **/proc/sysrq-trigger**.
 
 **--shm-size**=""
 
@@ -943,6 +1079,92 @@ Sign the built image using the GPG key that matches the specified fingerprint.
 **--skip-unused-stages** *bool-value*
 
 Skip stages in multi-stage builds which don't affect the target stage. (Default is `true`).
+
+**--source-date-epoch** *seconds*
+
+Set the "created" timestamp for the built image to this number of seconds since
+the epoch (Unix time 0, i.e., 00:00:00 UTC on 1 January 1970) (default is to
+use the value set in the `SOURCE_DATE_EPOCH` environment variable, or the
+current time if it is not set).
+
+The "created" timestamp is written into the image's configuration and manifest
+when the image is committed, so running the same build two different times
+will ordinarily produce images with different sha256 hashes, even if no other
+changes were made to the Containerfile and build context.
+
+When this flag is set, a `SOURCE_DATE_EPOCH` build arg will provide its value
+for a stage in which it is declared.
+
+When this flag is set, the image configuration's "created" timestamp is always
+set to the time specified, which should allow for identical images to be built
+at different times using the same set of inputs.
+
+When this flag is set, output written as specified to the **--output** flag
+will bear exactly the specified timestamp.
+
+Conflicts with the similar **--timestamp** flag, which also sets its specified
+time on the contents of new layers.
+
+**--source-policy-file** *pathname*
+
+Specifies the path to a BuildKit-compatible source policy JSON file.  When
+specified, source references (e.g., base images in FROM instructions) are
+evaluated against the policy rules before being used.
+
+Source policies allow controlling which images can be used as base images and
+optionally converting image references (e.g., pinning tags to specific digests)
+without modifying Containerfiles.  This is useful for enforcing organizational
+policies and ensuring build reproducibility.
+
+The policy file is a JSON document containing an array of rules.  Each rule has:
+- **action**: The action to take when the rule matches.  Valid actions are:
+  - **ALLOW**: Explicitly allow the source (no transformation).
+  - **DENY**: Block the source and fail the build.
+  - **CONVERT**: Transform the source to a different reference specified in `updates`.
+- **selector**: Specifies which sources the rule applies to.
+  - **identifier**: The source identifier to match (e.g., `docker-image://docker.io/library/alpine:latest`).
+  - **matchType**: How to match the identifier.  Valid types are `EXACT` and `WILDCARD` (supports `*` and `?` glob patterns).  Defaults to `WILDCARD` if not specified.
+- **updates**: For `CONVERT` actions, specifies the replacement identifier.
+
+Rules are evaluated in order; the first matching rule wins.  If no rule matches,
+the source is allowed by default.
+
+Note: Source policy CONVERT rules are processed after **--build-context** substitutions
+but before any substitutions specified in **containers-registries.conf(5)**.  This provides
+multiple ways to override which base image is used for a particular stage, in order of
+precedence: `--build-context`, then source policy, then registries.conf.
+
+Example policy file that pins alpine:latest to a specific digest:
+```json
+{
+  "rules": [
+    {
+      "action": "CONVERT",
+      "selector": {
+        "identifier": "docker-image://docker.io/library/alpine:latest"
+      },
+      "updates": {
+        "identifier": "docker-image://docker.io/library/alpine@sha256:..."
+      }
+    }
+  ]
+}
+```
+
+Example policy file that denies all ubuntu images:
+```json
+{
+  "rules": [
+    {
+      "action": "DENY",
+      "selector": {
+        "identifier": "docker-image://docker.io/library/ubuntu:*",
+        "matchType": "WILDCARD"
+      }
+    }
+  ]
+}
+```
 
 **--squash**
 
@@ -959,6 +1181,32 @@ The socket path can be left empty to use the value of `default=$SSH_AUTH_SOCK`
 To later use the ssh agent, use the --mount flag in a `RUN` instruction within a `Containerfile`:
 
 `RUN --mount=type=secret,id=id mycmd`
+
+**NOTE:** When using the non-default `root` user, then either `mode`, `uid` or `gid` options
+must be specified with the `mount` options. For example making ssh socket available to `app`
+user with `uid=50000`:
+
+```
+# Switch to application user (Note that uid depends on container image)
+USER app
+# ...and check whether ssh identities are available
+RUN --mount=type=ssh,uid=50000 \
+    ssh-add -L
+```
+
+**--stage-labels** *bool-value*
+
+Add metadata labels to all intermediate stage images of the multistage build,
+including the final image (Default is `false`).
+This option requires `--save-stages` to be enabled.
+
+When enabled, all intermediate stage images and final image will be labeled with:
+  - `io.buildah.stage.name`: The stage alias (from `FROM ... AS alias`), or stage position
+    if no alias is specified
+  - `io.buildah.stage.base`: The base image used by this stage (pullspec or image ID
+    when stage uses another stage as base)
+
+These labels make it easier to identify, query, and manage images from multi-stage builds.
 
 **--stdin**
 
@@ -987,14 +1235,29 @@ Commands after the target stage will be skipped.
 
 **--timestamp** *seconds*
 
-Set the create timestamp to seconds since epoch to allow for deterministic builds (defaults to current time).
-By default, the created timestamp is changed and written into the image manifest with every commit,
-causing the image's sha256 hash to be different even if the sources are exactly the same otherwise.
-When --timestamp is set, the created timestamp is always set to the time specified and therefore not changed, allowing the image's sha256 to remain the same. All files committed to the layers of the image will be created with the timestamp.
+Set the "created" timestamp for the built image to this number of seconds since
+the epoch (Unix time 0, i.e., 00:00:00 UTC on 1 January 1970) (defaults to
+current time).
+
+The "created" timestamp is written into the image's configuration and manifest
+when the image is committed, so running the same build two different times
+will ordinarily produce images with different sha256 hashes, even if no other
+changes were made to the Containerfile and build context.
+
+When --timestamp is set, the "created" timestamp is always set to the time
+specified, which should allow for identical images to be built at different
+times using the same set of inputs.
+
+When --timestamp is set, all content in layers created as part of the build,
+and output written as specified to the **--output** flag, will also bear this
+same timestamp.
+
+Conflicts with the similar **--source-date-epoch** flag, which by default does
+not affect the timestamps of layer contents.
 
 **--tls-verify** *bool-value*
 
-Require HTTPS and verification of certificates when talking to container registries (defaults to true).  TLS verification cannot be used when talking to an insecure registry.
+Require HTTPS and verification of certificates when talking to container registries (defaults to true) and retrieving build contexts and content from HTTPS locations for ADD instructions.  TLS verification cannot be used when talking to an insecure registry.
 
 **--ulimit** *type*=*soft-limit*[:*hard-limit*]
 
@@ -1019,6 +1282,10 @@ include:
   "sigpending": maximum number of pending signals (ulimit -i)
   "stack": maximum stack size (ulimit -s)
 
+**--unsetannotation** *annotation*
+
+Unset the image annotation, causing the annotation not to be inherited from the base image.
+
 **--unsetenv** *env*
 
 Unset environment variables from the final image.
@@ -1033,7 +1300,7 @@ Sets the configuration for user namespaces when handling `RUN` instructions.
 The configured value can be "" (the empty string) , "private" or "auto" to indicate
 that a new user namespace should be created, it can be "host" to indicate that
 the user namespace in which `buildah` itself is being run should be reused, or
-it can be the path to an user namespace which is already in use by another
+it can be the path to a user namespace that is already in use by another
 process.
 
 auto: automatically create a unique user namespace.
@@ -1273,6 +1540,14 @@ buildah build -v /var/lib/dnf:/var/lib/dnf:O -t imageName .
 
 buildah build --layers -t imageName .
 
+buildah build --save-stages -t imageName .
+
+buildah build --save-stages --layers -t imageName .
+
+buildah build --save-stages --stage-labels -t imageName .
+
+buildah build --save-stages --stage-labels --layers -t imageName .
+
 buildah build --no-cache -t imageName .
 
 buildah build -f Containerfile --layers --force-rm -t imageName .
@@ -1297,7 +1572,33 @@ buildah build --os-feature win32k -t imageName .
 
 buildah build --os-feature win32k- -t imageName .
 
-### Building an multi-architecture image using the --manifest option (requires emulation software)
+buildah build --secret=id=mysecret .
+
+buildah build --secret=id=mysecret,env=MYSECRET .
+
+buildah build --secret=id=mysecret,src=MYSECRET,type=env .
+
+buildah build --secret=id=mysecret,src=.mysecret,type=file .
+
+buildah build --secret=id=mysecret,src=.mysecret .
+
+### Building an image with a source policy
+
+buildah build --source-policy-file /etc/buildah/source-policy.json -t imageName .
+
+### Using FROM --after for explicit stage dependencies
+
+When using local transports like `FROM oci-archive:file.ociarchive` where the file is produced by an earlier stage, Buildah cannot automatically detect the dependency. Use the `--after` flag on the FROM instruction to declare explicit stage dependencies:
+
+```Dockerfile
+FROM quay.io/skopeo/stable AS builder
+RUN --mount=type=bind,target=/src,rw skopeo copy docker://quay.io/fedora/fedora-minimal oci-archive:/src/fedora.ociarchive
+
+FROM --after=builder oci-archive:fedora.ociarchive
+# This stage will wait for builder to complete before evaluating FROM
+```
+
+### Building a multi-architecture image using the --manifest option (requires emulation software)
 
 buildah build --arch arm --manifest myimage /tmp/mysrc
 
@@ -1320,6 +1621,20 @@ buildah build --output type=local,dest=out .
 buildah build --output type=tar,dest=out.tar .
 
 buildah build -o - . > out.tar
+
+### Preserving and querying intermediate stage images
+
+Build a multi-stage image while preserving intermediate stages with metadata labels:
+
+buildah build --save-stages --stage-labels -t myapp .
+
+Find an intermediate image for a specific stage name:
+
+buildah images --filter "label=io.buildah.stage.name=builder"
+
+Find an intermediate image for a specific stage base image:
+
+buildah images --filter "label=io.buildah.stage.base=golang:1.21"
 
 ### Building an image using a URL
 
@@ -1366,7 +1681,8 @@ are stored while pulling and pushing images.  Defaults to '/var/tmp'.
 
 If the .containerignore/.dockerignore file exists in the context directory,
 `buildah build` reads its contents. If both exist, then .containerignore is used.
-Use the `--ignorefile` flag to override the ignore file path location. Buildah uses the content to exclude files and directories from the context directory, when executing COPY and ADD directives in the Containerfile/Dockerfile
+Use the `--ignorefile` flag to override the ignore file path location. Buildah uses the content to exclude files and directories from the context directory, when executing COPY and ADD directives in the Containerfile/Dockerfile.
+COPY and ADD also support **--exclude**; patterns are relative to the copy source.
 
 Users can specify a series of Unix shell globals in a
 .containerignore/.dockerignore file to identify files/directories to exclude.
@@ -1406,6 +1722,8 @@ Exclude all doc files except Help.doc from the image.
 This functionality is compatible with the handling of .containerignore files described here:
 
 https://github.com/containers/common/blob/main/docs/containerignore.5.md
+
+Note: when the argument to ADD is a git repository, the local .containerignore is not applied.
 
 **registries.conf** (`/etc/containers/registries.conf`)
 

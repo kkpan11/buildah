@@ -1,15 +1,14 @@
 package main
 
 import (
-	"context"
 	"fmt"
 
-	buildahcli "github.com/containers/buildah/pkg/cli"
-	"github.com/containers/buildah/pkg/parse"
-	"github.com/containers/buildah/pkg/volumes"
-	"github.com/containers/common/libimage"
 	"github.com/hashicorp/go-multierror"
 	"github.com/spf13/cobra"
+	buildahcli "go.podman.io/buildah/pkg/cli"
+	"go.podman.io/buildah/pkg/parse"
+	"go.podman.io/buildah/pkg/volumes"
+	"go.podman.io/common/libimage"
 )
 
 type pruneOptions struct {
@@ -17,7 +16,7 @@ type pruneOptions struct {
 	all   bool
 }
 
-func init() {
+func pruneInit() {
 	var (
 		pruneDescription = `
 Cleanup intermediate images as well as build and mount cache.`
@@ -31,7 +30,8 @@ Cleanup intermediate images as well as build and mount cache.`
 			return pruneCmd(cmd, args, opts)
 		},
 		Example: `buildah prune
-  buildah prune`,
+  buildah prune --force`,
+		GroupID: groupSystem,
 	}
 	pruneCommand.SetUsageTemplate(UsageTemplate())
 
@@ -77,7 +77,7 @@ func pruneCmd(c *cobra.Command, args []string, iopts pruneOptions) error {
 	}
 	options.Force = iopts.force
 
-	rmiReports, rmiErrors := runtime.RemoveImages(context.Background(), args, options)
+	rmiReports, rmiErrors := runtime.RemoveImages(getContext(), args, options)
 	for _, r := range rmiReports {
 		for _, u := range r.Untagged {
 			fmt.Printf("untagged: %s\n", u)

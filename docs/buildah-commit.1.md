@@ -26,8 +26,15 @@ The image ID of the image that was created.  On error, 1 is returned and errno i
 Read the contents of the file `source` and add it to the committed image as a
 file at `destination`.  If `destination` is not specified, the path of `source`
 will be used.  The new file will be owned by UID 0, GID 0, have 0644
-permissions, and be given a current timestamp unless the **--timestamp** option
-is also specified.  This option can be specified multiple times.
+permissions, and be given the timestamp specified to the **--timestamp** option
+if it is specified.  This option can be specified multiple times.
+
+**--annotation** *annotation[=value]*
+
+Add an image *annotation* (e.g. annotation=*value*) to the image metadata. Can be used multiple times.
+If *annotation* is named, but neither `=` nor a `value` is provided, then the *annotation* is set to an empty value.
+
+Note: this information is not present in Docker image formats, so it is discarded when writing images in Docker formats.
 
 **--authfile** *path*
 
@@ -49,11 +56,32 @@ Apply the change to the committed image that would have been made if it had
 been built using a Containerfile which included the specified instruction.
 This option can be specified multiple times.
 
+**--compression-format** *format*
+
+Specifies the compression format to use.  Supported values are: `gzip`, `zstd` and `zstd:chunked`.
+If not specified, the format is read from the `compression_format` setting in containers.conf.
+Cannot be used together with **--disable-compression**.
+
+**--compression-level** *level*
+
+Specifies the compression level to use.  The value is specific to the compression algorithm used, e.g. for zstd the accepted values are in the range 1-20 (inclusive), while for gzip it is 1-9 (inclusive).
+If not specified, the level is read from the `compression_level` setting in containers.conf.
+
 **--config** *filename*
 
 Read a JSON-encoded version of an image configuration object from the specified
 file, and merge the values from it with the configuration of the image being
 committed.
+
+**--created-annotation**
+
+Add an image *annotation* (see also **--annotation**) to the image metadata
+setting "org.opencontainers.image.created" to the current time, or to the
+datestamp specified to the **--source-date-epoch** or **--timestamp** flag,
+if either was used.  If *false*, no such annotation will be present in the
+written image.
+
+Note: this information is not present in Docker image formats, so it is discarded when writing images in Docker formats.
 
 **--creds** *creds*
 
@@ -126,6 +154,7 @@ because image layers are compressed automatically when they are pushed to
 registries, and images being written to local storage would only need to be
 decompressed again to be stored.  Compression can be forced in all cases by
 specifying **--disable-compression=false**.
+Cannot be used together with **--compression-format** or **--force-compression**.
 
 **--encrypt-layer** *layer(s)*
 
@@ -134,6 +163,11 @@ Layer(s) to encrypt: 0-indexed layer indices with support for negative indexing 
 **--encryption-key** *key*
 
 The [protocol:keyfile] specifies the encryption protocol, which can be JWE (RFC7516), PGP (RFC4880), and PKCS7 (RFC2315) and the key material required for image encryption. For instance, jwe:/path/to/key.pem or pgp:admin@example.com or pkcs7:/path/to/x509-file.
+
+**--force-compression**
+
+If set, commit uses the specified compression algorithm even if the destination contains a differently-compressed variant already.
+Defaults to `true` if **--compression-format** is explicitly specified on the command-line or `compression_format` is set in containers.conf, `false` otherwise.
 
 **--format**, **-f** *[oci | docker]*
 
@@ -146,7 +180,9 @@ environment variable.  `export BUILDAH_FORMAT=docker`
 
 **--identity-label** *bool-value*
 
-Adds default identity label `io.buildah.version` if set. (default true).
+Adds a label `io.buildah.version` with its value set to the version of buildah
+which committed the image (default true unless `--timestamp` or
+`--source-date-epoch` is used).
 
 **--iidfile** *ImageIDfile*
 
@@ -156,6 +192,10 @@ Write the image ID to the file.
 
 Name of the manifest list to which the built image will be added. Creates the manifest list
 if it does not exist. This option is useful for building multi architecture images.
+
+**--metadata-file** *MetadataFile*
+
+Write information about the committed image to the named file.
 
 **--omit-history** *bool-value*
 
@@ -195,6 +235,13 @@ the image is not present locally.
 **--quiet**, **-q**
 
 When writing the output image, suppress progress output.
+
+**--rewrite-timestamp**
+
+When generating the new layer for the image, ensure that no newly added content
+bears a timestamp later than the value used by the **--source-date-epoch**
+flag, if one was provided, by replacing any timestamps which are later than
+that value, with that value.
 
 **--rm**
 Remove the working container and its contents after creating the image.
@@ -295,20 +342,55 @@ Generate SBOMs using the specified scanner image.
 
 Sign the new image using the GPG key that matches the specified fingerprint.
 
+**--source-date-epoch** *seconds*
+
+Set the "created" timestamp for the image to this number of seconds since the
+epoch (Unix time 0, i.e., 00:00:00 UTC on 1 January 1970) to make it easier to
+create deterministic builds (defaults to $SOURCE_DATE_EPOCH if set, otherwise
+the current time will be used).
+
+The "created" timestamp is written into the image's configuration and manifest
+when the image is committed, so committing the same working container at two
+different times will produce images with different sha256 hashes, even if no
+other changes were made to the working container in between.
+
+When --source-date-epoch is set, the "created" timestamp is always set to the time
+specified, which should allow for identical images to be committed at different
+times.
+
+Conflicts with the similar **--timestamp** flag, which also sets its specified
+time on layer contents.
+
 **--squash**
 
 Squash all of the new image's layers (including those inherited from a base image) into a single new layer.
 
 **--timestamp** *seconds*
 
-Set the create timestamp to seconds since epoch to allow for deterministic builds (defaults to current time).
-By default, the created timestamp is changed and written into the image manifest with every commit,
-causing the image's sha256 hash to be different even if the sources are exactly the same otherwise.
-When --timestamp is set, the created timestamp is always set to the time specified and therefore not changed, allowing the image's sha256 to remain the same. All files committed to the layers of the image will be created with the timestamp.
+Set the "created" timestamp for the image to this number of seconds since the
+epoch (Unix time 0, i.e., 00:00:00 UTC on 1 January 1970) to make it easier to
+create deterministic builds (defaults to current time).
+
+The "created" timestamp is written into the image's configuration and manifest
+when the image is committed, so committing the same working container at two
+different times will produce images with different sha256 hashes, even if no
+other changes were made to the working container in between.
+
+When --timestamp is set, the "created" timestamp is always set to the time
+specified, which should allow for identical images to be committed at different
+times.  All content in the new layer added as part of the image will also bear
+this timestamp.
+
+Conflicts with the similar **--source-date-epoch** flag, which by default does
+not affect the timestamps of layer contents.
 
 **--tls-verify** *bool-value*
 
 Require HTTPS and verification of certificates when talking to container registries (defaults to true).  TLS verification cannot be used when talking to an insecure registry.
+
+**--unsetannotation** *annotation*
+
+Unset the image annotation, causing the annotation not to be inherited from the base image.
 
 **--unsetenv** *env*
 
@@ -346,7 +428,7 @@ This example commits the container to the image on the local registry using cred
 This example saves an image based on the container, but stores dates based on epoch time.
 `buildah commit --timestamp=0 containerID newImageName`
 
-### Building an multi-architecture image using the --manifest option (requires emulation software)
+### Building a multi-architecture image using the --manifest option (requires emulation software)
 
 ```
 #!/bin/sh

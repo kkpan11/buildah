@@ -1,5 +1,4 @@
 //go:build freebsd
-// +build freebsd
 
 package chroot
 
@@ -14,12 +13,12 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/containers/buildah/pkg/jail"
-	"github.com/containers/storage/pkg/fileutils"
-	"github.com/containers/storage/pkg/mount"
-	"github.com/containers/storage/pkg/unshare"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
+	"go.podman.io/buildah/pkg/jail"
+	"go.podman.io/storage/pkg/fileutils"
+	"go.podman.io/storage/pkg/mount"
+	"go.podman.io/storage/pkg/unshare"
 	"golang.org/x/sys/unix"
 )
 
@@ -42,6 +41,7 @@ var (
 type runUsingChrootSubprocOptions struct {
 	Spec       *specs.Spec
 	BundlePath string
+	NoPivot    bool
 }
 
 func setPlatformUnshareOptions(spec *specs.Spec, cmd *unshare.Cmd) error {
@@ -191,12 +191,12 @@ func setupChrootBindMounts(spec *specs.Spec, bundlePath string) (undoBinds func(
 			// XXX: This was copied from the linux version which supports bind mounting files.
 			// Leaving it here since I plan to add this to FreeBSD's nullfs.
 			if m.Type != "nullfs" || srcinfo.IsDir() {
-				if err = os.MkdirAll(target, 0111); err != nil {
+				if err = os.MkdirAll(target, 0o111); err != nil {
 					return undoBinds, fmt.Errorf("creating mountpoint %q in mount namespace: %w", target, err)
 				}
 				removes = append(removes, target)
 			} else {
-				if err = os.MkdirAll(filepath.Dir(target), 0111); err != nil {
+				if err = os.MkdirAll(filepath.Dir(target), 0o111); err != nil {
 					return undoBinds, fmt.Errorf("ensuring parent of mountpoint %q (%q) is present in mount namespace: %w", target, filepath.Dir(target), err)
 				}
 				// Don't do this until we can support file mounts in nullfs
@@ -219,7 +219,7 @@ func setupChrootBindMounts(spec *specs.Spec, bundlePath string) (undoBinds func(
 					save := saveDir(spec, target)
 					if err := fileutils.Exists(save); err != nil {
 						if errors.Is(err, fs.ErrNotExist) {
-							err = os.MkdirAll(save, 0111)
+							err = os.MkdirAll(save, 0o111)
 						}
 						if err != nil {
 							return undoBinds, fmt.Errorf("creating file mount save directory %q: %w", save, err)
@@ -269,4 +269,9 @@ func setPdeathsig(cmd *exec.Cmd) {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
 	cmd.SysProcAttr.Pdeathsig = syscall.SIGKILL
+}
+
+// setgroupsDenied always returns false on FreeBSD; no such mechanism exists.
+func setgroupsDenied() bool {
+	return false
 }

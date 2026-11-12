@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,12 +8,12 @@ import (
 	"strings"
 	"time"
 
-	buildahcli "github.com/containers/buildah/pkg/cli"
-	"github.com/containers/buildah/pkg/formats"
-	"github.com/containers/buildah/pkg/parse"
-	"github.com/containers/common/libimage"
 	"github.com/docker/go-units"
 	"github.com/spf13/cobra"
+	buildahcli "go.podman.io/buildah/pkg/cli"
+	"go.podman.io/buildah/pkg/parse"
+	"go.podman.io/common/libimage"
+	"go.podman.io/common/pkg/formats"
 )
 
 const none = "<none>"
@@ -71,7 +70,7 @@ var imagesHeader = map[string]string{
 	"History":   "HISTORY",
 }
 
-func init() {
+func imagesInit() {
 	var (
 		opts              imageResults
 		imagesDescription = "\n  Lists locally stored images."
@@ -86,6 +85,7 @@ func init() {
 		Example: `buildah images --all
   buildah images [imageName]
   buildah images --format '{{.ID}} {{.Name}} {{.Size}} {{.CreatedAtRaw}}'`,
+		GroupID: groupImages,
 	}
 	imagesCommand.SetUsageTemplate(UsageTemplate())
 
@@ -132,7 +132,7 @@ func imagesCmd(c *cobra.Command, args []string, iopts *imageResults) error {
 		return err
 	}
 
-	ctx := context.Background()
+	ctx := getContext()
 
 	options := &libimage.ListImagesOptions{}
 	if len(iopts.filter) > 0 {
@@ -142,9 +142,27 @@ func imagesCmd(c *cobra.Command, args []string, iopts *imageResults) error {
 		options.Filters = append(options.Filters, "intermediate=false")
 	}
 
-	images, err := runtime.ListImages(ctx, args, options)
+	images, err := runtime.ListImages(ctx, options)
 	if err != nil {
 		return err
+	}
+
+	if len(args) > 0 {
+		imagesMatchName, err := runtime.ListImagesByNames(args)
+		if err != nil {
+			return err
+		}
+		imagesIDs := map[string]struct{}{}
+		for _, image := range imagesMatchName {
+			imagesIDs[image.ID()] = struct{}{}
+		}
+		var imagesMatchNameAndFilter []*libimage.Image
+		for _, image := range images {
+			if _, ok := imagesIDs[image.ID()]; ok {
+				imagesMatchNameAndFilter = append(imagesMatchNameAndFilter, image)
+			}
+		}
+		images = imagesMatchNameAndFilter
 	}
 
 	if iopts.quiet && iopts.format != "" {
@@ -171,7 +189,7 @@ func imagesCmd(c *cobra.Command, args []string, iopts *imageResults) error {
 
 func outputHeader(opts imageOptions) string {
 	if opts.format != "" {
-		return strings.Replace(opts.format, `\t`, "\t", -1)
+		return strings.ReplaceAll(opts.format, `\t`, "\t")
 	}
 	if opts.quiet {
 		return formats.IDString
@@ -309,10 +327,10 @@ func truncateID(id string, truncate bool) string {
 	return id
 }
 
-func imagesToGeneric(templParams []imageOutputParams) (genericParams []interface{}) {
+func imagesToGeneric(templParams []imageOutputParams) (genericParams []any) {
 	if len(templParams) > 0 {
 		for _, v := range templParams {
-			genericParams = append(genericParams, interface{}(v))
+			genericParams = append(genericParams, any(v))
 		}
 	}
 	return genericParams
@@ -340,7 +358,7 @@ func matchesReference(name, argName string) bool {
 	}
 	splitName := strings.Split(name, ":")
 	// If the arg contains a tag, we handle it differently than if it does not
-	if strings.Contains(argName, ":") {
+	if strings.Contains(argName, ":") && len(splitName) > 1 {
 		splitArg := strings.Split(argName, ":")
 		return strings.HasSuffix(splitName[0], splitArg[0]) && (splitName[1] == splitArg[1])
 	}

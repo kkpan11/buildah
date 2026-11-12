@@ -1,16 +1,16 @@
-package util
+package util //nolint:revive,nolintlint
 
 import (
-	"os"
 	"strconv"
 	"testing"
 
-	"github.com/containers/common/pkg/config"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/stretchr/testify/assert"
+	"go.podman.io/common/pkg/config"
 )
 
 func TestMergeEnv(t *testing.T) {
+	t.Parallel()
 	tests := [][3][]string{
 		{
 			[]string{"A=B", "B=C", "C=D"},
@@ -44,7 +44,7 @@ func TestMergeEnv(t *testing.T) {
 }
 
 func TestRuntime(t *testing.T) {
-	os.Setenv("CONTAINERS_CONF", "/dev/null")
+	t.Setenv("CONTAINERS_CONF", "/dev/null")
 	conf, _ := config.Default()
 	defaultRuntime := conf.Engine.OCIRuntime
 	runtime := Runtime()
@@ -52,7 +52,7 @@ func TestRuntime(t *testing.T) {
 		t.Fatalf("expected %v, got %v", runtime, defaultRuntime)
 	}
 	defaultRuntime = "myoci"
-	os.Setenv("BUILDAH_RUNTIME", defaultRuntime)
+	t.Setenv("BUILDAH_RUNTIME", defaultRuntime)
 	runtime = Runtime()
 	if runtime != defaultRuntime {
 		t.Fatalf("expected %v, got %v", runtime, defaultRuntime)
@@ -60,6 +60,7 @@ func TestRuntime(t *testing.T) {
 }
 
 func TestMountsSort(t *testing.T) {
+	t.Parallel()
 	mounts1a := []specs.Mount{
 		{
 			Source:      "/a/bb/c",

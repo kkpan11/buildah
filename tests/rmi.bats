@@ -85,19 +85,19 @@ load helpers
   run_buildah images -q
   expect_line_count 1
 
-  run_buildah mount $cid
+  run_buildah_mount $cid
   root=$output
   cp ${TEST_SCRATCH_DIR}/randomfile $root/randomfile
-  run_buildah unmount $cid
+  run_buildah_umount $cid
   run_buildah commit $WITH_POLICY_JSON $cid containers-storage:new-image
 
   run_buildah images -q
   expect_line_count 2
 
-  run_buildah mount $cid
+  run_buildah_mount $cid
   root=$output
   cp ${TEST_SCRATCH_DIR}/other-randomfile $root/other-randomfile
-  run_buildah unmount $cid
+  run_buildah_umount $cid
   run_buildah commit $WITH_POLICY_JSON $cid containers-storage:new-image
 
   run_buildah images -q
@@ -123,10 +123,10 @@ load helpers
   run_buildah images -q -a
   expect_line_count 0
 
-  run_buildah mount $cid
+  run_buildah_mount $cid
   root=$output
   cp ${TEST_SCRATCH_DIR}/randomfile $root/randomfile
-  run_buildah unmount $cid
+  run_buildah_umount $cid
   run_buildah commit --quiet $WITH_POLICY_JSON $cid
   image=$output
   run_buildah rm $cid
@@ -136,10 +136,10 @@ load helpers
 
   run_buildah from --quiet $WITH_POLICY_JSON $image
   cid=$output
-  run_buildah mount $cid
+  run_buildah_mount $cid
   root=$output
   cp ${TEST_SCRATCH_DIR}/other-randomfile $root/other-randomfile
-  run_buildah unmount $cid
+  run_buildah_umount $cid
   run_buildah commit $WITH_POLICY_JSON $cid
   run_buildah rm $cid
 
@@ -212,15 +212,19 @@ EOF
 
 @test "rmi with cached images" {
   _prefetch alpine
-  run_buildah bud $WITH_POLICY_JSON --layers -t test1 $BUDFILES/use-layers
+  contentdir=${TEST_SCRATCH_DIR}/content
+  mkdir -p ${contentdir}
+  echo sure, i guess this also counts as a README file > ${contentdir}/README.md
+  starthttpd ${contentdir}
+  run_buildah bud $WITH_POLICY_JSON --build-arg=HTTP_SERVER_PORT=${HTTP_SERVER_PORT} --layers -t test1 $BUDFILES/use-layers
   run_buildah images -a -q
-  expect_line_count 7
+  expect_line_count 8
   run_buildah bud $WITH_POLICY_JSON --layers -t test2 -f Dockerfile.2 $BUDFILES/use-layers
   run_buildah images -a -q
-  expect_line_count 9
+  expect_line_count 10
   run_buildah rmi test2
   run_buildah images -a -q
-  expect_line_count 7
+  expect_line_count 8
   run_buildah rmi test1
   run_buildah images -a -q
   expect_line_count 1
@@ -237,7 +241,7 @@ EOF
   cid=$output
   run_buildah config --entrypoint '[ "/ENTRYPOINT" ]' $cid
   run_buildah commit $WITH_POLICY_JSON $cid new-image
-  run_buildah from --quiet --pull=true $WITH_POLICY_JSON new-image
+  run_buildah from --quiet $WITH_POLICY_JSON new-image
   cid=$output
   run_buildah config --env 'foo=bar' $cid
   run_buildah commit $WITH_POLICY_JSON $cid new-image-2

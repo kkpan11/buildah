@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -17,17 +18,18 @@ import (
 	"strings"
 	"time"
 
-	"github.com/containers/buildah/internal/tmpdir"
-	"github.com/containers/buildah/pkg/overlay"
 	"github.com/containers/luksy"
-	"github.com/containers/storage/pkg/idtools"
-	"github.com/containers/storage/pkg/mount"
-	"github.com/containers/storage/pkg/system"
-	"github.com/docker/docker/pkg/ioutils"
 	"github.com/docker/go-units"
 	digest "github.com/opencontainers/go-digest"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/sirupsen/logrus"
+	"go.podman.io/buildah/internal/ctxreader"
+	"go.podman.io/buildah/internal/tmpdir"
+	"go.podman.io/buildah/pkg/overlay"
+	"go.podman.io/storage/pkg/idtools"
+	"go.podman.io/storage/pkg/ioutils"
+	"go.podman.io/storage/pkg/mount"
+	"go.podman.io/storage/pkg/system"
 )
 
 const minimumImageSize = 10 * 1024 * 1024
@@ -64,14 +66,24 @@ type chainRetrievalError struct {
 
 func (c chainRetrievalError) Error() string {
 	if trimmed := strings.TrimSpace(c.stderr); trimmed != "" {
-		return fmt.Sprintf("retrieving SEV certificate chain: sevctl: %v: %v", strings.TrimSpace(c.stderr), c.err)
+		return fmt.Sprintf("retrieving SEV certificate chain: sevctl: %v: %v", trimmed, c.err)
 	}
 	return fmt.Sprintf("retrieving SEV certificate chain: sevctl: %v", c.err)
 }
 
+func (c chainRetrievalError) Unwrap() error {
+	return c.err
+}
+
 // Archive generates a WorkloadConfig for a specified directory and produces a
 // tar archive of a container image's rootfs with the expected contents.
-func Archive(rootfsPath string, ociConfig *v1.Image, options ArchiveOptions) (io.ReadCloser, WorkloadConfig, error) {
+func Archive(ctx context.Context, rootfsPath string, ociConfig *v1.Image, options ArchiveOptions) (io.ReadCloser, WorkloadConfig, error) {
+	select {
+	case <-ctx.Done():
+		return nil, WorkloadConfig{}, ctx.Err()
+	default:
+	}
+
 	const (
 		teeDefaultCPUs       = 2
 		teeDefaultMemory     = 512
@@ -136,7 +148,7 @@ func Archive(rootfsPath string, ociConfig *v1.Image, options ArchiveOptions) (io
 			}
 		}()
 		logrus.Debugf("sevctl export -f %s", chain.Name())
-		cmd := exec.Command("sevctl", "export", "-f", chain.Name())
+		cmd := exec.CommandContext(ctx, "sevctl", "export", "-f", chain.Name())
 		var stdout, stderr bytes.Buffer
 		cmd.Stdout, cmd.Stderr = &stdout, &stderr
 		if err := cmd.Run(); err != nil {
@@ -260,7 +272,7 @@ func Archive(rootfsPath string, ociConfig *v1.Image, options ArchiveOptions) (io
 				return err
 			}
 			defer input.Close()
-			if _, err := io.Copy(output, input); err != nil {
+			if _, err := io.Copy(output, ctxreader.NewCancelableReader(ctx, input)); err != nil {
 				return fmt.Errorf("copying contents of %q to %q in container root filesystem: %w", content, location, err)
 			}
 			if err := output.Chown(int(st.UID()), int(st.GID())); err != nil {
@@ -319,7 +331,7 @@ func Archive(rootfsPath string, ociConfig *v1.Image, options ArchiveOptions) (io
 	imageSize := slop(options.ImageSize, options.Slop)
 	if imageSize == 0 {
 		var sourceSize int64
-		if err := filepath.WalkDir(rootfsPath, func(path string, d fs.DirEntry, err error) error {
+		if err := filepath.WalkDir(rootfsPath, func(_ string, d fs.DirEntry, err error) error {
 			if err != nil && !errors.Is(err, os.ErrNotExist) && !errors.Is(err, os.ErrPermission) {
 				return err
 			}
@@ -367,7 +379,7 @@ func Archive(rootfsPath string, ociConfig *v1.Image, options ArchiveOptions) (io
 	}
 
 	// Format the disk image with the filesystem contents.
-	if _, stderr, err := MakeFS(rootfsPath, plain.Name(), filesystem); err != nil {
+	if _, stderr, err := MakeFS(ctx, rootfsPath, plain.Name(), filesystem); err != nil {
 		if strings.TrimSpace(stderr) != "" {
 			return nil, WorkloadConfig{}, fmt.Errorf("%s: %w", strings.TrimSpace(stderr), err)
 		}
@@ -376,7 +388,7 @@ func Archive(rootfsPath string, ociConfig *v1.Image, options ArchiveOptions) (io
 
 	// If we're registering the workload, we can do that now.
 	if workloadConfig.AttestationURL != "" {
-		if err := SendRegistrationRequest(workloadConfig, diskEncryptionPassphrase, options.FirmwareLibrary, options.IgnoreAttestationErrors, logger); err != nil {
+		if err := SendRegistrationRequest(ctx, workloadConfig, diskEncryptionPassphrase, options.FirmwareLibrary, options.IgnoreAttestationErrors, logger); err != nil {
 			return nil, WorkloadConfig{}, err
 		}
 	}
@@ -520,7 +532,7 @@ func Archive(rootfsPath string, ociConfig *v1.Image, options ArchiveOptions) (io
 			return
 		}
 		encryptWrapper := luksy.EncryptWriter(encrypt, tw, blockSize)
-		if _, err = io.Copy(encryptWrapper, plain); err != nil {
+		if _, err = io.Copy(encryptWrapper, ctxreader.NewCancelableReader(ctx, plain)); err != nil {
 			logrus.Errorf("encrypting disk.img: %v", err)
 			return
 		}
@@ -543,13 +555,12 @@ func slop(size int64, slop string) int64 {
 	if slop == "" {
 		return size * 5 / 4
 	}
-	for _, factor := range strings.Split(slop, "+") {
+	for factor := range strings.SplitSeq(slop, "+") {
 		factor = strings.TrimSpace(factor)
 		if factor == "" {
 			continue
 		}
-		if strings.HasSuffix(factor, "%") {
-			percentage := strings.TrimSuffix(factor, "%")
+		if percentage, ok := strings.CutSuffix(factor, "%"); ok {
 			percent, err := strconv.ParseInt(percentage, 10, 8)
 			if err != nil {
 				logrus.Warnf("parsing percentage %q: %v", factor, err)

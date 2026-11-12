@@ -1,15 +1,14 @@
 package main
 
 import (
-	"context"
 	"errors"
 	"fmt"
 
-	buildahcli "github.com/containers/buildah/pkg/cli"
-	"github.com/containers/buildah/pkg/parse"
-	"github.com/containers/common/libimage"
 	"github.com/hashicorp/go-multierror"
 	"github.com/spf13/cobra"
+	buildahcli "go.podman.io/buildah/pkg/cli"
+	"go.podman.io/buildah/pkg/parse"
+	"go.podman.io/common/libimage"
 )
 
 type rmiOptions struct {
@@ -18,7 +17,7 @@ type rmiOptions struct {
 	force bool
 }
 
-func init() {
+func rmiInit() {
 	var (
 		rmiDescription = "\n  Removes one or more locally stored images."
 		opts           rmiOptions
@@ -33,6 +32,7 @@ func init() {
 		Example: `buildah rmi imageID
   buildah rmi --all --force
   buildah rmi imageID1 imageID2 imageID3`,
+		GroupID: groupImages,
 	}
 	rmiCommand.SetUsageTemplate(UsageTemplate())
 
@@ -88,7 +88,7 @@ func rmiCmd(c *cobra.Command, args []string, iopts rmiOptions) error {
 	}
 	options.Force = iopts.force
 
-	rmiReports, rmiErrors := runtime.RemoveImages(context.Background(), args, options)
+	rmiReports, rmiErrors := runtime.RemoveImages(getContext(), args, options)
 	for _, r := range rmiReports {
 		for _, u := range r.Untagged {
 			fmt.Printf("untagged: %s\n", u)

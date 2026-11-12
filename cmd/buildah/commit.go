@@ -5,66 +5,80 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
-	"github.com/containers/buildah"
-	"github.com/containers/buildah/define"
-	"github.com/containers/buildah/pkg/cli"
-	"github.com/containers/buildah/pkg/parse"
-	"github.com/containers/buildah/util"
-	"github.com/containers/common/pkg/auth"
-	"github.com/containers/common/pkg/completion"
-	"github.com/containers/image/v5/manifest"
-	"github.com/containers/image/v5/pkg/shortnames"
-	storageTransport "github.com/containers/image/v5/storage"
-	"github.com/containers/image/v5/transports/alltransports"
-	"github.com/containers/image/v5/types"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+	"go.podman.io/buildah"
+	"go.podman.io/buildah/define"
+	"go.podman.io/buildah/internal"
+	"go.podman.io/buildah/pkg/cli"
+	"go.podman.io/buildah/pkg/parse"
+	"go.podman.io/buildah/util"
+	"go.podman.io/common/pkg/auth"
+	"go.podman.io/common/pkg/completion"
+	"go.podman.io/common/pkg/config"
+	"go.podman.io/image/v5/manifest"
+	"go.podman.io/image/v5/pkg/compression"
+	"go.podman.io/image/v5/pkg/shortnames"
+	storageTransport "go.podman.io/image/v5/storage"
+	"go.podman.io/image/v5/transports/alltransports"
+	"go.podman.io/image/v5/types"
 )
 
 type commitInputOptions struct {
-	authfile           string
-	omitHistory        bool
-	blobCache          string
-	certDir            string
-	changes            []string
-	configFile         string
-	creds              string
-	cwOptions          string
-	disableCompression bool
-	format             string
-	iidfile            string
-	manifest           string
-	omitTimestamp      bool
-	timestamp          int64
-	quiet              bool
-	referenceTime      string
-	rm                 bool
-	pull               string
-	pullAlways         bool
-	pullNever          bool
-	sbomImgOutput      string
-	sbomImgPurlOutput  string
-	sbomMergeStrategy  string
-	sbomOutput         string
-	sbomPreset         string
-	sbomPurlOutput     string
-	sbomScannerCommand []string
-	sbomScannerImage   string
-	signaturePolicy    string
-	signBy             string
-	squash             bool
-	tlsVerify          bool
-	identityLabel      bool
-	encryptionKeys     []string
-	encryptLayers      []int
-	unsetenvs          []string
-	addFile            []string
+	authfile               string
+	omitHistory            bool
+	blobCache              string
+	blobInfoCache          string
+	certDir                string
+	changes                []string
+	compressionFormat      string
+	compressionLevel       int
+	configFile             string
+	creds                  string
+	cwOptions              string
+	disableCompression     bool
+	forceCompressionFormat bool
+	format                 string
+	iidfile                string
+	manifest               string
+	omitTimestamp          bool
+	timestamp              int64
+	sourceDateEpoch        string
+	rewriteTimestamp       bool
+	quiet                  bool
+	referenceTime          string
+	rm                     bool
+	pull                   string
+	pullAlways             bool
+	pullNever              bool
+	sbomImgOutput          string
+	sbomImgPurlOutput      string
+	sbomMergeStrategy      string
+	sbomOutput             string
+	sbomPreset             string
+	sbomPurlOutput         string
+	sbomScannerCommand     []string
+	sbomScannerImage       string
+	signaturePolicy        string
+	signBy                 string
+	squash                 bool
+	tlsVerify              bool
+	identityLabel          bool
+	encryptionKeys         []string
+	encryptLayers          []int
+	unsetenvs              []string
+	addFile                []string
+	unsetAnnotation        []string
+	annotation             []string
+	createdAnnotation      bool
+	metadataFile           string
 }
 
-func init() {
+func commitInit() {
 	var (
 		opts              commitInputOptions
 		commitDescription = "\n  Writes a new image using the container's read-write layer and, if it is based\n  on an image, the layers of that image."
@@ -79,11 +93,11 @@ func init() {
 		Example: `buildah commit containerID
   buildah commit containerID newImageName
   buildah commit containerID docker://localhost:5000/imageId`,
+		GroupID: groupContainers,
 	}
 	commitCommand.SetUsageTemplate(UsageTemplate())
 	commitListFlagSet(commitCommand, &opts)
 	rootCmd.AddCommand(commitCommand)
-
 }
 
 func commitListFlagSet(cmd *cobra.Command, opts *commitInputOptions) {
@@ -97,6 +111,10 @@ func commitListFlagSet(cmd *cobra.Command, opts *commitInputOptions) {
 	if err := flags.MarkHidden("blob-cache"); err != nil {
 		panic(fmt.Sprintf("error marking blob-cache as hidden: %v", err))
 	}
+	flags.StringVar(&opts.blobInfoCache, "blob-info-cache-dir", "", "cache information about blobs in the specified directory instead of the default location")
+	if err := flags.MarkHidden("blob-info-cache-dir"); err != nil {
+		panic(fmt.Sprintf("error marking blob-info-cache-dir as hidden: %v", err))
+	}
 	flags.StringSliceVar(&opts.encryptionKeys, "encryption-key", nil, "key with the encryption protocol to use needed to encrypt the image (e.g. jwe:/path/to/key.pem)")
 	_ = cmd.RegisterFlagCompletionFunc("encryption-key", completion.AutocompleteDefault)
 	flags.IntSliceVar(&opts.encryptLayers, "encrypt-layer", nil, "layers to encrypt, 0-indexed layer indices with support for negative indexing (e.g. 0 is the first layer, -1 is the last layer). If not defined, will encrypt all layers if encryption-key flag is specified")
@@ -109,23 +127,38 @@ func commitListFlagSet(cmd *cobra.Command, opts *commitInputOptions) {
 	_ = cmd.RegisterFlagCompletionFunc("config", completion.AutocompleteDefault)
 	flags.StringVar(&opts.creds, "creds", "", "use `[username[:password]]` for accessing the registry")
 	_ = cmd.RegisterFlagCompletionFunc("creds", completion.AutocompleteNone)
+	flags.StringVar(&opts.compressionFormat, "compression-format", "", "compression format to use")
+	_ = cmd.RegisterFlagCompletionFunc("compression-format", completion.AutocompleteNone)
+	flags.IntVar(&opts.compressionLevel, "compression-level", 0, "compression level to use")
+	_ = cmd.RegisterFlagCompletionFunc("compression-level", completion.AutocompleteNone)
 	flags.StringVar(&opts.cwOptions, "cw", "", "confidential workload `options`")
 	flags.BoolVarP(&opts.disableCompression, "disable-compression", "D", true, "don't compress layers")
+	flags.BoolVar(&opts.forceCompressionFormat, "force-compression", false, "use the specified compression algorithm if the destination contains a differently-compressed variant already")
 	flags.StringVarP(&opts.format, "format", "f", defaultFormat(), "`format` of the image manifest and metadata")
 	_ = cmd.RegisterFlagCompletionFunc("format", completion.AutocompleteNone)
 	flags.StringVar(&opts.manifest, "manifest", "", "adds created image to the specified manifest list. Creates manifest list if it does not exist")
 	_ = cmd.RegisterFlagCompletionFunc("manifest", completion.AutocompleteNone)
 	flags.StringVar(&opts.iidfile, "iidfile", "", "write the image ID to the file")
 	_ = cmd.RegisterFlagCompletionFunc("iidfile", completion.AutocompleteDefault)
+	flags.StringVar(&opts.metadataFile, "metadata-file", "", "`file` to write metadata about the image to")
+	_ = cmd.RegisterFlagCompletionFunc("metadata-file", completion.AutocompleteDefault)
+
 	flags.BoolVar(&opts.omitTimestamp, "omit-timestamp", false, "set created timestamp to epoch 0 to allow for deterministic builds")
-	flags.Int64Var(&opts.timestamp, "timestamp", 0, "set created timestamp to epoch seconds to allow for deterministic builds, defaults to current time")
+	sourceDateEpochUsageDefault := "current time"
+	if v := os.Getenv(internal.SourceDateEpochName); v != "" {
+		sourceDateEpochUsageDefault = fmt.Sprintf("%q", v)
+	}
+	flags.StringVar(&opts.sourceDateEpoch, "source-date-epoch", os.Getenv(internal.SourceDateEpochName), "set new timestamps in image info to `seconds` after the epoch, defaults to "+sourceDateEpochUsageDefault)
+	_ = cmd.RegisterFlagCompletionFunc("source-date-epoch", completion.AutocompleteNone)
+	flags.BoolVar(&opts.rewriteTimestamp, "rewrite-timestamp", false, "set timestamps in layer to no later than the value for --source-date-epoch")
+	flags.Int64Var(&opts.timestamp, "timestamp", 0, "set new timestamps in image info and layer to `seconds` after the epoch, defaults to current times")
 	_ = cmd.RegisterFlagCompletionFunc("timestamp", completion.AutocompleteNone)
 	flags.BoolVarP(&opts.quiet, "quiet", "q", false, "don't output progress information when writing images")
 	flags.StringVar(&opts.referenceTime, "reference-time", "", "set the timestamp on the image to match the named `file`")
 	_ = cmd.RegisterFlagCompletionFunc("reference-time", completion.AutocompleteNone)
 
 	flags.StringVar(&opts.pull, "pull", "true", "pull SBOM scanner images from the registry if newer or not present in store, if false, only pull SBOM scanner images if not present, if always, pull SBOM scanner images even if the named images are present in store, if never, only use images present in store if available")
-	flags.Lookup("pull").NoOptDefVal = "true" //allow `--pull ` to be set to `true` as expected.
+	flags.Lookup("pull").NoOptDefVal = "true" // allow `--pull ` to be set to `true` as expected.
 
 	flags.BoolVar(&opts.pullAlways, "pull-always", false, "pull the image even if the named image is present in store")
 	if err := flags.MarkHidden("pull-always"); err != nil {
@@ -177,6 +210,11 @@ func commitListFlagSet(cmd *cobra.Command, opts *commitInputOptions) {
 
 	flags.StringSliceVar(&opts.unsetenvs, "unsetenv", nil, "unset env from final image")
 	_ = cmd.RegisterFlagCompletionFunc("unsetenv", completion.AutocompleteNone)
+	flags.StringSliceVar(&opts.unsetAnnotation, "unsetannotation", nil, "unset annotation when inheriting annotations from base image")
+	_ = cmd.RegisterFlagCompletionFunc("unsetannotation", completion.AutocompleteNone)
+	flags.StringArrayVar(&opts.annotation, "annotation", []string{}, "set metadata for an image (default [])")
+	_ = cmd.RegisterFlagCompletionFunc("annotation", completion.AutocompleteNone)
+	flags.BoolVar(&opts.createdAnnotation, "created-annotation", true, `set an "org.opencontainers.image.created" annotation in the image`)
 }
 
 func commitCmd(c *cobra.Command, args []string, iopts commitInputOptions) error {
@@ -203,6 +241,15 @@ func commitCmd(c *cobra.Command, args []string, iopts commitInputOptions) error 
 	compress := define.Gzip
 	if iopts.disableCompression {
 		compress = define.Uncompressed
+	}
+
+	if c.Flag("disable-compression").Changed && iopts.disableCompression {
+		if c.Flag("compression-format").Changed {
+			return errors.New("--disable-compression and --compression-format cannot be used together")
+		}
+		if c.Flag("force-compression").Changed {
+			return errors.New("--disable-compression and --force-compression cannot be used together")
+		}
 	}
 
 	format, err := cli.GetFormat(iopts.format)
@@ -245,11 +292,6 @@ func commitCmd(c *cobra.Command, args []string, iopts commitInputOptions) error 
 		}
 	}
 
-	// Add builder identity information.
-	if iopts.identityLabel {
-		builder.SetLabel(buildah.BuilderIdentityAnnotation, define.Version)
-	}
-
 	encConfig, encLayers, err := cli.EncryptConfig(iopts.encryptionKeys, iopts.encryptLayers)
 	if err != nil {
 		return fmt.Errorf("unable to obtain encryption config: %w", err)
@@ -290,22 +332,54 @@ func commitCmd(c *cobra.Command, args []string, iopts commitInputOptions) error 
 	}
 
 	options := buildah.CommitOptions{
-		PreferredManifestType: format,
-		Manifest:              iopts.manifest,
-		Compression:           compress,
-		SignaturePolicyPath:   iopts.signaturePolicy,
-		SystemContext:         systemContext,
-		IIDFile:               iopts.iidfile,
-		Squash:                iopts.squash,
-		BlobDirectory:         iopts.blobCache,
-		OmitHistory:           iopts.omitHistory,
-		SignBy:                iopts.signBy,
-		OciEncryptConfig:      encConfig,
-		OciEncryptLayers:      encLayers,
-		UnsetEnvs:             iopts.unsetenvs,
-		OverrideChanges:       iopts.changes,
-		OverrideConfig:        overrideConfig,
-		ExtraImageContent:     addFiles,
+		PreferredManifestType:  format,
+		Manifest:               iopts.manifest,
+		Compression:            compress,
+		ForceCompressionFormat: iopts.forceCompressionFormat,
+		SignaturePolicyPath:    iopts.signaturePolicy,
+		SystemContext:          systemContext,
+		IIDFile:                iopts.iidfile,
+		Squash:                 iopts.squash,
+		BlobDirectory:          iopts.blobCache,
+		OmitHistory:            iopts.omitHistory,
+		SignBy:                 iopts.signBy,
+		OciEncryptConfig:       encConfig,
+		OciEncryptLayers:       encLayers,
+		UnsetEnvs:              iopts.unsetenvs,
+		OverrideChanges:        iopts.changes,
+		OverrideConfig:         overrideConfig,
+		ExtraImageContent:      addFiles,
+		UnsetAnnotations:       iopts.unsetAnnotation,
+		Annotations:            iopts.annotation,
+		CreatedAnnotation:      types.NewOptionalBool(iopts.createdAnnotation),
+	}
+	defaultContainerConfig, err := config.Default()
+	if err != nil {
+		return fmt.Errorf("failed to get container config: %w", err)
+	}
+	if iopts.compressionFormat != "" {
+		algo, err := compression.AlgorithmByName(iopts.compressionFormat)
+		if err != nil {
+			return err
+		}
+		options.CompressionFormat = &algo
+		if !c.Flag("force-compression").Changed {
+			options.ForceCompressionFormat = true
+		}
+	} else if defaultContainerConfig.Engine.CompressionFormat != "" && defaultContainerConfig.Engine.CompressionFormat != "gzip" {
+		algo, err := compression.AlgorithmByName(defaultContainerConfig.Engine.CompressionFormat)
+		if err != nil {
+			return fmt.Errorf("parsing compression_format from containers.conf: %w", err)
+		}
+		options.CompressionFormat = &algo
+		if !c.Flag("force-compression").Changed {
+			options.ForceCompressionFormat = true
+		}
+	}
+	if c.Flag("compression-level").Changed {
+		options.CompressionLevel = &iopts.compressionLevel
+	} else {
+		options.CompressionLevel = defaultContainerConfig.Engine.CompressionLevel
 	}
 	exclusiveFlags := 0
 	if c.Flag("reference-time").Changed {
@@ -318,6 +392,16 @@ func commitCmd(c *cobra.Command, args []string, iopts commitInputOptions) error 
 		timestamp := finfo.ModTime().UTC()
 		options.HistoryTimestamp = &timestamp
 	}
+	if iopts.sourceDateEpoch != "" {
+		exclusiveFlags++
+		sourceDateEpochVal, err := strconv.ParseInt(iopts.sourceDateEpoch, 10, 64)
+		if err != nil {
+			return fmt.Errorf("parsing source date epoch %q: %w", iopts.sourceDateEpoch, err)
+		}
+		sourceDateEpoch := time.Unix(sourceDateEpochVal, 0).UTC()
+		options.SourceDateEpoch = &sourceDateEpoch
+	}
+	options.RewriteTimestamp = iopts.rewriteTimestamp
 	if c.Flag("timestamp").Changed {
 		exclusiveFlags++
 		timestamp := time.Unix(iopts.timestamp, 0).UTC()
@@ -327,6 +411,25 @@ func commitCmd(c *cobra.Command, args []string, iopts commitInputOptions) error 
 		exclusiveFlags++
 		timestamp := time.Unix(0, 0).UTC()
 		options.HistoryTimestamp = &timestamp
+	}
+	if exclusiveFlags > 1 {
+		return errors.New("cannot use more then one timestamp option at a time")
+	}
+
+	// Add builder identity information.
+	var identityLabel types.OptionalBool
+	if c.Flag("identity-label").Changed {
+		identityLabel = types.NewOptionalBool(iopts.identityLabel)
+	}
+	switch identityLabel {
+	case types.OptionalBoolTrue:
+		builder.SetLabel(buildah.BuilderIdentityAnnotation, define.Version)
+	case types.OptionalBoolFalse:
+		// nothing - don't clear it if there's a value set in the base image
+	default:
+		if options.HistoryTimestamp == nil && options.SourceDateEpoch == nil {
+			builder.SetLabel(buildah.BuilderIdentityAnnotation, define.Version)
+		}
 	}
 
 	if iopts.cwOptions != "" {
@@ -353,17 +456,15 @@ func commitCmd(c *cobra.Command, args []string, iopts commitInputOptions) error 
 		options.SBOMScanOptions = sbomOptions
 	}
 
-	if exclusiveFlags > 1 {
-		return errors.New("can not use more then one timestamp option at at time")
-	}
-
 	if !iopts.quiet {
 		options.ReportWriter = os.Stderr
 	}
-	id, ref, _, err := builder.Commit(ctx, dest, options)
+	results, err := builder.CommitResults(ctx, dest, options)
 	if err != nil {
 		return util.GetFailureCause(err, fmt.Errorf("committing container %q to %q: %w", builder.Container, image, err))
 	}
+	ref := results.Canonical
+	id := results.ImageID
 	if ref != nil && id != "" {
 		logrus.Debugf("wrote image %s with ID %s", ref, id)
 	} else if ref != nil {
@@ -375,6 +476,15 @@ func commitCmd(c *cobra.Command, args []string, iopts commitInputOptions) error 
 	}
 	if options.IIDFile == "" && id != "" {
 		fmt.Printf("%s\n", id)
+	}
+	if iopts.metadataFile != "" {
+		metadataBytes, err := json.Marshal(results.Metadata)
+		if err != nil {
+			return fmt.Errorf("encoding contents for %q: %w", iopts.metadataFile, err)
+		}
+		if err := os.WriteFile(iopts.metadataFile, metadataBytes, 0o644); err != nil {
+			return err
+		}
 	}
 
 	if iopts.rm {

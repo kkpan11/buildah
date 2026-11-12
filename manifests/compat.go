@@ -6,8 +6,8 @@
 package manifests
 
 import (
-	"github.com/containers/common/libimage/manifests"
-	"github.com/containers/storage"
+	"go.podman.io/common/libimage/manifests"
+	"go.podman.io/storage"
 )
 
 type (
@@ -17,10 +17,8 @@ type (
 	PushOptions = manifests.PushOptions
 )
 
-var (
-	// ErrListImageUnknown is an alias for github.com/containers/common/libimage/manifests.ErrListImageUnknown
-	ErrListImageUnknown = manifests.ErrListImageUnknown
-)
+// ErrListImageUnknown is an alias for github.com/containers/common/libimage/manifests.ErrListImageUnknown
+var ErrListImageUnknown = manifests.ErrListImageUnknown
 
 // Create wraps github.com/containers/common/libimage/manifests.Create().
 func Create() List {

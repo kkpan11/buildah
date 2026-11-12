@@ -5,25 +5,22 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"time"
+	"os/signal"
+	"sync"
 
-	"github.com/containers/buildah"
-	"github.com/containers/common/pkg/umask"
-	"github.com/containers/image/v5/image"
-	"github.com/containers/image/v5/manifest"
-	is "github.com/containers/image/v5/storage"
-	"github.com/containers/image/v5/types"
-	"github.com/containers/storage"
-	"github.com/containers/storage/pkg/homedir"
-	"github.com/containers/storage/pkg/unshare"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
+	"go.podman.io/buildah"
+	"go.podman.io/common/pkg/umask"
+	is "go.podman.io/image/v5/storage"
+	"go.podman.io/image/v5/types"
+	"go.podman.io/storage"
+	"go.podman.io/storage/pkg/homedir"
+	"go.podman.io/storage/pkg/unshare"
 )
 
-var (
-	// configuration, including customizations made in containers.conf
-	needToShutdownStore = false
-)
+// configuration, including customizations made in containers.conf
+var needToShutdownStore = false
 
 func getStore(c *cobra.Command) (storage.Store, error) {
 	if err := setXDGRuntimeDir(); err != nil {
@@ -36,6 +33,12 @@ func getStore(c *cobra.Command) (storage.Store, error) {
 	if c.Flag("root").Changed || c.Flag("runroot").Changed {
 		options.GraphRoot = globalFlagResults.Root
 		options.RunRoot = globalFlagResults.RunRoot
+	}
+	if c.Flag("imagestore").Changed {
+		options.ImageStore = globalFlagResults.ImageStore
+	}
+	if c.Flag("transient-store").Changed {
+		options.TransientStore = globalFlagResults.TransientStore
 	}
 	if c.Flag("storage-driver").Changed {
 		options.GraphDriverName = globalFlagResults.StorageDriver
@@ -156,50 +159,30 @@ func openImage(ctx context.Context, sc *types.SystemContext, store storage.Store
 	return builder, nil
 }
 
-func getDateAndDigestAndSize(ctx context.Context, sys *types.SystemContext, store storage.Store, storeImage storage.Image) (time.Time, string, int64, error) {
-	created := time.Time{}
-	is.Transport.SetStore(store)
-	storeRef, err := is.Transport.ParseStoreReference(store, storeImage.ID)
-	if err != nil {
-		return created, "", -1, err
-	}
-	img, err := storeRef.NewImageSource(ctx, nil)
-	if err != nil {
-		return created, "", -1, err
-	}
-	defer img.Close()
-	imgSize, sizeErr := store.ImageSize(storeImage.ID)
-	if sizeErr != nil {
-		imgSize = -1
-	}
-	manifestBytes, _, manifestErr := img.GetManifest(ctx, nil)
-	manifestDigest := ""
-	if manifestErr == nil && len(manifestBytes) > 0 {
-		mDigest, err := manifest.Digest(manifestBytes)
-		manifestErr = err
-		if manifestErr == nil {
-			manifestDigest = mDigest.String()
-		}
-	}
-	inspectable, inspectableErr := image.FromUnparsedImage(ctx, sys, image.UnparsedInstance(img, nil))
-	if inspectableErr == nil {
-		inspectInfo, inspectErr := inspectable.Inspect(ctx)
-		if inspectErr == nil && inspectInfo != nil && inspectInfo.Created != nil {
-			created = *inspectInfo.Created
-		}
-	}
-	if sizeErr != nil {
-		err = sizeErr
-	} else if manifestErr != nil {
-		err = manifestErr
-	}
-	return created, manifestDigest, imgSize, err
+// getContext returns a context that may have a timeout, and which cancels if
+// it receives os.Interrupt
+func getContext() context.Context {
+	ctx, _ := getContextWithCancel()
+	return ctx
 }
 
-// getContext returns a context.TODO
-func getContext() context.Context {
-	return context.TODO()
+func getContextCancel() context.CancelFunc {
+	_, cancel := getContextWithCancel()
+	return cancel
 }
+
+var getContextWithCancel = sync.OnceValues(func() (context.Context, context.CancelFunc) {
+	var ctx context.Context
+	var cancel1, cancel2 func()
+	if rootCmd.PersistentFlags().Changed("experimental-timeout") {
+		ctx, cancel1 = context.WithTimeout(context.Background(), globalFlagResults.ExperimentalTimeout)
+	} else {
+		ctx = context.Background()
+		cancel1 = func() {}
+	}
+	ctx, cancel2 = signal.NotifyContext(ctx, os.Interrupt)
+	return ctx, func() { cancel1(); cancel2() }
+})
 
 func getUserFlags() pflag.FlagSet {
 	fs := pflag.FlagSet{}

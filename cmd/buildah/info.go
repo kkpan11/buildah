@@ -6,11 +6,11 @@ import (
 	"os"
 	"regexp"
 	"runtime"
-	"text/template"
 
-	"github.com/containers/buildah"
-	"github.com/containers/buildah/define"
 	"github.com/spf13/cobra"
+	"go.podman.io/buildah"
+	"go.podman.io/buildah/define"
+	"go.podman.io/common/pkg/formats"
 	"golang.org/x/term"
 )
 
@@ -19,7 +19,7 @@ type infoResults struct {
 	format string
 }
 
-func init() {
+func infoInit() {
 	var (
 		infoDescription = "\n  Display information about the host and current storage statistics which are useful when reporting issues."
 		opts            infoResults
@@ -28,11 +28,12 @@ func init() {
 		Use:   "info",
 		Short: "Display Buildah system information",
 		Long:  infoDescription,
-		RunE: func(cmd *cobra.Command, args []string) error {
+		RunE: func(cmd *cobra.Command, _ []string) error {
 			return infoCmd(cmd, opts)
 		},
 		Args:    cobra.NoArgs,
 		Example: `buildah info`,
+		GroupID: groupSystem,
 	}
 	infoCommand.SetUsageTemplate(UsageTemplate())
 
@@ -43,7 +44,7 @@ func init() {
 }
 
 func infoCmd(c *cobra.Command, iopts infoResults) error {
-	info := map[string]interface{}{}
+	info := map[string]any{}
 
 	store, err := getStore(c)
 	if err != nil {
@@ -71,9 +72,9 @@ func infoCmd(c *cobra.Command, iopts infoResults) error {
 		} else if !matched {
 			return fmt.Errorf("invalid format provided: %s", format)
 		}
-		t, err := template.New("format").Parse(format)
+		t, err := formats.NewParse("info", format)
 		if err != nil {
-			return fmt.Errorf("Template parsing error: %w", err)
+			return fmt.Errorf("template parsing error: %w", err)
 		}
 		if err = t.Execute(os.Stdout, info); err != nil {
 			return err
@@ -92,8 +93,8 @@ func infoCmd(c *cobra.Command, iopts infoResults) error {
 }
 
 // top-level "debug" info
-func debugInfo() map[string]interface{} {
-	info := map[string]interface{}{}
+func debugInfo() map[string]any {
+	info := map[string]any{}
 	info["compiler"] = runtime.Compiler
 	info["go version"] = runtime.Version()
 	info["buildah version"] = define.Version

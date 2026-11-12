@@ -116,38 +116,6 @@ encounters a `RUN` instruction, so you'll also need to build and install a compa
 [runc](https://github.com/opencontainers/runc) for Buildah to call for those cases.  If Buildah is installed
 via a package manager such as yum, dnf or apt-get, runc will be installed as part of that process.
 
-### CNI Requirement
-
-When Buildah uses `runc` to run commands, it defaults to running those commands
-in the host's network namespace.  If the command is being run in a separate
-user namespace, though, for example when ID mapping is used, then the command
-will also be run in a separate network namespace.
-
-A newly-created network namespace starts with no network interfaces, so
-commands which are run in that namespace are effectively disconnected from the
-network unless additional setup is done.  Buildah relies on the CNI
-[library](https://github.com/containernetworking/cni) and
-[plugins](https://github.com/containernetworking/plugins) to set up interfaces
-and routing for network namespaces.
-
-If Buildah is installed via a package manager such as yum, dnf or apt-get, a
-package containing CNI plugins may be available (in Fedora, the package is
-named `containernetworking-cni`).  If not, they will need to be installed,
-for example using:
-```
-  git clone https://github.com/containernetworking/plugins
-  ( cd ./plugins; ./build_linux.sh )
-  sudo mkdir -p /opt/cni/bin
-  sudo install -v ./plugins/bin/* /opt/cni/bin
-```
-
-The CNI library needs to be configured so that it will know which plugins to
-call to set up namespaces.  Usually, this configuration takes the form of one
-or more configuration files in the `/etc/cni/net.d` directory.  A set of example
-configuration files is included in the
-[`docs/cni-examples`](https://github.com/containers/buildah/tree/main/docs/cni-examples)
-directory of this source tree.
-
 ## Package Installation
 
 Buildah is available on several software repositories and can be installed via a package manager such
@@ -194,11 +162,8 @@ In Fedora, you can use this command:
 Then to install Buildah on Fedora follow the steps in this example:
 
 ```
-  mkdir ~/buildah
-  cd ~/buildah
-  export GOPATH=`pwd`
-  git clone https://github.com/containers/buildah ./src/github.com/containers/buildah
-  cd ./src/github.com/containers/buildah
+  git clone https://github.com/containers/buildah
+  cd buildah
   make
   sudo make install
   buildah --help
@@ -252,18 +217,10 @@ In Ubuntu 22.10 (Karmic) or Debian 12 (Bookworm) you can use these commands:
 
 ```
   sudo apt-get -y -qq update
-  sudo apt-get -y install bats btrfs-progs git go-md2man golang libapparmor-dev libglib2.0-dev libgpgme11-dev libseccomp-dev libselinux1-dev make skopeo
+  sudo apt-get -y install bats btrfs-progs git go-md2man golang libapparmor-dev libglib2.0-dev libgpgme11-dev libseccomp-dev libselinux1-dev make runc skopeo libbtrfs-dev
 ```
 
-Then to install Buildah follow the steps in this example:
-
-```
-  git clone https://github.com/containers/buildah
-  cd buildah
-  make runc all SECURITYTAGS="apparmor seccomp"
-  sudo make install install.runc
-  buildah --help
-```
+The build steps for Buildah on Debian or Ubuntu are the same as for Fedora, above.
 
 ## Vendoring - Dependency Management
 
@@ -274,11 +231,11 @@ This project is using [go modules](https://github.com/golang/go/wiki/Modules) fo
 The following configuration files are required in order for Buildah to run appropriately.  The
 majority of these files are commonly contained in the `containers-common` package.
 
-### [registries.conf](https://github.com/containers/buildah/blob/main/docs/samples/registries.conf)
+### [registries.conf](https://github.com/containers/container-libs/blob/main/image/registries.conf)
 
-#### Man Page: [registries.conf.5](https://github.com/containers/image/blob/main/docs/containers-registries.conf.5.md)
+#### Man Page: [containers-registries.conf.5](https://github.com/containers/container-libs/blob/main/image/docs/containers-registries.conf.5.md)
 
-`/etc/containers/registries.conf`
+`/usr/share/containers/registries.conf`, `/etc/containers/registries.conf`, `$HOME/.config/containers/registries.conf`
 
 registries.conf is the configuration file which specifies which container registries should be consulted when completing image names which do not include a registry or domain portion.
 
@@ -286,31 +243,79 @@ registries.conf is the configuration file which specifies which container regist
 
 ```
 cat /etc/containers/registries.conf
-# This is a system-wide configuration file used to
-# keep track of registries for various container backends.
-# It adheres to TOML format and does not support recursive
-# lists of registries.
-
-# The default location for this configuration file is /etc/containers/registries.conf.
-
-# The only valid categories are: 'registries.search', 'registries.insecure',
-# and 'registries.block'.
-
-[registries.search]
-registries = ['docker.io', 'registry.fedoraproject.org', 'quay.io', 'registry.access.redhat.com']
-
-# If you need to access insecure registries, add the registry's fully-qualified name.
-# An insecure registry is one that does not have a valid SSL certificate or only does HTTP.
-[registries.insecure]
-registries = []
-
-
-# If you need to block pull access from a registry, uncomment the section below
-# and add the registries fully-qualified name.
+# For more information on this configuration file, see containers-registries.conf(5).
 #
-# Docker only
-[registries.block]
-registries = []
+# NOTE: RISK OF USING UNQUALIFIED IMAGE NAMES
+# We recommend always using fully qualified image names including the registry
+# server (full dns name), namespace, image name, and tag
+# (e.g., registry.redhat.io/ubi8/ubi:latest). Pulling by digest (i.e.,
+# quay.io/repository/name@digest) further eliminates the ambiguity of tags.
+# When using short names, there is always an inherent risk that the image being
+# pulled could be spoofed. For example, a user wants to pull an image named
+# `foobar` from a registry and expects it to come from myregistry.com. If
+# myregistry.com is not first in the search list, an attacker could place a
+# different `foobar` image at a registry earlier in the search list. The user
+# would accidentally pull and run the attacker's image and code rather than the
+# intended content. We recommend only adding registries which are completely
+# trusted (i.e., registries which don't allow unknown or anonymous users to
+# create accounts with arbitrary names). This will prevent an image from being
+# spoofed, squatted or otherwise made insecure.  If it is necessary to use one
+# of these registries, it should be added at the end of the list.
+#
+# # An array of host[:port] registries to try when pulling an unqualified image, in order.
+unqualified-search-registries = ["registry.fedoraproject.org", "registry.access.redhat.com", "docker.io", "quay.io"]
+#
+# [[registry]]
+# # The "prefix" field is used to choose the relevant [[registry]] TOML table;
+# # (only) the TOML table with the longest match for the input image name
+# # (taking into account namespace/repo/tag/digest separators) is used.
+# #
+# # If the prefix field is missing, it defaults to be the same as the "location" field.
+# prefix = "example.com/foo"
+#
+# # If true, unencrypted HTTP as well as TLS connections with untrusted
+# # certificates are allowed.
+# insecure = false
+#
+# # If true, pulling images with matching names is forbidden.
+# blocked = false
+#
+# # The physical location of the "prefix"-rooted namespace.
+# #
+# # By default, this equal to "prefix" (in which case "prefix" can be omitted
+# # and the [[registry]] TOML table can only specify "location").
+# #
+# # Example: Given
+# #   prefix = "example.com/foo"
+# #   location = "internal-registry-for-example.net/bar"
+# # requests for the image example.com/foo/myimage:latest will actually work with the
+# # internal-registry-for-example.net/bar/myimage:latest image.
+# location = "internal-registry-for-example.com/bar"
+#
+# # (Possibly-partial) mirrors for the "prefix"-rooted namespace.
+# #
+# # The mirrors are attempted in the specified order; the first one that can be
+# # contacted and contains the image will be used (and if none of the mirrors contains the image,
+# # the primary location specified by the "registry.location" field, or using the unmodified
+# # user-specified reference, is tried last).
+# #
+# # Each TOML table in the "mirror" array can contain the following fields, with the same semantics
+# # as if specified in the [[registry]] TOML table directly:
+# # - location
+# # - insecure
+# [[registry.mirror]]
+# location = "example-mirror-0.local/mirror-for-foo"
+# [[registry.mirror]]
+# location = "example-mirror-1.local/mirrors/foo"
+# insecure = true
+# # Given the above, a pull of example.com/foo/image:latest will try:
+# # 1. example-mirror-0.local/mirror-for-foo/image:latest
+# # 2. example-mirror-1.local/mirrors/foo/image:latest
+# # 3. internal-registry-for-example.net/bar/image:latest
+# # in order, and use the first one that exists.
+
+# Enforcing mode for short names is default for Fedora 34 and newer
+short-name-mode="enforcing"
 ```
 
 ### [mounts.conf](https://src.fedoraproject.org/rpms/skopeo/blob/main/f/mounts.conf)

@@ -1,7 +1,6 @@
 //go:build !linux && !darwin
-// +build !linux,!darwin
 
-package util
+package util //nolint:revive,nolintlint
 
 import (
 	"os"

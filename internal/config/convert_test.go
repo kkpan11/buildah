@@ -2,14 +2,14 @@ package config
 
 import (
 	"reflect"
+	"slices"
 	"strconv"
 	"testing"
 
-	"github.com/containers/image/v5/manifest"
 	dockerclient "github.com/fsouza/go-dockerclient"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/exp/slices"
+	"go.podman.io/image/v5/manifest"
 )
 
 // fillAllFields recursively fills in 1 or "1" for every field in the passed-in
@@ -124,13 +124,13 @@ func checkValue(t *testing.T, value reflect.Value, name string, kind reflect.Kin
 		case reflect.Map:
 			assert.Falsef(t, value.IsZero(), "map field %s not set when it was not already expected to be left unpopulated by conversion", name)
 			keys := value.MapKeys()
-			for i := 0; i < len(keys); i++ {
+			for i := range len(keys) {
 				v := value.MapIndex(keys[i])
 				checkValue(t, v, name+"{"+keys[i].String()+"}", elemType.Kind(), nil, allowedToBeZero)
 			}
 		case reflect.Slice:
 			assert.Falsef(t, value.IsZero(), "slice field %s not set when it was not already expected to be left unpopulated by conversion", name)
-			for i := 0; i < value.Len(); i++ {
+			for i := range value.Len() {
 				v := value.Index(i)
 				checkValue(t, v, name+"["+strconv.Itoa(i)+"]", elemType.Kind(), nil, allowedToBeZero)
 			}
@@ -148,6 +148,7 @@ func checkValue(t *testing.T, value reflect.Value, name string, kind reflect.Kin
 }
 
 func TestGoDockerclientConfigFromSchema2Config(t *testing.T) {
+	t.Parallel()
 	var input manifest.Schema2Config
 	fillAllFields(t, &input)
 	output := GoDockerclientConfigFromSchema2Config(&input)
@@ -157,6 +158,7 @@ func TestGoDockerclientConfigFromSchema2Config(t *testing.T) {
 }
 
 func TestSchema2ConfigFromGoDockerclientConfig(t *testing.T) {
+	t.Parallel()
 	var input dockerclient.Config
 	fillAllFields(t, &input)
 	output := Schema2ConfigFromGoDockerclientConfig(&input)

@@ -8,56 +8,58 @@ import (
 	"strings"
 	"time"
 
-	"github.com/containers/buildah"
-	"github.com/containers/buildah/define"
-	"github.com/containers/buildah/docker"
-	buildahcli "github.com/containers/buildah/pkg/cli"
 	"github.com/mattn/go-shellwords"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+	"go.podman.io/buildah"
+	"go.podman.io/buildah/define"
+	"go.podman.io/buildah/docker"
+	buildahcli "go.podman.io/buildah/pkg/cli"
 )
 
 type configResults struct {
-	addHistory             bool
-	annotation             []string
-	arch                   string
-	author                 string
-	cmd                    string
-	comment                string
-	createdBy              string
-	domainName             string
-	entrypoint             string
-	env                    []string
-	healthcheck            string
-	healthcheckInterval    string
-	healthcheckRetries     int
-	healthcheckStartPeriod string
-	healthcheckTimeout     string
-	historyComment         string
-	hostname               string
-	label                  []string
-	onbuild                []string
-	os                     string
-	osfeature              []string
-	osversion              string
-	ports                  []string
-	shell                  string
-	stopSignal             string
-	user                   string
-	variant                string
-	volume                 []string
-	workingDir             string
-	unsetLabels            []string
+	addHistory               bool
+	annotation               []string
+	arch                     string
+	author                   string
+	cmd                      string
+	comment                  string
+	createdBy                string
+	domainName               string
+	entrypoint               string
+	env                      []string
+	healthcheck              string
+	healthcheckInterval      string
+	healthcheckRetries       int
+	healthcheckStartPeriod   string
+	healthcheckStartInterval string
+	healthcheckTimeout       string
+	historyComment           string
+	hostname                 string
+	label                    []string
+	onbuild                  []string
+	os                       string
+	osfeature                []string
+	osversion                string
+	ports                    []string
+	shell                    string
+	stopSignal               string
+	user                     string
+	variant                  string
+	volume                   []string
+	workingDir               string
+	unsetLabels              []string
+	unsetAnnotations         []string
 }
 
-func init() {
+func configInit() {
 	var (
-		configDescription = "\n  Modifies the configuration values which will be saved to the image."
+		configDescription = "\n  Modifies the configuration values which will be committed to an image."
 		opts              configResults
 	)
 	configCommand := &cobra.Command{
 		Use:   "config",
-		Short: "Update image configuration settings",
+		Short: "Update image configuration settings in a working container",
 		Long:  configDescription,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return configCmd(cmd, args, opts)
@@ -65,6 +67,7 @@ func init() {
 		Example: `buildah config --author='Jane Austen' --workingdir='/etc/mycontainers' containerID
   buildah config --entrypoint '[ "/entrypoint.sh", "dev" ]' containerID
   buildah config --env foo=bar --env PATH=$PATH containerID`,
+		GroupID: groupContainers,
 	}
 	configCommand.SetUsageTemplate(UsageTemplate())
 
@@ -84,6 +87,7 @@ func init() {
 	flags.StringVar(&opts.healthcheckInterval, "healthcheck-interval", "", "set the `interval` between runs of the `healthcheck` command for the target image")
 	flags.IntVar(&opts.healthcheckRetries, "healthcheck-retries", 0, "set the `number` of times the `healthcheck` command has to fail")
 	flags.StringVar(&opts.healthcheckStartPeriod, "healthcheck-start-period", "", "set the amount of `time` to wait after starting a container before a failed `healthcheck` command will count as a failure")
+	flags.StringVar(&opts.healthcheckStartInterval, "healthcheck-start-interval", "", "set the time between health checks during the start period. Only available with format `docker`")
 	flags.StringVar(&opts.healthcheckTimeout, "healthcheck-timeout", "", "set the maximum amount of `time` to wait for a `healthcheck` command for the target image")
 	flags.StringVar(&opts.historyComment, "history-comment", "", "set a `comment` for the history of the target image")
 	flags.StringVar(&opts.hostname, "hostname", "", "set a host`name` for containers based on image")
@@ -100,9 +104,9 @@ func init() {
 	flags.StringSliceVarP(&opts.volume, "volume", "v", []string{}, "add default `volume` path to be created for containers based on image (default [])")
 	flags.StringVar(&opts.workingDir, "workingdir", "", "set working `directory` for containers based on image")
 	flags.StringSliceVar(&opts.unsetLabels, "unsetlabel", nil, "remove image configuration label")
+	flags.StringSliceVar(&opts.unsetAnnotations, "unsetannotation", nil, "remove image configuration annotation")
 
 	rootCmd.AddCommand(configCommand)
-
 }
 
 func updateCmd(builder *buildah.Builder, cmd string) error {
@@ -153,7 +157,7 @@ func updateEntrypoint(builder *buildah.Builder, entrypoint string) {
 	builder.SetEntrypoint(entrypointSpec)
 }
 
-func conditionallyAddHistory(builder *buildah.Builder, c *cobra.Command, createdByFmt string, args ...interface{}) {
+func conditionallyAddHistory(builder *buildah.Builder, c *cobra.Command, createdByFmt string, args ...any) {
 	history := buildahcli.DefaultHistory()
 	if c.Flag("add-history").Changed {
 		history, _ = c.Flags().GetBool("add-history")
@@ -308,6 +312,10 @@ func updateConfig(builder *buildah.Builder, c *cobra.Command, iopts configResult
 	for _, key := range iopts.unsetLabels {
 		builder.UnsetLabel(key)
 	}
+	// unset annotation if any
+	for _, key := range iopts.unsetAnnotations {
+		builder.UnsetAnnotation(key)
+	}
 	if c.Flag("workingdir").Changed {
 		builder.SetWorkDir(iopts.workingDir)
 		conditionallyAddHistory(builder, c, "/bin/sh -c #(nop) WORKDIR %s", iopts.workingDir)
@@ -384,8 +392,7 @@ func updateHealthcheck(builder *buildah.Builder, c *cobra.Command, iopts configR
 		if c.Flag("healthcheck-retries").Changed {
 			healthcheck.Retries = iopts.healthcheckRetries
 			args = args + "--retries=" + strconv.Itoa(iopts.healthcheckRetries) + " "
-			//args = fmt.Sprintf("%s --retries=%d ", args, iopts.healthcheckRetries)
-
+			// args = fmt.Sprintf("%s --retries=%d ", args, iopts.healthcheckRetries)
 		}
 		if c.Flag("healthcheck-start-period").Changed {
 			duration, err := time.ParseDuration(iopts.healthcheckStartPeriod)
@@ -394,6 +401,14 @@ func updateHealthcheck(builder *buildah.Builder, c *cobra.Command, iopts configR
 			}
 			healthcheck.StartPeriod = duration
 			args = args + "--start-period=" + iopts.healthcheckStartPeriod + " "
+		}
+		if c.Flag("healthcheck-start-interval").Changed {
+			duration, err := time.ParseDuration(iopts.healthcheckStartInterval)
+			if err != nil {
+				return fmt.Errorf("parsing --healthcheck-start-interval %q: %w", iopts.healthcheckStartInterval, err)
+			}
+			healthcheck.StartInterval = duration
+			args = args + "--start-interval=" + iopts.healthcheckStartInterval + " "
 		}
 		if c.Flag("healthcheck-timeout").Changed {
 			duration, err := time.ParseDuration(iopts.healthcheckTimeout)

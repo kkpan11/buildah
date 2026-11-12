@@ -3,19 +3,21 @@ package copier
 import (
 	"archive/tar"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 
-	"github.com/containers/storage/pkg/mount"
-	"github.com/containers/storage/pkg/reexec"
+	"github.com/moby/sys/capability"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/syndtr/gocapability/capability"
+	"go.podman.io/storage/pkg/mount"
+	"go.podman.io/storage/pkg/reexec"
 	"golang.org/x/sys/unix"
 )
 
@@ -30,7 +32,7 @@ type getWrappedOptions struct {
 	DropCaps        []capability.Cap
 }
 
-func getWrapped(root string, directory string, getOptions GetOptions, globs []string, dropCaps []capability.Cap, bulkWriter io.Writer) error {
+func getWrapped(ctx context.Context, root string, directory string, getOptions GetOptions, globs []string, dropCaps []capability.Cap, bulkWriter io.Writer) error {
 	options := getWrappedOptions{
 		Root:       root,
 		Directory:  directory,
@@ -42,7 +44,7 @@ func getWrapped(root string, directory string, getOptions GetOptions, globs []st
 	if err != nil {
 		return fmt.Errorf("marshalling options: %w", err)
 	}
-	cmd := reexec.Command("get")
+	cmd := reexec.CommandContext(ctx, "get")
 	cmd.Env = append(cmd.Env, "OPTIONS="+string(encoded))
 	cmd.Stdout = bulkWriter
 	stderrBuf := bytes.Buffer{}
@@ -117,22 +119,22 @@ func TestGetPermissionErrorChroot(t *testing.T) {
 func testGetPermissionError(t *testing.T) {
 	dropCaps := []capability.Cap{capability.CAP_DAC_OVERRIDE, capability.CAP_DAC_READ_SEARCH}
 	tmp := t.TempDir()
-	err := os.Mkdir(filepath.Join(tmp, "unreadable-directory"), 0000)
+	err := os.Mkdir(filepath.Join(tmp, "unreadable-directory"), 0o000)
 	require.NoError(t, err, "error creating an unreadable directory")
-	err = os.Mkdir(filepath.Join(tmp, "readable-directory"), 0755)
+	err = os.Mkdir(filepath.Join(tmp, "readable-directory"), 0o755)
 	require.NoError(t, err, "error creating a readable directory")
-	err = os.Mkdir(filepath.Join(tmp, "readable-directory", "unreadable-subdirectory"), 0000)
+	err = os.Mkdir(filepath.Join(tmp, "readable-directory", "unreadable-subdirectory"), 0o000)
 	require.NoError(t, err, "error creating an unreadable subdirectory")
-	err = os.WriteFile(filepath.Join(tmp, "unreadable-file"), []byte("hi, i'm a file that you can't read"), 0000)
+	err = os.WriteFile(filepath.Join(tmp, "unreadable-file"), []byte("hi, i'm a file that you can't read"), 0o000)
 	require.NoError(t, err, "error creating an unreadable file")
-	err = os.WriteFile(filepath.Join(tmp, "readable-file"), []byte("hi, i'm also a file, and you can read me"), 0644)
+	err = os.WriteFile(filepath.Join(tmp, "readable-file"), []byte("hi, i'm also a file, and you can read me"), 0o644)
 	require.NoError(t, err, "error creating a readable file")
-	err = os.WriteFile(filepath.Join(tmp, "readable-directory", "unreadable-file"), []byte("hi, i'm also a file that you can't read"), 0000)
+	err = os.WriteFile(filepath.Join(tmp, "readable-directory", "unreadable-file"), []byte("hi, i'm also a file that you can't read"), 0o000)
 	require.NoError(t, err, "error creating an unreadable file in a readable directory")
 	for _, ignore := range []bool{false, true} {
 		t.Run(fmt.Sprintf("ignore=%v", ignore), func(t *testing.T) {
 			var buf bytes.Buffer
-			err = getWrapped(tmp, tmp, GetOptions{IgnoreUnreadable: ignore}, []string{"."}, dropCaps, &buf)
+			err = getWrapped(t.Context(), tmp, tmp, GetOptions{IgnoreUnreadable: ignore}, []string{"."}, dropCaps, &buf)
 			if ignore {
 				assert.NoError(t, err, "expected no errors")
 				tr := tar.NewReader(&buf)
@@ -142,7 +144,7 @@ func testGetPermissionError(t *testing.T) {
 					items++
 					_, err = tr.Next()
 				}
-				assert.True(t, errors.Is(err, io.EOF), "expected EOF to finish read contents")
+				assert.ErrorIs(t, err, io.EOF, "expected EOF to finish read contents")
 				assert.Equalf(t, 2, items, "expected two readable items, got %d", items)
 			} else {
 				assert.Error(t, err, "expected an error")
@@ -163,7 +165,7 @@ func TestGetNoCrossDevice(t *testing.T) {
 	require.NoError(t, err, "error creating new mount namespace")
 
 	subdir := filepath.Join(tmpdir, "subdir")
-	err = os.Mkdir(subdir, 0755)
+	err = os.Mkdir(subdir, 0o755)
 	require.NoErrorf(t, err, "error creating %q", subdir)
 
 	err = mount.Mount("tmpfs", subdir, "tmpfs", "rw")
@@ -174,7 +176,7 @@ func TestGetNoCrossDevice(t *testing.T) {
 	}()
 
 	skipped := filepath.Join(subdir, "skipped.txt")
-	err = os.WriteFile(skipped, []byte("this file should have been skipped\n"), 0644)
+	err = os.WriteFile(skipped, []byte("this file should have been skipped\n"), 0o644)
 	require.NoErrorf(t, err, "error writing file at %q", skipped)
 
 	var buf bytes.Buffer
@@ -184,7 +186,7 @@ func TestGetNoCrossDevice(t *testing.T) {
 	tr := tar.NewReader(&buf)
 	th, err := tr.Next() // should be the "subdir" directory
 	require.NoError(t, err, "error reading first entry archived")
-	assert.Equal(t, "subdir", th.Name, `first entry in archive was not named "subdir"`)
+	assert.Equal(t, "subdir/", th.Name, `first entry in archive was not named "subdir/"`)
 
 	th, err = tr.Next()
 	assert.Error(t, err, "should not have gotten a second entry in archive")
@@ -192,4 +194,12 @@ func TestGetNoCrossDevice(t *testing.T) {
 	if err == nil {
 		t.Logf("got unexpected entry for %q", th.Name)
 	}
+}
+
+// assertCtimeMatches asserts that fi1 and fi2 have the same ctime.
+func assertCtimeMatches(t *testing.T, fi1, fi2 os.FileInfo) {
+	t.Helper()
+	st1 := fi1.Sys().(*syscall.Stat_t)
+	st2 := fi2.Sys().(*syscall.Stat_t)
+	assert.Equal(t, st1.Ctim, st2.Ctim)
 }
